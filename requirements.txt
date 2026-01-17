@@ -1,0 +1,16 @@
+cachetools
+lmdb
+msgpack
+numpy
+psutil
+psycopg2-binary
+pydantic
+pydantic-settings
+python-dotenv
+python-json-logger
+qdrant-client
+requests
+spacy
+torch
+transformers
+typer

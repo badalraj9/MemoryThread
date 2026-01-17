@@ -1,0 +1,16 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Environments
+.env
+.venv
+env/
+venv/
+
+# Logs
+*.log
+server.log
+tests/phase5_ordeal/mock_db.json
+tests/phase5_ordeal_v2/
