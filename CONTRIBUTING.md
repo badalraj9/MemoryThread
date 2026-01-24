@@ -1,80 +1,78 @@
-# Contributing to Memory Thread
+# Contributing to Memory Thread 🧠
 
-Thank you for your interest in Memory Thread.
+Hey! Thanks for checking out Memory Thread. Whether you're fixing a typo or adding a major feature, every contribution matters.
 
-This project is not a typical CRUD application; it is a reference architecture for persistent, uncertainty-aware reasoning systems. We welcome contributions that align with our core philosophy: **Correctness > Cleverness**.
+## What is MT?
 
-## Philosophy
+Memory Thread is an AI memory system — think of it as the "hippocampus" for intelligent agents. It helps AI remember facts, handle contradictions, and know when to say "I don't know."
 
-Memory Thread is designed to be the "Hippocampus" for AI agents. It prioritizes:
-1.  **Deterministic History:** The past is immutable.
-2.  **Explicit Uncertainty:** "I don't know" is a valid state.
-3.  **Provable Correctness:** State must be a mathematical function of events.
+## The Vibe
 
-We reject contributions that:
-*   Introduce non-deterministic behavior (except where explicitly modeled as Aleatoric uncertainty).
-*   Add features without corresponding "Golden Trace" verification.
-*   Increase latency beyond the 20ms read budget without strong justification.
+We're building something cool here. The core principles:
 
-## Getting Started
+- **Truth over hacks** — If a shortcut breaks correctness, we don't take it
+- **"I don't know" is valid** — Uncertainty is explicit, not hidden
+- **Events are immutable** — The past doesn't change
 
-### Prerequisites
-*   Python 3.10+
-*   PostgreSQL 14+ (with `pg_trgm` extension)
-*   Qdrant (Vector Database)
-*   Redis (for Hot State Cache)
-*   ZeroMQ / Kafka (depending on deployment scale)
+## Quick Start
 
-### Installation
-1.  Clone the repository:
-    ```bash
-    git clone https://github.com/your-org/memory-thread.git
-    cd memory-thread
-    ```
-2.  Install dependencies:
-    ```bash
-    pip install -r requirements.txt
-    ```
-3.  Set up environment:
-    ```bash
-    cp .env.example .env
-    # Configure your DB connection strings
-    ```
+```bash
+# Clone it
+git clone https://github.com/your-org/memory-thread.git
+cd memory-thread
 
-## Development Workflow
+# Install deps
+pip install -r requirements.txt
 
-### 1. Issues First
-Please open an Issue before submitting a Pull Request (PR), especially for architectural changes. Discussing the design beforehand saves everyone time.
+# Set up your env
+cp .env.example .env
+# Edit .env with your Postgres credentials
+```
 
-### 2. Branching Strategy
-*   `main`: The stable production branch.
-*   `backend-core`: The active development branch for the core engine.
-*   `feature/your-feature`: Your working branch.
+**You'll need:**
 
-### 3. Testing is Mandatory
-We use a rigorous testing methodology.
-*   **Unit Tests:** `pytest tests/`
-*   **Golden Traces:** Run `python benchmarks/test_phase_6_integration.py`. This replays 100+ scenarios to ensure the timeline remains consistent.
-*   **Performance:** If you touch the ingestion path, run `benchmarks/benchmark_phase_4_1.py` to verify EPS throughput.
+- Python 3.10+
+- PostgreSQL (we use 14+, but 18 works great too)
+- Qdrant (vector DB) — optional for basic testing
 
-### 4. Submission Checklist
-*   [ ] Logic is covered by tests.
-*   [ ] "Golden Trace" verification passes.
-*   [ ] Type hints are strictly enforced (Pydantic models).
-*   [ ] Documentation in `docs/` is updated if architectural assumptions change.
+## Want to Contribute?
 
-## Architecture Reference
+### 1. Start with an Issue ✋
 
-Before contributing to the core logic, please read:
-*   `docs/thesis_reference/00_Unified_System_Overview.md`: High-level concepts.
-*   `docs/thesis_reference/07_End_to_End_Workflow.md`: Detailed data flow.
+Before diving into code, open an issue to discuss what you want to do. Saves everyone time and we can point you in the right direction.
+
+### 2. Fork & Branch
+
+```bash
+git checkout -b feature/your-cool-thing
+```
+
+### 3. Write Tests
+
+We love tests. If you're adding logic, add a test for it:
+
+```bash
+pytest tests/ -v
+```
+
+### 4. Submit a PR
+
+Open a PR against `main`. We'll review it, maybe suggest tweaks, and merge it once it's ready.
 
 ## Code Style
 
-*   We follow PEP 8.
-*   Use `Black` for formatting.
-*   Docstrings should explain *why*, not just *what*.
+- **PEP 8** — Standard Python style
+- **Type hints** — We use Pydantic, so types matter
+- **Comments explain _why_**, not _what_ — The code shows what it does
 
-## Community
+## Need Help?
 
-We are building a tool for serious systems engineers and researchers. Please keep discussions professional and focused on technical excellence. See `CODE_OF_CONDUCT.md` for details.
+- Check the `docs/` folder for architecture details
+- Open an issue with questions
+- We don't bite! 🙂
+
+## The Bottom Line
+
+This isn't just another CRUD app — it's infrastructure for AI that needs to _remember_. If that excites you, we'd love to have you contribute.
+
+Welcome aboard! 🚀

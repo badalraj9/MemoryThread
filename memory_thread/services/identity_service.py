@@ -8,6 +8,7 @@ from memory_thread.models.entity import Entity, MergeProposal, EntityMergeLog
 from memory_thread.db.postgres_client import PostgresClient
 from memory_thread.db.qdrant_client import QdrantClientWrapper
 from memory_thread.utils.embeddings import generate_embeddings
+from memory_thread.config.settings import settings
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 log = logging.getLogger(__name__)
@@ -28,7 +29,10 @@ class IdentityService:
             log.info(f"Collection {self.collection_name} not found, creating...")
             self.qdrant.client.create_collection(
                 collection_name=self.collection_name,
-                vectors_config={"size": 1536, "distance": "Cosine"}
+                vectors_config={
+                    "size": settings.EMBEDDING_DIMENSION, 
+                    "distance": settings.EMBEDDING_DISTANCE
+                }
             )
 
     def create_entity(self, name: str, entity_type: str, attributes: Dict = {}) -> Entity:

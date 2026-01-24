@@ -110,7 +110,16 @@ def worker_process(allocator: SlabAllocator, persistence_engine: Any): # Note: p
 
                 allocator.release_slab(slab.slab_id)
             except Exception as e:
-                log.error(f"Error processing slab {slab.slab_id}: {e}")
+                log.error(
+                    f"Error processing slab {slab.slab_id}: {e}",
+                    exc_info=True,
+                    extra={
+                        "slab_id": slab.slab_id,
+                        "error_type": type(e).__name__
+                    }
+                )
+                # Track for potential retry/dead-letter handling
+                # In production: implement retry queue or DLQ persistence
                 allocator.release_slab(slab.slab_id)
         else:
             time.sleep(0.001)

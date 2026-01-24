@@ -42,17 +42,8 @@ class TimewarpEngine:
             ))
 
         # 2. Recompute State
-        # We use the ReplayService to "Replay" from the past.
-        # But wait, ReplayService in snapshot_service.py was defined inside it/merged?
-        # I defined a separate ReplayService in `replay_service.py` (Phase 6.1).
-        # And another one inside `snapshot_service.py` (Phase 6.2 plan snippet)?
-        # I overwrote `snapshot_service.py` but DID NOT include `ReplayService` class inside it in the final overwrite.
-        # I should use `memory_thread.services.replay_service.ReplayService` but it needs modification to use snapshots.
-
-        # Actually, `ReplayService` (6.1) was for debugging (Trace -> Replay).
-        # We need a `StateReconstructionService` that uses snapshots + DB events.
-
-        # Let's implement the logic here directly or helper.
+        # Uses inline state reconstruction for timewarp operations.
+        # This replays all events from scratch (or nearest snapshot) to rebuild state.
 
         new_state = self._recompute_state(event.object_id)
 

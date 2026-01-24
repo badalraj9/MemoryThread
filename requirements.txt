@@ -11,6 +11,11 @@ python-json-logger
 qdrant-client
 requests
 spacy
+tenacity
 torch
 transformers
 typer
+prometheus-client
+fastapi
+uvicorn
+zmq

@@ -93,7 +93,11 @@ class KafkaMirror:
             await self.producer.start()
             log.info(f"Kafka Mirror connected to {self.bootstrap_servers}")
         except Exception as e:
-            log.warning(f"Kafka connection failed ({e}). Switching to MOCK mode.")
+            log.warning(
+                f"Kafka connection failed ({e}). Switching to MOCK mode. "
+                f"WARNING: Events will NOT be durably persisted to Kafka! "
+                f"This is acceptable for development but NOT for production."
+            )
             self.mock_mode = True
 
     async def mirror(self, event: Dict[str, Any]):
