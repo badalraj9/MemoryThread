@@ -1056,15 +1056,26 @@ class MemoryClient:
         contradiction = self.check_contradiction(user_message)
         contradiction_note = ""
         if contradiction.get("has_contradiction"):
-            contradiction_note = f"\n[Note: This contradicts earlier: {contradiction.get('conflicting_memory', '')}]"
+            contradiction_note = f"\n[Note: User previously said: {contradiction.get('conflicting_memory', '')}]"
         
-        # 3. Recall relevant context
-        context = self.get_context_for_llm(user_message, max_tokens=800)
+        # 3. Build context from ALL stored memories (not just semantic search)
+        context_lines = ["What I know about the user:"]
+        for eid, state in self._memories.items():
+            content = state.current_value.get("content", "")
+            mtype = state.current_value.get("type", "fact")
+            # Only include facts and relations, not entities
+            if content and mtype in ["fact", "relation", "preference", "identity"]:
+                context_lines.append(f"- {content}")
+        
+        if len(context_lines) == 1:
+            context = "No previous information about the user."
+        else:
+            context = "\n".join(context_lines[:15])  # Limit to 15 memories
         
         # 4. Build prompt
-        default_system = """You are a helpful assistant with access to memory about the user.
+        default_system = """You are a helpful assistant with memory about the user.
 Use the provided context to give personalized, relevant responses.
-If you learn something new about the user, acknowledge it."""
+Reference the user's information when appropriate."""
         
         full_prompt = f"""{system_prompt or default_system}
 
@@ -1122,29 +1133,74 @@ Assistant:"""
             log.error(f"Local generation failed: {e}")
             return f"[Memory context retrieved, but local LLM unavailable. Context: {prompt[:200]}...]"
     
-    def _generate_cloud(self, prompt: str) -> str:
-        """Generate response using cloud API (Groq/OpenAI/etc)."""
+    def _generate_cloud(self, prompt: str, provider: str = "auto") -> str:
+        """
+        Generate response using cloud API.
+        
+        Providers:
+            - "groq": Uses GROQ_MODEL (default: llama-3.1-70b-versatile)
+            - "openrouter": Uses OPENROUTER_MODEL (default: meta-llama/llama-3.1-405b-instruct)
+            - "auto": Try Groq first, then OpenRouter, then local
+        
+        Set via environment variables:
+            - GROQ_API_KEY, GROQ_MODEL
+            - OPENROUTER_API_KEY, OPENROUTER_MODEL
+        """
         try:
             import os
             import requests
             
-            # Try Groq first (fast and free)
-            api_key = os.environ.get("GROQ_API_KEY")
-            if api_key:
-                response = requests.post(
-                    "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {api_key}"},
-                    json={
-                        "model": "llama-3.1-70b-versatile",
-                        "messages": [{"role": "user", "content": prompt}],
-                        "max_tokens": 300
-                    },
-                    timeout=30
-                )
-                if response.ok:
-                    return response.json()["choices"][0]["message"]["content"]
+            groq_key = os.environ.get("GROQ_API_KEY")
+            groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+            openrouter_key = os.environ.get("OPENROUTER_API_KEY")
+            openrouter_model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-405b-instruct")
+            
+            # Provider selection
+            if provider == "groq" or (provider == "auto" and groq_key):
+                if groq_key:
+                    log.info(f"Using Groq ({groq_model})")
+                    response = requests.post(
+                        "https://api.groq.com/openai/v1/chat/completions",
+                        headers={"Authorization": f"Bearer {groq_key}"},
+                        json={
+                            "model": groq_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 500,
+                            "temperature": 0.7
+                        },
+                        timeout=30
+                    )
+                    if response.ok:
+                        return response.json()["choices"][0]["message"]["content"]
+                    else:
+                        log.warning(f"Groq error: {response.status_code} - {response.text[:100]}")
+            
+            # Try OpenRouter
+            if provider == "openrouter" or (provider == "auto" and openrouter_key):
+                if openrouter_key:
+                    log.info(f"Using OpenRouter ({openrouter_model})")
+                    response = requests.post(
+                        "https://openrouter.ai/api/v1/chat/completions",
+                        headers={
+                            "Authorization": f"Bearer {openrouter_key}",
+                            "HTTP-Referer": "https://github.com/badalraj9/MemoryThread",
+                            "X-Title": "MemoryThread"
+                        },
+                        json={
+                            "model": openrouter_model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 500,
+                            "temperature": 0.7
+                        },
+                        timeout=60
+                    )
+                    if response.ok:
+                        return response.json()["choices"][0]["message"]["content"]
+                    else:
+                        log.warning(f"OpenRouter error: {response.status_code} - {response.text[:100]}")
             
             # Fallback to local
+            log.warning("No cloud API available, falling back to local model")
             return self._generate_local(prompt)
             
         except Exception as e:
