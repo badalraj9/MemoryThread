@@ -303,7 +303,7 @@ class BridgeState:
 
     def set_role(self, role: str):
         # Validate role exists in our policy
-        valid_roles = ["guest", "employee", "developer", "researcher", "executive", "root"]
+        valid_roles = ["guest", "employee", "developer", "researcher", "executive", "godfather"]
         if role.lower() in valid_roles:
             self.current_user_role = role.lower()
             if self.secure_mode:
@@ -636,6 +636,53 @@ class MTInterface:
         else:
             self.console.print("[red]Unknown provider[/]")
 
+    def login_flow(self, arg_role: str):
+        """Hardened Pentagon-style Login."""
+        from memory_thread.nervous.vault import vault
+
+        # 1. Identity Check
+        target_role = arg_role.lower()
+        if target_role == "root": target_role = "godfather" # Alias
+
+        # 2. Access Key Prompt
+        self.console.print(f"[bold cyan]IDENTITY > {target_role.upper()}[/]")
+        session = PromptSession()
+        key_input = session.prompt(HTML("<b>ACCESS KEY > </b>"), is_password=True)
+
+        # 3. Visual FX
+        with Live(Spinner("dots", style="red", text="Verifying Biometrics..."), transient=True):
+            time.sleep(0.8) # Dramatic pause
+
+        # 4. Stealth Elevation Logic
+        is_godfather_key = vault.verify_godfather(key_input)
+
+        if is_godfather_key:
+            # Elevation!
+            self.console.print("[bold red blink]G O D F A T H E R   P R O T O C O L   E N G A G E D[/]")
+            self.bridge.set_role("godfather")
+            self.bridge.secure_mode = True # Force secure
+            self.bridge.client = self.bridge._init_client()
+            return
+
+        # 5. Standard PIN Check
+        if vault.verify_pin(target_role, key_input):
+            if self.bridge.set_role(target_role):
+                # Greetings
+                greetings = {
+                    "guest": "Welcome, Guest. Public access only.",
+                    "employee": "Identity Verified. Internal channels open.",
+                    "developer": "Dev Mode Active. Caution advised.",
+                    "researcher": "Accessing Classified Archives...",
+                    "executive": "Command Uplink Established. Welcome, Commander."
+                }
+                self.console.print(f"[green]{greetings.get(target_role, 'Access Granted.')}[/]")
+                if not self.bridge.secure_mode:
+                     self.console.print("[dim]Note: Security mode is OFF. Type /secure to enable.[/]")
+            else:
+                self.console.print("[red]Role assignment failed.[/]")
+        else:
+            self.console.print("[bold red]ACCESS DENIED. INCIDENT LOGGED.[/]")
+
     def run(self):
         self.clear_screen()
         self.print_logo()
@@ -645,6 +692,12 @@ class MTInterface:
             return
         if not RICH_AVAILABLE:
              print("Warning: 'rich' is not installed. UI will be degraded. Please run 'pip install rich'.")
+
+        # Initialize Vault (Print Godfather Key once if new)
+        from memory_thread.nervous.vault import vault
+        g_key = vault.get_or_create_godfather_key()
+        if "MT-" in g_key:
+            self.console.print(Panel(f"[bold red]NUCLEAR KEY GENERATED:[/]\n{g_key}\n[dim]Save this. It will not be shown again.[/]", border_style="red"))
 
         # --- Key Bindings ---
         bindings = KeyBindings()
@@ -698,11 +751,10 @@ class MTInterface:
                         else: self.console.print("[red]Use: /variants <surface|deep>[/]")
                     elif cmd == "/conf": self._handle_conf(arg)
                     elif cmd == "/login":
-                        if self.bridge.set_role(arg):
-                            self.console.print(f"[green]Logged in as: {arg.upper()}[/]")
-                            if not self.bridge.secure_mode:
-                                self.console.print("[dim]Note: Security mode is OFF. Type /secure to enable.[/]")
-                        else: self.console.print("[red]Unknown role. Use: guest, employee, developer, researcher, executive, root[/]")
+                        if arg:
+                            self.login_flow(arg)
+                        else:
+                            self.console.print("[red]Usage: /login <role>[/]")
                     elif cmd == "/secure":
                         state = self.bridge.toggle_security()
                         status = "ENABLED" if state else "DISABLED"

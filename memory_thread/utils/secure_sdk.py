@@ -13,7 +13,7 @@ import json
 import datetime
 
 from memory_thread.sdk import MemoryClient, RecallResult, Memory
-from memory_thread.nervous.access_control import AccessControlService, UserContext, ClearanceLevel
+from memory_thread.nervous.access_control import AccessControlService, UserContext
 from memory_thread.models.provenance import ProvenanceEnvelope, Actor, Origin, Scope
 from memory_thread.nervous.audit_ledger import ledger, AuditEvent
 
@@ -34,7 +34,7 @@ class SecureMemoryClient:
 
     @property
     def clearance(self):
-        return self.user.clearance.name
+        return self.user.grade.name
 
     def remember(self, content: str, namespace: str = "public",
                  memory_type: str = "fact") -> Optional[uuid.UUID]:
@@ -213,7 +213,7 @@ Task: Identify one specific search query to find missing info. Return ONLY the q
 
 SECURITY CONTEXT:
 User Role: {self.user.role}
-Clearance: {self.user.clearance.name}
+Grade: {self.user.grade.name}
 
 SECURE MEMORY CONTEXT (Only authorized facts):
 {context_str}
@@ -226,6 +226,16 @@ Assistant:"""
             return self._core_client._generate_local(full_prompt)
         else:
             return self._core_client._generate_cloud(full_prompt)
+
+    def _get_namespace_clearance(self, namespace: str) -> int:
+        """Helper to map namespace to required Grade."""
+        from memory_thread.nervous.access_control import Grade
+        if "public" in namespace: return Grade.E_CLASS
+        if "team" in namespace: return Grade.C_CLASS
+        if "tech" in namespace: return Grade.B_CLASS
+        if "research" in namespace: return Grade.A_CLASS
+        if "secret" in namespace: return Grade.S_CLASS
+        return Grade.C_CLASS
 
     # --- ADMIN CAPABILITY ---
     def audit_log(self, limit: int = 50) -> List[Dict]:

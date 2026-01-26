@@ -15,35 +15,44 @@ from memory_thread.models.provenance import ProvenanceEnvelope, Actor, Scope
 from memory_thread.nervous.audit_ledger import ledger, AuditEvent
 from memory_thread.nervous.authority_store import authority_store, AuthorityGrant
 
-class ClearanceLevel(IntEnum):
-    PUBLIC = 0
-    INTERNAL = 1
-    CONFIDENTIAL = 2
-    SECRET = 3
-    TOP_SECRET = 4
+class Grade(IntEnum):
+    E_CLASS = 0   # Public / Guest
+    C_CLASS = 1   # Internal / Employee
+    B_CLASS = 2   # Confidential / Developer
+    A_CLASS = 3   # Secret / Researcher
+    S_CLASS = 4   # Top Secret / Executive
+    SSS_CLASS = 5 # Godfather / Root
+
+    def __str__(self):
+        return self.name
 
 @dataclass
 class UserContext:
     user_id: str
     role: str
-    clearance: ClearanceLevel
+    grade: Grade
     domains: List[str]
+
+    @property
+    def clearance(self):
+        return self.grade # Alias for backward compatibility
 
 class AccessControlService:
     """
     The Single Source of Truth for Permissions and Authority.
+    Hardened for Pentagon-style Grade System.
     """
 
-    # --- POLICY DEFINITIONS (In a real system, this comes from DB/LDAP) ---
+    # --- POLICY DEFINITIONS ---
 
-    # Map Roles to Default Clearance
-    ROLE_CLEARANCE = {
-        "guest": ClearanceLevel.PUBLIC,
-        "employee": ClearanceLevel.INTERNAL,
-        "developer": ClearanceLevel.CONFIDENTIAL,
-        "researcher": ClearanceLevel.SECRET,
-        "executive": ClearanceLevel.TOP_SECRET,
-        "root": ClearanceLevel.TOP_SECRET # God mode
+    # Map Roles to Default Clearance Grades
+    ROLE_GRADES = {
+        "guest": Grade.E_CLASS,
+        "employee": Grade.C_CLASS,
+        "developer": Grade.B_CLASS,
+        "researcher": Grade.A_CLASS,
+        "executive": Grade.S_CLASS,
+        "godfather": Grade.SSS_CLASS # Hidden Role
     }
 
     # Map Roles to Domain Access (Namespaces they can Read/Write)
@@ -70,7 +79,7 @@ class AccessControlService:
             "read": ["*"],
             "write": ["*"]
         },
-        "root": {
+        "godfather": {
             "read": ["*"],
             "write": ["*"]
         }
@@ -78,7 +87,7 @@ class AccessControlService:
 
     # Authority Scoring Matrix: (Role, Domain) -> Score
     AUTHORITY_MATRIX = {
-        ("root", "*"): 1.0,
+        ("godfather", "*"): 1.0,
         ("executive", "*"): 0.95,
         ("researcher", "research_lab"): 0.90,
         ("researcher", "tech_core"): 0.50,
@@ -94,13 +103,15 @@ class AccessControlService:
     def create_context(cls, user_id: str, role: str) -> UserContext:
         """Factory to create a user context from a role."""
         role = role.lower()
-        if role not in cls.ROLE_CLEARANCE:
+        if role == "root": role = "godfather" # Alias
+
+        if role not in cls.ROLE_GRADES:
             role = "guest"
 
         return UserContext(
             user_id=user_id,
             role=role,
-            clearance=cls.ROLE_CLEARANCE[role],
+            grade=cls.ROLE_GRADES[role],
             domains=cls.ROLE_DOMAINS[role]["read"]
         )
 
@@ -185,13 +196,13 @@ class AccessControlService:
         Dynamic Revocation.
         """
         # 1. Check Revoker's Power (Must be Admin/Exec or original granter ideally, simplified here)
-        if revoker.role not in ["executive", "root"]:
+        if revoker.role not in ["executive", "godfather"]:
              ledger.log(AuditEvent(
                 action_type="REVOKE_DENIED",
                 actor_id=revoker.user_id,
                 role=revoker.role,
                 target=domain,
-                details={"reason": "requires_exec_or_root"}
+                details={"reason": "requires_exec_or_godfather"}
             ))
              return False
 
@@ -261,10 +272,10 @@ class AccessControlService:
         return namespace in allowed
 
     @classmethod
-    def _get_domain_clearance(cls, domain: str) -> ClearanceLevel:
-        if "public" in domain: return ClearanceLevel.PUBLIC
-        if "team" in domain: return ClearanceLevel.INTERNAL
-        if "tech" in domain: return ClearanceLevel.CONFIDENTIAL
-        if "research" in domain: return ClearanceLevel.SECRET
-        if "secret" in domain: return ClearanceLevel.TOP_SECRET
-        return ClearanceLevel.INTERNAL
+    def _get_domain_clearance(cls, domain: str) -> Grade:
+        if "public" in domain: return Grade.E_CLASS
+        if "team" in domain: return Grade.C_CLASS
+        if "tech" in domain: return Grade.B_CLASS
+        if "research" in domain: return Grade.A_CLASS
+        if "secret" in domain: return Grade.S_CLASS
+        return Grade.C_CLASS
