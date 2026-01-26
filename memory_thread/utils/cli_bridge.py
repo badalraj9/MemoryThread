@@ -13,7 +13,12 @@ import glob
 import uuid
 from pathlib import Path
 from typing import Optional, List, Dict, Any
-sys.path.insert(0, '.')
+
+# Ensure project root is in path
+current_dir = os.path.dirname(os.path.abspath(__file__))
+project_root = os.path.dirname(os.path.dirname(current_dir))
+if project_root not in sys.path:
+    sys.path.insert(0, project_root)
 
 # --- LOGGING & WARNING SUPPRESSION ---
 import logging
@@ -563,7 +568,7 @@ class MTInterface:
             self.p_style = PStyle.from_dict({
                 'prompt': '#3B82F6 bold',
                 'input': '#EEEEEE',
-                'completion-menu': 'bg:#1e1e1e1e #eeeeee',
+                'completion-menu': 'bg:#1e1e1e #eeeeee',
                 'completion-menu.completion.current': 'bg:#3B82F6 #ffffff',
                 'bottom-toolbar': 'bg:default #666666',
                 'bottom-toolbar.key': '#ffffff bold',
@@ -767,6 +772,8 @@ class MTInterface:
 
             except KeyboardInterrupt:
                 self.console.print("\n[dim]Bye[/]")
+                break
+            except EOFError:
                 break
             except Exception as e:
                 self.console.print(f"[red]Err: {e}[/]")
