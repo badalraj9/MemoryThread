@@ -646,7 +646,7 @@ class MTInterface:
         else:
             self.console.print("[red]Unknown provider[/]")
 
-    def login_flow(self, arg_role: str):
+    async def login_flow(self, arg_role: str):
         """Hardened Pentagon-style Login."""
         from memory_thread.nervous.vault import vault
         from memory_thread.nervous.access_control import AccessControlService
@@ -665,11 +665,11 @@ class MTInterface:
         # 2. Access Key Prompt
         self.console.print(f"[bold cyan]IDENTITY > {target_role.upper()}[/]")
         session = PromptSession()
-        key_input = session.prompt(HTML("<b>ACCESS KEY > </b>"), is_password=True)
+        key_input = await session.prompt_async(HTML("<b>ACCESS KEY > </b>"), is_password=True)
 
         # 3. Visual FX
         with Live(Spinner("dots", style="red", text="Verifying Biometrics..."), transient=True):
-            time.sleep(0.8) # Dramatic pause
+            await asyncio.sleep(0.8) # Dramatic pause
 
         # 4. Stealth Elevation Logic
         is_godfather_key = vault.verify_godfather(key_input)
@@ -813,7 +813,7 @@ class MTInterface:
                         elif cmd == "/conf": self._handle_conf(arg)
                         elif cmd == "/login":
                             if arg:
-                                self.login_flow(arg)
+                                await self.login_flow(arg)
                             else:
                                 self.console.print("[red]Usage: /login <role>[/]")
                         elif cmd == "/secure":
