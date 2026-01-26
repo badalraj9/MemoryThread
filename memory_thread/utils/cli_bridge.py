@@ -249,7 +249,14 @@ class BridgeState:
 
         # We re-init SDK when agent changes (namespace switch)
         from memory_thread.sdk import MemoryClient
+        from memory_thread.utils.secure_sdk import SecureMemoryClient
+
         self._sdk_class = MemoryClient
+        self._secure_class = SecureMemoryClient
+
+        # Security State
+        self.secure_mode = False
+        self.current_user_role = "employee" # Default role
         self.client = self._init_client()
 
     def _detect_provider(self) -> str:
@@ -260,15 +267,37 @@ class BridgeState:
         return "local"
 
     def _init_client(self):
-        """Initialize SDK based on current AGENT's namespace."""
-        agent_cfg = AgentManager.AGENTS.get(self.agent, AgentManager.AGENTS["coder"])
-        ns = agent_cfg["namespace"]
-        return self._sdk_class(namespace=ns, use_db=False)
+        """Initialize SDK based on current AGENT's namespace or Security Context."""
+        if self.secure_mode:
+            # Use Enterprise Secure Wrapper
+            # We use a fixed user ID for demo purposes
+            return self._secure_class(user_id="demo-user", role=self.current_user_role)
+        else:
+            # Standard Mode
+            agent_cfg = AgentManager.AGENTS.get(self.agent, AgentManager.AGENTS["coder"])
+            ns = agent_cfg["namespace"]
+            return self._sdk_class(namespace=ns, use_db=False)
 
     def set_agent(self, name: str):
         if name in AgentManager.AGENTS:
             self.agent = name
-            self.client = self._init_client()
+            if not self.secure_mode:
+                self.client = self._init_client()
+            return True
+        return False
+
+    def toggle_security(self):
+        self.secure_mode = not self.secure_mode
+        self.client = self._init_client()
+        return self.secure_mode
+
+    def set_role(self, role: str):
+        # Validate role exists in our policy
+        valid_roles = ["guest", "employee", "developer", "researcher", "executive"]
+        if role.lower() in valid_roles:
+            self.current_user_role = role.lower()
+            if self.secure_mode:
+                self.client = self._init_client()
             return True
         return False
 
@@ -463,6 +492,11 @@ class MTInterface:
                 '/agents': {'coder': None, 'architect': None, 'reviewer': None},
                 '/variants': {'surface': None, 'deep': None},
                 '/conf': {'groq': None, 'openrouter': None, 'local': None},
+                '/login': {
+                    'guest': None, 'employee': None, 'developer': None,
+                    'researcher': None, 'executive': None
+                },
+                '/secure': None,
                 '/ingest': None, '/clear': None, '/quit': None, '/help': None,
             })
 
@@ -509,11 +543,18 @@ class MTInterface:
         graph = "ON" if self.graph_mode else "OFF"
         g_style = "class:bottom-toolbar.on" if self.graph_mode else "class:bottom-toolbar.off"
 
+        # Security Status
+        sec_status = ""
+        if self.bridge.secure_mode:
+            role = self.bridge.current_user_role.upper()
+            sec_status = f" · [SECURE: {role}]"
+
         return [
             ('class:bottom-toolbar.key', ' Agent '), ('class:bottom-toolbar.val', f'{ag} '),
             ('class:bottom-toolbar.key', ' Model '), ('class:bottom-toolbar.val', f'{pr} '),
             ('class:bottom-toolbar.sep', f' · {var}'),
             ('class:bottom-toolbar.sep', ' · Graph:'), (g_style, f' {graph} '),
+            ('class:bottom-toolbar.on', sec_status),
             ('class:bottom-toolbar', '    '),
             ('class:bottom-toolbar', 'F3 Graph  ctrl+t variants  / help')
         ]
@@ -587,6 +628,17 @@ class MTInterface:
                         if self.bridge.set_variant(arg): self.console.print(f"[green]Variant: {arg}[/]")
                         else: self.console.print("[red]Use: /variants <surface|deep>[/]")
                     elif cmd == "/conf": self._handle_conf(arg)
+                    elif cmd == "/login":
+                        if self.bridge.set_role(arg):
+                            self.console.print(f"[green]Logged in as: {arg.upper()}[/]")
+                            if not self.bridge.secure_mode:
+                                self.console.print("[dim]Note: Security mode is OFF. Type /secure to enable.[/]")
+                        else: self.console.print("[red]Unknown role. Use: guest, employee, developer, researcher, executive[/]")
+                    elif cmd == "/secure":
+                        state = self.bridge.toggle_security()
+                        status = "ENABLED" if state else "DISABLED"
+                        color = "green" if state else "red"
+                        self.console.print(f"[{color}]Enterprise Security: {status}[/]")
                     elif cmd == "/ingest":
                          with Live(Spinner("dots", text="Scanning..."), transient=True):
                              c = self.bridge.ingest_project()
@@ -595,7 +647,7 @@ class MTInterface:
                         self.bridge.client.clear()
                         self.console.print("[green]Cleared memory[/]")
                     elif cmd == "/help":
-                        self.console.print("[dim]/agents, /variants, /conf, /ingest, /clear, /quit[/]")
+                        self.console.print("[dim]/agents, /variants, /conf, /login, /secure, /ingest, /clear, /quit[/]")
                     else: self.console.print(f"[red]Unknown: {cmd}[/]")
                     continue
 
