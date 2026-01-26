@@ -178,12 +178,32 @@ class SecureMemoryClient:
         """Delegate unknown methods to core client (e.g. get_stats, get_health)."""
         return getattr(self._core_client, name)
 
-    def chat(self, user_message: str, system_prompt: Optional[str] = None, use_local: bool = True) -> str:
+    def chat(self, user_message: str, system_prompt: Optional[str] = None, use_local: bool = True, smart_loop: bool = False) -> str:
         """
-        Secure Chat.
+        Secure Chat with optional Smart Loop (Layer VI).
         """
-        # 1. Secure Recall
-        recall_res = self.recall(user_message)
+        # 1. Secure Recall (Initial Pass)
+        recall_res = self.recall(user_message, top_k=5)
+
+        # Smart Loop: Reflection (Layer VI)
+        if smart_loop and recall_res.total_found < 2:
+            # If low context, ask LLM what else it needs
+            reflection_prompt = f"""User: {user_message}
+Current Context: {recall_res.to_context(max_chars=500)}
+Task: Identify one specific search query to find missing info. Return ONLY the query."""
+
+            if use_local:
+                next_query = self._core_client._generate_local(reflection_prompt)
+            else:
+                next_query = self._core_client._generate_cloud(reflection_prompt)
+
+            # Clean up query
+            next_query = next_query.strip().replace('"', '')
+
+            # Secondary Recall
+            extra_res = self.recall(next_query, top_k=3)
+            # Merge results (simple append for prototype)
+            recall_res.memories.extend(extra_res.memories)
 
         # 2. Build Context
         context_str = recall_res.to_context(max_chars=3000)
@@ -229,3 +249,11 @@ Assistant:"""
             self._core_client.clear()
         else:
             print(f"Access Denied: Only ROOT can clear DB.")
+
+    def grant(self, target_role: str, domain: str, score: float) -> bool:
+        """Dynamic Authority Grant."""
+        return AccessControlService.grant_authority(self.user, target_role, domain, score)
+
+    def revoke(self, target_role: str, domain: str) -> bool:
+        """Dynamic Revocation."""
+        return AccessControlService.revoke_authority(self.user, target_role, domain)

@@ -256,6 +256,7 @@ class BridgeState:
 
         # Security State
         self.secure_mode = False
+        self.smart_mode = False # Layer VI toggle
         self.current_user_role = "employee" # Default role
         self.client = self._init_client()
 
@@ -291,6 +292,10 @@ class BridgeState:
         self.client = self._init_client()
         return self.secure_mode
 
+    def toggle_smart(self):
+        self.smart_mode = not self.smart_mode
+        return self.smart_mode
+
     def set_role(self, role: str):
         # Validate role exists in our policy
         valid_roles = ["guest", "employee", "developer", "researcher", "executive", "root"]
@@ -321,6 +326,29 @@ class BridgeState:
             output += f"[{color}]{ts} | {actor} | {action} | {target}[/]\n"
 
         return output
+
+    def handle_grant(self, args: str):
+        if not self.secure_mode: return "Enable Secure Mode first (/secure)"
+        parts = args.split()
+        if len(parts) < 3: return "Usage: /grant <role> <domain> <score>"
+        try:
+            score = float(parts[2])
+            if self.client.grant(parts[0], parts[1], score):
+                return f"[green]Granted {score} authority to {parts[0]} on {parts[1]}[/]"
+            else:
+                return "[red]Grant Denied (Check Audit Log)[/]"
+        except Exception as e: return f"[red]Error: {e}[/]"
+
+    def handle_revoke(self, args: str):
+        if not self.secure_mode: return "Enable Secure Mode first (/secure)"
+        parts = args.split()
+        if len(parts) < 2: return "Usage: /revoke <role> <domain>"
+        try:
+            if self.client.revoke(parts[0], parts[1]):
+                return f"[yellow]Revoked authority from {parts[0]} on {parts[1]}[/]"
+            else:
+                return "[red]Revoke Denied (Check Audit Log)[/]"
+        except Exception as e: return f"[red]Error: {e}[/]"
 
     def set_variant(self, variant: str):
         if variant in ["surface", "deep"]:
@@ -380,10 +408,16 @@ class BridgeState:
         # Wait, SDK.chat DOES accept system_prompt.
         # def chat(self, user_message: str, system_prompt: Optional[str] = None, use_local: bool = True) -> str:
 
+        # Check if client supports smart_loop (SecureClient does, Base might not)
+        kwargs = {}
+        if hasattr(self.client, 'chat') and 'smart_loop' in self.client.chat.__code__.co_varnames:
+             kwargs['smart_loop'] = self.smart_mode
+
         response = self.client.chat(
             user_message=final_query,
             system_prompt=sys_prompt,
-            use_local=(self.provider=="local")
+            use_local=(self.provider=="local"),
+            **kwargs
         )
 
         # Record Response
@@ -519,6 +553,8 @@ class MTInterface:
                 },
                 '/secure': None,
                 '/audit': None,
+                '/grant': None, '/revoke': None,
+                '/smart': None,
                 '/ingest': None, '/clear': None, '/quit': None, '/help': None,
             })
 
@@ -571,12 +607,18 @@ class MTInterface:
             role = self.bridge.current_user_role.upper()
             sec_status = f" · [SECURE: {role}]"
 
+        # Smart Status
+        smart_status = ""
+        if self.bridge.smart_mode:
+            smart_status = " · [SMART: ON]"
+
         return [
             ('class:bottom-toolbar.key', ' Agent '), ('class:bottom-toolbar.val', f'{ag} '),
             ('class:bottom-toolbar.key', ' Model '), ('class:bottom-toolbar.val', f'{pr} '),
             ('class:bottom-toolbar.sep', f' · {var}'),
             ('class:bottom-toolbar.sep', ' · Graph:'), (g_style, f' {graph} '),
             ('class:bottom-toolbar.on', sec_status),
+            ('class:bottom-toolbar.on', smart_status),
             ('class:bottom-toolbar', '    '),
             ('class:bottom-toolbar', 'F3 Graph  ctrl+t variants  / help')
         ]
@@ -661,9 +703,17 @@ class MTInterface:
                         status = "ENABLED" if state else "DISABLED"
                         color = "green" if state else "red"
                         self.console.print(f"[{color}]Enterprise Security: {status}[/]")
+                    elif cmd == "/smart":
+                        state = self.bridge.toggle_smart()
+                        status = "ENABLED" if state else "DISABLED"
+                        self.console.print(f"[cyan]Smart Reflection Loop: {status}[/]")
                     elif cmd == "/audit":
                         log_view = self.bridge.view_audit()
                         self.console.print(Panel(log_view, title="Audit Log", border_style="red"))
+                    elif cmd == "/grant":
+                        self.console.print(self.bridge.handle_grant(arg))
+                    elif cmd == "/revoke":
+                        self.console.print(self.bridge.handle_revoke(arg))
                     elif cmd == "/ingest":
                          with Live(Spinner("dots", text="Scanning..."), transient=True):
                              c = self.bridge.ingest_project()
@@ -672,18 +722,38 @@ class MTInterface:
                         self.bridge.client.clear()
                         self.console.print("[green]Cleared memory[/]")
                     elif cmd == "/help":
-                        self.console.print("[dim]/agents, /variants, /conf, /login, /secure, /ingest, /clear, /quit[/]")
+                        self.console.print("[dim]/agents, /variants, /conf, /login, /secure, /smart, /grant, /revoke, /audit, /ingest, /clear, /quit[/]")
                     else: self.console.print(f"[red]Unknown: {cmd}[/]")
                     continue
 
                 # --- CHAT ---
                 with Live(Spinner("dots", style=self.DIM), transient=True, refresh_per_second=10):
+                    # We can't easily get the 'recall_result' from chat() directly without refactoring SDK return types.
+                    # For Layer V Lite, we will do a manual recall in the bridge to show sources,
+                    # mirroring what the chat loop sees.
+
+                    # 1. Get Sources first
+                    sources_view = None
+                    if self.bridge.secure_mode:
+                         # Use top_k=5 matching SecureClient default
+                         res = self.bridge.client.recall(user_input, top_k=5)
+                         if res.memories:
+                             s_text = "[bold]Evidence:[/]\n"
+                             for i, m in enumerate(res.memories, 1):
+                                 src_label = getattr(m, 'source', 'unknown')
+                                 s_text += f"{i}. {m.content[:60]}... [dim]({src_label})[/]\n"
+                             sources_view = Panel(s_text, title="Reasoning Sources", border_style="blue")
+
+                    # 2. Get Response
                     response = self.bridge.chat(user_input)
 
-                    # Graph Insight (Parallel-ish)
+                    # 3. Graph Insight
                     graph_insight = None
                     if self.graph_mode:
                          graph_insight = self.bridge.get_graph_insight(user_input)
+
+                if sources_view:
+                    self.console.print(sources_view)
 
                 if graph_insight:
                     title = "Knowledge Graph"

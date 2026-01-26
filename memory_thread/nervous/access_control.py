@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from enum import Enum, IntEnum
 from memory_thread.models.provenance import ProvenanceEnvelope, Actor, Scope
 from memory_thread.nervous.audit_ledger import ledger, AuditEvent
+from memory_thread.nervous.authority_store import authority_store, AuthorityGrant
 
 class ClearanceLevel(IntEnum):
     PUBLIC = 0
@@ -109,7 +110,12 @@ class AccessControlService:
         Determines the Truth Score (Authority) for a write operation.
         Returns 0.0 if write is denied.
         """
-        # 1. Check Write Permission
+        # 1. Check Dynamic Grants (Layer III) - Grants Override Permissions
+        dynamic_score = authority_store.get_score(user.role, target_domain)
+        if dynamic_score is not None:
+            return dynamic_score
+
+        # 2. Check Write Permission (Static)
         allowed_writes = cls.ROLE_DOMAINS[user.role]["write"]
         if "*" not in allowed_writes and target_domain not in allowed_writes:
             # AUDIT LOG: Write Denied
@@ -122,7 +128,7 @@ class AccessControlService:
             ))
             return 0.0 # Denied
 
-        # 2. Calculate Score
+        # 3. Calculate Static Score
         # Check specific rule first
         score = cls.AUTHORITY_MATRIX.get((user.role, target_domain))
         if score is None:
@@ -134,6 +140,72 @@ class AccessControlService:
             score = 0.5
 
         return score
+
+    @classmethod
+    def grant_authority(cls, granter: UserContext, target_role: str, domain: str, score: float) -> bool:
+        """
+        Dynamic Authority Grant (Governance).
+        Granter must have equal or higher authority in that domain to grant it.
+        """
+        # 1. Check Granter's Power
+        granter_auth = cls.calculate_write_authority(granter, domain)
+        if granter_auth < score:
+            ledger.log(AuditEvent(
+                action_type="GRANT_DENIED",
+                actor_id=granter.user_id,
+                role=granter.role,
+                target=domain,
+                details={"reason": "insufficient_authority", "yours": granter_auth, "requested": score}
+            ))
+            return False
+
+        # 2. Execute Grant
+        grant = AuthorityGrant(
+            granter_id=granter.user_id,
+            granter_role=granter.role,
+            target_role=target_role.lower(),
+            target_domain=domain,
+            score=score
+        )
+        authority_store.add_grant(grant)
+
+        # 3. Audit
+        ledger.log(AuditEvent(
+            action_type="AUTHORITY_GRANT",
+            actor_id=granter.user_id,
+            role=granter.role,
+            target=f"{target_role}:{domain}",
+            details={"score": score}
+        ))
+        return True
+
+    @classmethod
+    def revoke_authority(cls, revoker: UserContext, target_role: str, domain: str) -> bool:
+        """
+        Dynamic Revocation.
+        """
+        # 1. Check Revoker's Power (Must be Admin/Exec or original granter ideally, simplified here)
+        if revoker.role not in ["executive", "root"]:
+             ledger.log(AuditEvent(
+                action_type="REVOKE_DENIED",
+                actor_id=revoker.user_id,
+                role=revoker.role,
+                target=domain,
+                details={"reason": "requires_exec_or_root"}
+            ))
+             return False
+
+        # 2. Execute Revoke
+        authority_store.revoke(target_role.lower(), domain, revoker.role)
+
+        # 3. Audit
+        ledger.log(AuditEvent(
+            action_type="AUTHORITY_REVOKE",
+            actor_id=revoker.user_id,
+            role=revoker.role,
+            target=f"{target_role}:{domain}"
+        ))
+        return True
 
     @classmethod
     def can_read(cls, user: UserContext, envelope: Dict) -> bool:
