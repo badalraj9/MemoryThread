@@ -878,7 +878,14 @@ class MTInterface:
         # Run asyncio loop
         # Run asyncio loop
         try:
-            asyncio.run(main_loop())
+            # Check for existing loop (e.g. if embedded)
+            try:
+                loop = asyncio.get_running_loop()
+            except RuntimeError:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+
+            loop.run_until_complete(main_loop())
         except KeyboardInterrupt:
             self.console.print("\n[dim]Bye[/]")
         except EOFError:
