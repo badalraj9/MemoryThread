@@ -83,6 +83,90 @@ LOGO_LINES = [
 ]
 
 # --- BRIDGE LOGIC (The Brains) ---
+from dataclasses import dataclass
+
+@dataclass
+class GalaxyRow:
+    """Represents a joined row in the Cognitive Galaxy."""
+    # Fact (Source)
+    source_uri: str
+    # Dimension (Agent)
+    agent_role: str
+    authority: float
+    # Dimension (Belief)
+    belief_id: uuid.UUID
+    content: str
+    confidence: float
+    # Lineage
+    provenance: Dict[str, Any]
+
+class GalaxyQueryEngine:
+    """OLAP for Cognition."""
+    def __init__(self, client):
+        self.client = client
+
+    def slice_by_source(self, source_query: str, limit: int = 20) -> List[GalaxyRow]:
+        """SLICE: Select all beliefs derived from a specific source/fact."""
+        # Use Core Client to get raw data for OLAP to bypass secure filtering masking
+        if not hasattr(self.client, '_core_client'):
+             return []
+
+        core_results = self.client._core_client.recall(source_query, top_k=limit * 2)
+
+        rows = []
+        for mem in core_results.memories:
+            # Parse Raw Payload
+            try:
+                import json
+                payload = json.loads(mem.content)
+                if not isinstance(payload, dict):
+                    # Legacy memory (Fact)
+                    raw_text = mem.content
+                    prov = None
+                else:
+                    # Secure Memory (Dimension)
+                    raw_text = payload.get("text", "")
+                    prov = payload.get("_provenance", {})
+            except:
+                raw_text = mem.content
+                prov = None
+
+            match = False
+            uri = "unknown"
+
+            if source_query.lower() in raw_text.lower():
+                match = True
+                uri = source_query # Inferred
+
+            if match:
+                role = "unknown"
+                if prov and 'actor' in prov:
+                    role = prov['actor'].get('role', 'unknown')
+                elif mem.source:
+                    role = mem.source
+
+                rows.append(GalaxyRow(
+                    source_uri=uri,
+                    agent_role=role,
+                    authority=mem.authority,
+                    belief_id=mem.id,
+                    content=raw_text,
+                    confidence=mem.confidence,
+                    provenance=prov or {}
+                ))
+        return rows[:limit]
+
+    def drill_down(self, belief_id: uuid.UUID) -> Optional[Dict[str, Any]]:
+        """DRILL DOWN: Retrieve the full raw Event Log for a specific belief."""
+        if hasattr(self.client._core_client, '_memories'):
+            mem_state = self.client._core_client._memories.get(belief_id)
+            if mem_state:
+                return {
+                    "current_state": mem_state.current_value,
+                    "history_len": len(mem_state.history),
+                    "events": [e.payload for e in mem_state.history]
+                }
+        return None
 
 class ModelManager:
     """Manages Local and Cloud Models."""
@@ -252,13 +336,17 @@ class BridgeState:
         self.provider = self._detect_provider()
         self.variant = "surface" # surface | deep
 
+        # Workspace State
+        self.active_context_fact_id: Optional[str] = None
+        self.active_filename: str = ""
+
         # Short-term memory buffer
         self.conversation = ConversationManager()
 
         # We re-init SDK when agent changes (namespace switch)
         from memory_thread.sdk import MemoryClient
         from memory_thread.utils.secure_sdk import SecureMemoryClient
-        from memory_thread.utils.galaxy import GalaxyQueryEngine
+        # GalaxyQueryEngine is now local
 
         self._sdk_class = MemoryClient
         self._secure_class = SecureMemoryClient
@@ -291,7 +379,6 @@ class BridgeState:
             client = self._sdk_class(namespace=ns, use_db=False)
 
         # Update Galaxy Engine if needed
-        from memory_thread.utils.galaxy import GalaxyQueryEngine
         if self.secure_mode:
              self.galaxy = GalaxyQueryEngine(client)
         else:
@@ -454,6 +541,32 @@ class BridgeState:
 
         # Context Injection (@file)
         context_buffer = ""
+
+        # Workspace Injection (Focused File)
+        if self.active_context_fact_id:
+             # Fetch fact content
+             # We rely on Core Client for raw fetch
+             if hasattr(self.client, '_core_client'):
+                 try:
+                     # Attempt recall by ID (SDK doesn't have direct get, so we cheat via private access or search)
+                     # For now, we assume the user just wants the fact they focused on to be "top of mind"
+                     # We can inject a system note:
+                     context_buffer += f"\n[WORKSPACE FOCUS]: {self.active_filename} (ID: {self.active_context_fact_id})\n"
+                     # Ideally we fetch content.
+                     if hasattr(self.client._core_client, '_memories'):
+                         # Try local cache
+                         mem_state = self.client._core_client._memories.get(uuid.UUID(self.active_context_fact_id))
+                         if mem_state:
+                             content = mem_state.current_value.get('content', '')
+                             # Clean if JSON wrapped
+                             if content.startswith('{') and '"text":' in content:
+                                 import json
+                                 try: content = json.loads(content).get('text', content)
+                                 except: pass
+                             context_buffer += f"--- CONTENT ---\n{content}\n----------------\n"
+                 except:
+                     pass
+
         words = user_input.split()
         clean_input = []
         for w in words:
@@ -866,22 +979,61 @@ class MTInterface:
 
         # Main Loop logic
         async def main_loop():
+            code_buffer = []
+            in_code_mode = False
+
             while True:
                 try:
                     self.console.print()
-                    # Prompt is synchronous in this design, but that's fine as it waits for user
-                    # To make prompt async with asyncio is complex with prompt_toolkit's current session.prompt call
-                    # We will use prompt_async if possible, or just standard prompt and run heavy tasks async.
 
-                    user_input = await session.prompt_async([('class:prompt', '▌ ')], bottom_toolbar=self.get_bottom_toolbar)
+                    if in_code_mode:
+                        # Code Mode Prompt
+                        line = await session.prompt_async([('class:prompt', '... ')], bottom_toolbar=self.get_bottom_toolbar)
+                        if line.strip() == ":::":
+                            # End of Code Block
+                            in_code_mode = False
+                            full_code = "\n".join(code_buffer)
+                            self.console.print(Panel(full_code, title="Code Preview", border_style="blue"))
+
+                            # Ask for Action
+                            action = await session.prompt_async(HTML("<b>[1] Ingest Fact  [2] Ask Agent  [3] Both > </b>"))
+
+                            fact_id = None
+                            # Action 1 or 3: Ingest
+                            if action in ["1", "3"]:
+                                if hasattr(self.bridge.client, 'ingest_fact'):
+                                    fact_id = self.bridge.client.ingest_fact(full_code, source_uri="user:code_block", namespace="project")
+                                    self.console.print(f"[green]Ingested as Fact: {fact_id}[/]")
+                                else:
+                                    self.console.print("[red]Secure Mode required for Fact Ingestion.[/]")
+
+                            # Action 2 or 3: Chat
+                            if action in ["2", "3"]:
+                                user_input = full_code # Treat code as the message
+                                # Fallthrough to chat logic below...
+                            else:
+                                code_buffer = []
+                                continue
+                        else:
+                            code_buffer.append(line)
+                            continue
+                    else:
+                        # Standard Chat Prompt
+                        user_input = await session.prompt_async([('class:prompt', '▌ ')], bottom_toolbar=self.get_bottom_toolbar)
 
                     if not user_input.strip(): continue
                     user_input = user_input.strip()
 
                     if user_input.startswith("/"):
-                        # ... Command handling (fast enough to be sync usually) ...
                         parts = user_input.split()
                         cmd = parts[0].lower()
+                        arg = parts[1] if len(parts) > 1 else ""
+
+                        if cmd == "/code":
+                            in_code_mode = True
+                            code_buffer = []
+                            self.console.print("[bold yellow]--- Entering Code Mode (end with :::) ---[/]")
+                            continue
                         arg = parts[1] if len(parts) > 1 else ""
 
                         if cmd == "/quit": break
@@ -913,8 +1065,70 @@ class MTInterface:
                             self.console.print(self.bridge.handle_grant(arg))
                         elif cmd == "/revoke":
                             self.console.print(self.bridge.handle_revoke(arg))
+                        elif cmd == "/facts":
+                            # Alias for ls but broader
+                            if hasattr(self.bridge.client, 'recall'):
+                                res = self.bridge.client.recall("source:manual OR source:file", top_k=20)
+                                table = Table(title="Canonical Facts", border_style="green")
+                                table.add_column("Type", style="yellow")
+                                table.add_column("Source", style="cyan")
+                                table.add_column("ID", style="dim")
+                                for m in res.memories:
+                                    # Heuristic type detection
+                                    mtype = "File" if "file://" in m.source else "Manual"
+                                    table.add_row(mtype, m.source, str(m.id)[:8])
+                                self.console.print(table)
+                        elif cmd == "/beliefs":
+                            # /beliefs <fact_id>
+                            if not arg:
+                                self.console.print("[red]Usage: /beliefs <fact_id>[/]")
+                            else:
+                                if self.bridge.galaxy:
+                                    # Use Galaxy Slice to find beliefs derived from this fact
+                                    # We search for the ID in the text or provenance
+                                    # This works because record_belief links derived_from=[id]
+                                    # But slice_by_source currently searches text/uri.
+                                    # We might need to broaden slice_by_source to search IDs?
+                                    # GalaxyQueryEngine.slice_by_source uses "source_query" in recall.
+                                    # If we pass the UUID, and if 'derived_from' is indexed or in text?
+                                    # The secure payload hides it in JSON.
+                                    # We rely on text match or core search.
+                                    # Let's try passing the ID.
+                                    rows = self.bridge.galaxy.slice_by_source(arg)
+                                    if not rows:
+                                        self.console.print("[yellow]No beliefs found derived from this fact.[/]")
+                                    else:
+                                        table = Table(title=f"Beliefs about {arg}", border_style="magenta")
+                                        table.add_column("Agent", style="blue")
+                                        table.add_column("Content", style="white")
+                                        table.add_column("Conf", style="green")
+                                        for r in rows:
+                                            table.add_row(r.agent_role, r.content[:80], f"{r.confidence:.2f}")
+                                        self.console.print(table)
+                                else:
+                                    self.console.print("[red]Galaxy Engine not active.[/]")
+
                         elif cmd == "/galaxy":
                              self.handle_galaxy(arg)
+                        elif cmd == "/ls":
+                            # List persisted facts
+                            if hasattr(self.bridge.client, '_core_client'):
+                                res = self.bridge.client._core_client.recall("memory_type:fact", top_k=50) # keyword hack if supported
+                                # Or better: just generic list if backend supported it.
+                                # For prototype: we scan "file://" sources
+                                res = self.bridge.client.recall("file://", top_k=20)
+                                table = Table(title="Workspace Facts (Canonical Truth)", border_style="blue")
+                                table.add_column("Source", style="cyan")
+                                table.add_column("ID", style="dim")
+                                for m in res.memories:
+                                    if m.source.startswith("file://"):
+                                        table.add_row(m.source, str(m.id)[:8])
+                                self.console.print(table)
+                        elif cmd == "/focus":
+                             # focus <id>
+                             self.bridge.active_context_fact_id = arg
+                             self.bridge.active_filename = f"Fact-{arg[:8]}"
+                             self.console.print(f"[green]Workspace Focused: {arg}[/]")
                         elif cmd == "/ingest":
                              with Live(Spinner("dots", text="Scanning..."), transient=True):
                                  # This is heavy, run in executor
