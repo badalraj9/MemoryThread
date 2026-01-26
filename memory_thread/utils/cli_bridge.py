@@ -446,6 +446,12 @@ class BridgeState:
         # 1. Update Short-term History
         self.conversation.add_turn("user", user_input)
 
+        # Record User Input as FACT (if in secure mode)
+        user_fact_id = None
+        if hasattr(self.client, 'ingest_fact'):
+             # Store raw message as immutable fact
+             user_fact_id = self.client.ingest_fact(user_input, source_uri="user:input", namespace="conversation")
+
         # Context Injection (@file)
         context_buffer = ""
         words = user_input.split()
@@ -477,15 +483,6 @@ class BridgeState:
 
         # Variant Logic (Depth)
         top_k = 10 if self.variant == "deep" else 3
-        # Note: top_k isn't directly passed to chat() in current SDK,
-        # but the SDK's chat method does its own recall.
-        # Ideally we'd modify SDK to accept top_k, but we can't touch it.
-        # The bridge handles the prompt construction.
-
-        # We prepend system prompt to the query for now as SDK handles raw chat
-        # Ideally SDK would accept system_prompt arg, but bridge can wrapper it.
-        # Wait, SDK.chat DOES accept system_prompt.
-        # def chat(self, user_message: str, system_prompt: Optional[str] = None, use_local: bool = True) -> str:
 
         # Check if client supports smart_loop (SecureClient does, Base might not)
         kwargs = {}
@@ -501,6 +498,15 @@ class BridgeState:
 
         # Record Response
         self.conversation.add_turn("assistant", response)
+
+        # Persist Belief (Epistemic Artifact)
+        if hasattr(self.client, 'record_belief') and user_fact_id:
+             self.client.record_belief(
+                 content=response,
+                 derived_from=[user_fact_id],
+                 confidence=0.8, # Assumed confidence for chat
+                 namespace="conversation"
+             )
 
         return response
 
@@ -587,7 +593,11 @@ class BridgeState:
                         with open(path, 'r', encoding='utf-8') as f:
                             content = f.read(2000)
                             if content.strip():
-                                self.client.remember(f"File {path}:\n{content}", source="ingest")
+                                # Updated to strict ingestion API
+                                if hasattr(self.client, 'ingest_fact'):
+                                     self.client.ingest_fact(f"File {path}:\n{content}", source_uri=f"file://{path}")
+                                else:
+                                     self.client.remember(f"File {path}:\n{content}", source="ingest")
                                 count += 1
                     except Exception:
                         # Ignore encoding errors or permission issues

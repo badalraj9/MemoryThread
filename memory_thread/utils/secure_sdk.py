@@ -36,10 +36,94 @@ class SecureMemoryClient:
     def clearance(self):
         return self.user.grade.name
 
-    def remember(self, content: str, namespace: str = "public",
-                 memory_type: str = "fact") -> Optional[uuid.UUID]:
+    def ingest_fact(self, content: str, source_uri: str = "manual", namespace: str = "public") -> Optional[uuid.UUID]:
         """
-        Secure Remember with Provenance.
+        Class A Ingestion: Canonical Truth.
+        - Must be raw content (no embeddings, no opinions).
+        - Must be verifiable.
+        """
+        # DEBUG CHECK
+        # print(f"DEBUG: ingest_fact called with {content}")
+        # Prime Rule Checks
+        if not content or not isinstance(content, str):
+            raise ValueError("PRIME RULE VIOLATION: Fact content must be a non-empty string.")
+        if len(content) > 100000:
+             # Just a sanity check, large files are okay but memory limits exist
+             pass
+
+        # Check for Forbidden Patterns (Heuristic)
+        if content.strip().startswith("[") and content.strip().endswith("]") and "," in content:
+             # Rough check for vector/embedding dump
+             # If it looks like a list of floats, reject.
+             try:
+                 possible_vec = json.loads(content)
+                 if isinstance(possible_vec, list) and len(possible_vec) > 0 and isinstance(possible_vec[0], (float, int)):
+                     raise ValueError("PRIME RULE VIOLATION: Embeddings cannot be stored as Truth.")
+             except json.JSONDecodeError:
+                 pass
+             except ValueError as e:
+                 raise e # Re-raise our own violation
+             except Exception:
+                 pass
+
+        return self._internal_remember(
+            content=content,
+            namespace=namespace,
+            memory_type="fact",
+            confidence=1.0, # Facts are absolute
+            source_uri=source_uri,
+            provenance_extras={}
+        )
+
+    def record_belief(self, content: str, derived_from: List[uuid.UUID], confidence: float, namespace: str = "public") -> Optional[uuid.UUID]:
+        """
+        Class B Ingestion: Epistemic Artifact.
+        - Must have provenance (derived_from).
+        - Must have confidence.
+        """
+        # Prime Rule Checks
+        if not derived_from or not isinstance(derived_from, list):
+             raise ValueError("PRIME RULE VIOLATION: Beliefs must have explicit 'derived_from' provenance.")
+
+        if confidence is None or not (0.0 <= confidence <= 1.0):
+             raise ValueError("PRIME RULE VIOLATION: Beliefs must have a valid confidence score (0.0-1.0).")
+
+        return self._internal_remember(
+            content=content,
+            namespace=namespace,
+            memory_type="belief",
+            confidence=confidence,
+            source_uri=f"agent:{self.user.role}",
+            provenance_extras={"derived_from": [str(uid) for uid in derived_from]}
+        )
+
+    def remember(self, content: str, namespace: str = "public",
+                 memory_type: str = "fact", **kwargs) -> Optional[uuid.UUID]:
+        """
+        [DEPRECATED] Generic wrapper.
+        Routes to specific methods or warns.
+        """
+        print(f"WARNING: 'remember()' is deprecated. Use 'ingest_fact' or 'record_belief'.")
+
+        if memory_type == "fact":
+            return self.ingest_fact(content, namespace=namespace)
+        elif memory_type == "belief":
+            derived = kwargs.get('derived_from', [])
+            conf = kwargs.get('confidence', 0.5)
+            if not derived:
+                 # Soft violation for backward compat during migration?
+                 # NO. Prime Rule is law.
+                 raise ValueError("PRIME RULE VIOLATION: Cannot store belief without 'derived_from' via generic remember().")
+            return self.record_belief(content, derived, conf, namespace)
+        else:
+            # Default to Fact if ambiguous but warn?
+            # Safer to fail.
+             raise ValueError(f"Unknown memory_type: {memory_type}")
+
+    def _internal_remember(self, content: str, namespace: str, memory_type: str,
+                           confidence: float, source_uri: str, provenance_extras: Dict) -> Optional[uuid.UUID]:
+        """
+        Internal Secure Persist Logic.
         """
         # 1. Check Write Permissions & Get Authority
         authority_score = AccessControlService.calculate_write_authority(self.user, namespace)
@@ -54,40 +138,23 @@ class SecureMemoryClient:
             scope=Scope(namespace=namespace, domain=namespace) # Domain mapped to namespace for now
         )
 
-        # 3. Embed Envelope into Content (Payload Injection)
-        # Strategy: We append a hidden metadata block or struct if SDK supported it.
-        # Since SDK treats content as string, we will use a "Payload Injection" strategy
-        # where we serialize the envelope into the string or utilize the SDK's ability
-        # to store JSON if we were passing a dict.
-        # However, `MemoryClient.remember` takes `content: str`.
-        #
-        # BETTER STRATEGY: The Core SDK actually creates an Event with a `delta`.
-        # The `delta` usually contains `{"content": "..."}`.
-        # We can't change the SDK `remember` signature.
-        # BUT, looking at `MemoryClient.remember` implementation:
-        # It takes `content`.
-        # It creates a `delta={"content": content, ...}`.
-        # It allows NO metadata injection via arguments.
-        #
-        # WORKAROUND: We will JSON-encode the content to include the envelope.
-        # Users of SecureClient will need to decode it, OR we decode on recall.
+        # Merge extras (like derived_from)
+        env_dict = envelope.to_dict()
+        env_dict.update(provenance_extras)
 
+        # 3. Payload Injection
         secure_payload = {
             "text": content,
-            "_provenance": envelope.to_dict()
+            "_provenance": env_dict
         }
 
         serialized_content = json.dumps(secure_payload)
 
         # 4. Call Core
-        # We pass the serialized JSON as the "content".
-        # The Core treats it as a string (safe).
-        # Secure Recall will parse it back.
-
         event_id = self._core_client.remember(
             content=serialized_content,
-            source=f"agent:{self.user.role}", # Legacy audit
-            confidence=1.0,
+            source=source_uri,
+            confidence=confidence,
             authority=authority_score,
             memory_type=memory_type
         )
