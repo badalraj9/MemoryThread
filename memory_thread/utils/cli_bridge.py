@@ -258,6 +258,7 @@ class BridgeState:
         # We re-init SDK when agent changes (namespace switch)
         from memory_thread.sdk import MemoryClient
         from memory_thread.utils.secure_sdk import SecureMemoryClient
+        from memory_thread.utils.galaxy import GalaxyQueryEngine
 
         self._sdk_class = MemoryClient
         self._secure_class = SecureMemoryClient
@@ -267,6 +268,7 @@ class BridgeState:
         self.smart_mode = False # Layer VI toggle
         self.current_user_role = "employee" # Default role
         self.client = self._init_client()
+        self.galaxy = GalaxyQueryEngine(self.client) if self.secure_mode else None
 
     def _detect_provider(self) -> str:
         if os.environ.get("GROQ_API_KEY") and "your_" not in os.environ.get("GROQ_API_KEY"):
@@ -277,15 +279,25 @@ class BridgeState:
 
     def _init_client(self):
         """Initialize SDK based on current AGENT's namespace or Security Context."""
+        client = None
         if self.secure_mode:
             # Use Enterprise Secure Wrapper
             # We use a fixed user ID for demo purposes
-            return self._secure_class(user_id="demo-user", role=self.current_user_role)
+            client = self._secure_class(user_id="demo-user", role=self.current_user_role)
         else:
             # Standard Mode
             agent_cfg = AgentManager.AGENTS.get(self.agent, AgentManager.AGENTS["coder"])
             ns = agent_cfg["namespace"]
-            return self._sdk_class(namespace=ns, use_db=False)
+            client = self._sdk_class(namespace=ns, use_db=False)
+
+        # Update Galaxy Engine if needed
+        from memory_thread.utils.galaxy import GalaxyQueryEngine
+        if self.secure_mode:
+             self.galaxy = GalaxyQueryEngine(client)
+        else:
+             self.galaxy = None
+
+        return client
 
     def set_agent(self, name: str):
         if name in AgentManager.AGENTS:
@@ -335,8 +347,66 @@ class BridgeState:
 
         return output
 
+    def handle_galaxy(self, args: str):
+        """OLAP for Cognition."""
+        if not self.bridge.secure_mode: return "Enable Secure Mode first (/secure)"
+        if not self.bridge.galaxy: return "Galaxy Engine not initialized."
+
+        parts = args.split()
+        if not parts: return "Usage: /galaxy <slice|dice|drill> <args>"
+
+        op = parts[0].lower()
+        query = " ".join(parts[1:]) if len(parts) > 1 else ""
+
+        if op == "slice":
+            # /galaxy slice <source_uri>
+            if not query: return "Usage: /galaxy slice <source_name>"
+            rows = self.bridge.galaxy.slice_by_source(query)
+            if not rows: return "[yellow]No Cognitive Joins found for this Fact.[/]"
+
+            table = Table(title=f"Cognitive Slice: {query}", border_style="cyan")
+            table.add_column("Belief (Dimension)", style="white")
+            table.add_column("Agent", style="magenta")
+            table.add_column("Auth", justify="right", style="green")
+            table.add_column("ID", style="dim")
+
+            for r in rows:
+                table.add_row(
+                    r.content[:60] + "...",
+                    r.agent_role,
+                    f"{r.authority:.2f}",
+                    str(r.belief_id)[:8]
+                )
+            self.console.print(table)
+
+        elif op == "dice":
+            # /galaxy dice <role>
+            # NOTE: This only dices the *last* slice if we were stateful,
+            # or we assume we query broadly?
+            # For this prototype, let's just warn:
+            return "[yellow]Dice requires an active Slice context (not implemented in stateless CLI). Use Slice first.[/]"
+
+        elif op == "drill":
+            # /galaxy drill <id>
+            if not query: return "Usage: /galaxy drill <belief_id>"
+            try:
+                bid = uuid.UUID(query)
+            except:
+                return "[red]Invalid UUID[/]"
+
+            data = self.bridge.galaxy.drill_down(bid)
+            if not data:
+                return "[red]Fact not found in active memory cache.[/]"
+
+            self.console.print(Panel(str(data), title=f"Drill Down: {query}", border_style="yellow"))
+
+        else:
+            return f"[red]Unknown galaxy operation: {op}[/]"
+
+        return ""
+
     def handle_grant(self, args: str):
-        if not self.secure_mode: return "Enable Secure Mode first (/secure)"
+        if not self.bridge.secure_mode: return "Enable Secure Mode first (/secure)"
         parts = args.split()
         if len(parts) < 3: return "Usage: /grant <role> <domain> <score>"
         try:
@@ -570,6 +640,7 @@ class MTInterface:
                 '/grant': {r: None for r in roles},
                 '/revoke': {r: None for r in roles},
                 '/smart': None,
+                '/galaxy': {'slice': None, 'dice': None, 'drill': None},
                 '/ingest': None, '/clear': None, '/quit': None, '/help': None,
             })
 
@@ -832,6 +903,8 @@ class MTInterface:
                             self.console.print(self.bridge.handle_grant(arg))
                         elif cmd == "/revoke":
                             self.console.print(self.bridge.handle_revoke(arg))
+                        elif cmd == "/galaxy":
+                             self.handle_galaxy(arg)
                         elif cmd == "/ingest":
                              with Live(Spinner("dots", text="Scanning..."), transient=True):
                                  # This is heavy, run in executor
