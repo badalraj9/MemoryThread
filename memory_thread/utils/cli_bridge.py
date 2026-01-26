@@ -11,6 +11,9 @@ import os
 import time
 import glob
 import uuid
+import asyncio
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional, List, Dict, Any
 
@@ -26,8 +29,8 @@ import warnings
 
 # 1. Global Logging Configuration
 logging.basicConfig(
-    filename='mt.log',
-    level=logging.ERROR,
+    filename='tui_debug.log',
+    level=logging.INFO,
     format='%(asctime)s %(name)s %(levelname)s %(message)s',
     filemode='w'
 )
@@ -364,11 +367,12 @@ class BridgeState:
     def chat(self, user_input: str) -> str:
         """
         Intelligent Chat Bridge.
-        1. Inject Agent Persona
-        2. Inject Context (File/Memory)
-        3. Inject Conversation History (Short-term)
-        4. Call MT
         """
+        # ... logic moved to _chat_sync ...
+        return self._chat_sync(user_input)
+
+    def _chat_sync(self, user_input: str) -> str:
+        """Synchronous implementation of Chat Logic."""
         # 1. Update Short-term History
         self.conversation.add_turn("user", user_input)
 
@@ -544,21 +548,27 @@ class MTInterface:
         except: pass
 
         self.bridge = BridgeState()
+        self.executor = ThreadPoolExecutor(max_workers=1)
 
         # OpenCode Command Structure
         self.completer = None
         if PROMPT_TOOLKIT_AVAILABLE:
+            # Dynamic Role List
+            try:
+                from memory_thread.nervous.access_control import AccessControlService
+                roles = {r: None for r in AccessControlService.ROLE_GRADES.keys()}
+            except ImportError:
+                roles = {'guest': None, 'root': None} # Fallback
+
             self.completer = NestedCompleter.from_nested_dict({
                 '/agents': {'coder': None, 'architect': None, 'reviewer': None},
                 '/variants': {'surface': None, 'deep': None},
                 '/conf': {'groq': None, 'openrouter': None, 'local': None},
-                '/login': {
-                    'guest': None, 'employee': None, 'developer': None,
-                    'researcher': None, 'executive': None, 'root': None
-                },
+                '/login': roles,
                 '/secure': None,
                 '/audit': None,
-                '/grant': None, '/revoke': None,
+                '/grant': {r: None for r in roles},
+                '/revoke': {r: None for r in roles},
                 '/smart': None,
                 '/ingest': None, '/clear': None, '/quit': None, '/help': None,
             })
@@ -639,10 +649,18 @@ class MTInterface:
     def login_flow(self, arg_role: str):
         """Hardened Pentagon-style Login."""
         from memory_thread.nervous.vault import vault
+        from memory_thread.nervous.access_control import AccessControlService
 
         # 1. Identity Check
         target_role = arg_role.lower()
         if target_role == "root": target_role = "godfather" # Alias
+
+        # Strict Validation
+        if target_role not in AccessControlService.ROLE_GRADES:
+            valid = ", ".join(AccessControlService.ROLE_GRADES.keys())
+            self.console.print(f"[red]INVALID IDENTITY: '{target_role}'[/]")
+            self.console.print(f"[dim]Valid personnel: {valid}[/]")
+            return
 
         # 2. Access Key Prompt
         self.console.print(f"[bold cyan]IDENTITY > {target_role.upper()}[/]")
@@ -683,6 +701,32 @@ class MTInterface:
         else:
             self.console.print("[bold red]ACCESS DENIED. INCIDENT LOGGED.[/]")
 
+    async def async_chat_task(self, user_input):
+        """Async wrapper for the heavy lifting."""
+        loop = asyncio.get_event_loop()
+
+        # 1. Get Sources (Fast-ish, but DB call)
+        sources_view = None
+        if self.bridge.secure_mode:
+             # run_in_executor
+             res = await loop.run_in_executor(self.executor, lambda: self.bridge.client.recall(user_input, top_k=5))
+             if res.memories:
+                 s_text = "[bold]Evidence:[/]\n"
+                 for i, m in enumerate(res.memories, 1):
+                     src_label = getattr(m, 'source', 'unknown')
+                     s_text += f"{i}. {m.content[:60]}... [dim]({src_label})[/]\n"
+                 sources_view = Panel(s_text, title="Reasoning Sources", border_style="blue")
+
+        # 2. Get Response (Slow - LLM)
+        response = await loop.run_in_executor(self.executor, lambda: self.bridge._chat_sync(user_input))
+
+        # 3. Graph Insight
+        graph_insight = None
+        if self.graph_mode:
+             graph_insight = await loop.run_in_executor(self.executor, lambda: self.bridge.get_graph_insight(user_input))
+
+        return sources_view, response, graph_insight
+
     def run(self):
         self.clear_screen()
         self.print_logo()
@@ -698,6 +742,16 @@ class MTInterface:
         g_key = vault.get_or_create_godfather_key()
         if "MT-" in g_key:
             self.console.print(Panel(f"[bold red]NUCLEAR KEY GENERATED:[/]\n{g_key}\n[dim]Save this. It will not be shown again.[/]", border_style="red"))
+
+        # System Overview
+        status_panel = (
+            f"[bold]System:[/]\t[green]ONLINE[/]\n"
+            f"[bold]Identity:[/]\t{self.bridge.current_user_role.upper()}\n"
+            f"[bold]Security:[/]\t{'[green]ACTIVE[/]' if self.bridge.secure_mode else '[dim]INACTIVE[/]'}\n"
+            f"[bold]Smart Loop:[/]\t{'[cyan]READY[/]' if self.bridge.smart_mode else '[dim]OFF[/]'}\n\n"
+            f"[dim]Try: /login guest (PIN: 0000) or /help[/]"
+        )
+        self.console.print(Panel(status_panel, title="System Overview", border_style="blue", padding=(0, 1)))
 
         # --- Key Bindings ---
         bindings = KeyBindings()
@@ -729,106 +783,108 @@ class MTInterface:
             key_bindings=bindings
         )
 
-        while True:
-            try:
-                self.console.print()
-                user_input = session.prompt([('class:prompt', '▌ ')], bottom_toolbar=self.get_bottom_toolbar)
+        # Main Loop logic
+        async def main_loop():
+            while True:
+                try:
+                    self.console.print()
+                    # Prompt is synchronous in this design, but that's fine as it waits for user
+                    # To make prompt async with asyncio is complex with prompt_toolkit's current session.prompt call
+                    # We will use prompt_async if possible, or just standard prompt and run heavy tasks async.
 
-                if not user_input.strip(): continue
-                user_input = user_input.strip()
+                    user_input = await session.prompt_async([('class:prompt', '▌ ')], bottom_toolbar=self.get_bottom_toolbar)
 
-                if user_input.startswith("/"):
-                    parts = user_input.split()
-                    cmd = parts[0].lower()
-                    arg = parts[1] if len(parts) > 1 else ""
+                    if not user_input.strip(): continue
+                    user_input = user_input.strip()
 
-                    if cmd == "/quit": break
-                    elif cmd == "/agents":
-                        if self.bridge.set_agent(arg): self.console.print(f"[green]Agent: {arg}[/]")
-                        else: self.console.print("[red]Use: /agents <coder|architect|reviewer>[/]")
-                    elif cmd == "/variants":
-                        if self.bridge.set_variant(arg): self.console.print(f"[green]Variant: {arg}[/]")
-                        else: self.console.print("[red]Use: /variants <surface|deep>[/]")
-                    elif cmd == "/conf": self._handle_conf(arg)
-                    elif cmd == "/login":
-                        if arg:
-                            self.login_flow(arg)
-                        else:
-                            self.console.print("[red]Usage: /login <role>[/]")
-                    elif cmd == "/secure":
-                        state = self.bridge.toggle_security()
-                        status = "ENABLED" if state else "DISABLED"
-                        color = "green" if state else "red"
-                        self.console.print(f"[{color}]Enterprise Security: {status}[/]")
-                    elif cmd == "/smart":
-                        state = self.bridge.toggle_smart()
-                        status = "ENABLED" if state else "DISABLED"
-                        self.console.print(f"[cyan]Smart Reflection Loop: {status}[/]")
-                    elif cmd == "/audit":
-                        log_view = self.bridge.view_audit()
-                        self.console.print(Panel(log_view, title="Audit Log", border_style="red"))
-                    elif cmd == "/grant":
-                        self.console.print(self.bridge.handle_grant(arg))
-                    elif cmd == "/revoke":
-                        self.console.print(self.bridge.handle_revoke(arg))
-                    elif cmd == "/ingest":
-                         with Live(Spinner("dots", text="Scanning..."), transient=True):
-                             c = self.bridge.ingest_project()
-                         self.console.print(f"[green]Ingested {c} files[/]")
-                    elif cmd == "/clear":
-                        self.bridge.client.clear()
-                        self.console.print("[green]Cleared memory[/]")
-                    elif cmd == "/help":
-                        self.console.print("[dim]/agents, /variants, /conf, /login, /secure, /smart, /grant, /revoke, /audit, /ingest, /clear, /quit[/]")
-                    else: self.console.print(f"[red]Unknown: {cmd}[/]")
-                    continue
+                    if user_input.startswith("/"):
+                        # ... Command handling (fast enough to be sync usually) ...
+                        parts = user_input.split()
+                        cmd = parts[0].lower()
+                        arg = parts[1] if len(parts) > 1 else ""
 
-                # --- CHAT ---
-                with Live(Spinner("dots", style=self.DIM), transient=True, refresh_per_second=10):
-                    # We can't easily get the 'recall_result' from chat() directly without refactoring SDK return types.
-                    # For Layer V Lite, we will do a manual recall in the bridge to show sources,
-                    # mirroring what the chat loop sees.
+                        if cmd == "/quit": break
+                        elif cmd == "/agents":
+                            if self.bridge.set_agent(arg): self.console.print(f"[green]Agent: {arg}[/]")
+                            else: self.console.print("[red]Use: /agents <coder|architect|reviewer>[/]")
+                        elif cmd == "/variants":
+                            if self.bridge.set_variant(arg): self.console.print(f"[green]Variant: {arg}[/]")
+                            else: self.console.print("[red]Use: /variants <surface|deep>[/]")
+                        elif cmd == "/conf": self._handle_conf(arg)
+                        elif cmd == "/login":
+                            if arg:
+                                self.login_flow(arg)
+                            else:
+                                self.console.print("[red]Usage: /login <role>[/]")
+                        elif cmd == "/secure":
+                            state = self.bridge.toggle_security()
+                            status = "ENABLED" if state else "DISABLED"
+                            color = "green" if state else "red"
+                            self.console.print(f"[{color}]Enterprise Security: {status}[/]")
+                        elif cmd == "/smart":
+                            state = self.bridge.toggle_smart()
+                            status = "ENABLED" if state else "DISABLED"
+                            self.console.print(f"[cyan]Smart Reflection Loop: {status}[/]")
+                        elif cmd == "/audit":
+                            log_view = self.bridge.view_audit()
+                            self.console.print(Panel(log_view, title="Audit Log", border_style="red"))
+                        elif cmd == "/grant":
+                            self.console.print(self.bridge.handle_grant(arg))
+                        elif cmd == "/revoke":
+                            self.console.print(self.bridge.handle_revoke(arg))
+                        elif cmd == "/ingest":
+                             with Live(Spinner("dots", text="Scanning..."), transient=True):
+                                 # This is heavy, run in executor
+                                 c = await asyncio.get_event_loop().run_in_executor(self.executor, self.bridge.ingest_project)
+                             self.console.print(f"[green]Ingested {c} files[/]")
+                        elif cmd == "/clear":
+                            self.bridge.client.clear()
+                            self.console.print("[green]Cleared memory[/]")
+                        elif cmd == "/help":
+                            self.console.print("[dim]/agents, /variants, /conf, /login, /secure, /smart, /grant, /revoke, /audit, /ingest, /clear, /quit[/]")
+                        else: self.console.print(f"[red]Unknown: {cmd}[/]")
+                        continue
 
-                    # 1. Get Sources first
+                    # --- CHAT (ASYNC) ---
+                    # Now the spinner will actually spin!
                     sources_view = None
-                    if self.bridge.secure_mode:
-                         # Use top_k=5 matching SecureClient default
-                         res = self.bridge.client.recall(user_input, top_k=5)
-                         if res.memories:
-                             s_text = "[bold]Evidence:[/]\n"
-                             for i, m in enumerate(res.memories, 1):
-                                 src_label = getattr(m, 'source', 'unknown')
-                                 s_text += f"{i}. {m.content[:60]}... [dim]({src_label})[/]\n"
-                             sources_view = Panel(s_text, title="Reasoning Sources", border_style="blue")
-
-                    # 2. Get Response
-                    response = self.bridge.chat(user_input)
-
-                    # 3. Graph Insight
+                    response = ""
                     graph_insight = None
-                    if self.graph_mode:
-                         graph_insight = self.bridge.get_graph_insight(user_input)
 
-                if sources_view:
-                    self.console.print(sources_view)
+                    with Live(Spinner("dots", style=self.DIM), transient=True, refresh_per_second=10):
+                        sources_view, response, graph_insight = await self.async_chat_task(user_input)
 
-                if graph_insight:
-                    title = "Knowledge Graph"
-                    if RICH_AVAILABLE:
-                         self.console.print(Panel(graph_insight, title=title, border_style="yellow", padding=(0, 1)))
-                    else:
-                         print(f"--- {title} ---\n{graph_insight}")
+                    if sources_view:
+                        self.console.print(sources_view)
 
-                self.console.print()
-                self.console.print(response)
+                    if graph_insight:
+                        title = "Knowledge Graph"
+                        if RICH_AVAILABLE:
+                             self.console.print(Panel(graph_insight, title=title, border_style="yellow", padding=(0, 1)))
+                        else:
+                             print(f"--- {title} ---\n{graph_insight}")
 
-            except KeyboardInterrupt:
-                self.console.print("\n[dim]Bye[/]")
-                break
-            except EOFError:
-                break
-            except Exception as e:
-                self.console.print(f"[red]Err: {e}[/]")
+                    self.console.print()
+                    self.console.print(response)
+
+                except KeyboardInterrupt:
+                    self.console.print("\n[dim]Bye[/]")
+                    break
+                except EOFError:
+                    break
+                except Exception as e:
+                    self.console.print(f"[red]Err: {e}[/]")
+
+        # Run asyncio loop
+        # Run asyncio loop
+        try:
+            asyncio.run(main_loop())
+        except KeyboardInterrupt:
+            self.console.print("\n[dim]Bye[/]")
+        except EOFError:
+            pass
+        except Exception as e:
+            self.console.print(f"[red]Err: {e}[/]")
 
 if __name__ == "__main__":
     if not RICH_AVAILABLE:
