@@ -293,13 +293,34 @@ class BridgeState:
 
     def set_role(self, role: str):
         # Validate role exists in our policy
-        valid_roles = ["guest", "employee", "developer", "researcher", "executive"]
+        valid_roles = ["guest", "employee", "developer", "researcher", "executive", "root"]
         if role.lower() in valid_roles:
             self.current_user_role = role.lower()
             if self.secure_mode:
                 self.client = self._init_client()
             return True
         return False
+
+    def view_audit(self):
+        """View Audit Logs (Root only)."""
+        if not self.secure_mode or not hasattr(self.client, 'audit_log'):
+             return "Audit logs only available in Secure Mode."
+
+        logs = self.client.audit_log(limit=20)
+        if not logs:
+            return "No audit logs found or Access Denied."
+
+        output = "[bold underline]OPERATIONAL AUDIT LEDGER[/]\n"
+        for entry in logs:
+            ts = entry.get('timestamp', '')[:19]
+            actor = entry.get('actor', {}).get('role', 'unknown').upper()
+            action = entry.get('type', 'UNKNOWN')
+            target = entry.get('target', '')
+
+            color = "red" if "DENIED" in action else "green"
+            output += f"[{color}]{ts} | {actor} | {action} | {target}[/]\n"
+
+        return output
 
     def set_variant(self, variant: str):
         if variant in ["surface", "deep"]:
@@ -494,9 +515,10 @@ class MTInterface:
                 '/conf': {'groq': None, 'openrouter': None, 'local': None},
                 '/login': {
                     'guest': None, 'employee': None, 'developer': None,
-                    'researcher': None, 'executive': None
+                    'researcher': None, 'executive': None, 'root': None
                 },
                 '/secure': None,
+                '/audit': None,
                 '/ingest': None, '/clear': None, '/quit': None, '/help': None,
             })
 
@@ -633,12 +655,15 @@ class MTInterface:
                             self.console.print(f"[green]Logged in as: {arg.upper()}[/]")
                             if not self.bridge.secure_mode:
                                 self.console.print("[dim]Note: Security mode is OFF. Type /secure to enable.[/]")
-                        else: self.console.print("[red]Unknown role. Use: guest, employee, developer, researcher, executive[/]")
+                        else: self.console.print("[red]Unknown role. Use: guest, employee, developer, researcher, executive, root[/]")
                     elif cmd == "/secure":
                         state = self.bridge.toggle_security()
                         status = "ENABLED" if state else "DISABLED"
                         color = "green" if state else "red"
                         self.console.print(f"[{color}]Enterprise Security: {status}[/]")
+                    elif cmd == "/audit":
+                        log_view = self.bridge.view_audit()
+                        self.console.print(Panel(log_view, title="Audit Log", border_style="red"))
                     elif cmd == "/ingest":
                          with Live(Spinner("dots", text="Scanning..."), transient=True):
                              c = self.bridge.ingest_project()
