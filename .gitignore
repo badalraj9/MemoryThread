@@ -14,3 +14,9 @@ venv/
 server.log
 tests/phase5_ordeal/mock_db.json
 tests/phase5_ordeal_v2/
+
+# Memory Thread Enterprise Data
+.mt/
+vault.json
+audit_ledger.jsonl
+authority_grants.jsonl
