@@ -1,1202 +1,480 @@
 """
-MT CLI Bridge - The "OpenCode" style Interface for Memory Thread.
-
-ARCHITECTURE:
-- Bridge: Manages state (Scope, Depth, Provider) that SDK doesn't know about.
-- SDK: Dumb storage engine. Bridge tells it what to do.
-- UI: TUI layer mocking OpenCode aesthetics.
+MT Neural Interface - Professional Galaxy TUI
 """
-import sys
-import os
-import time
-import glob
-import uuid
-import asyncio
-import threading
-from concurrent.futures import ThreadPoolExecutor
-from pathlib import Path
-from typing import Optional, List, Dict, Any
 
-# Ensure project root is in path
-current_dir = os.path.dirname(os.path.abspath(__file__))
-project_root = os.path.dirname(os.path.dirname(current_dir))
-if project_root not in sys.path:
-    sys.path.insert(0, project_root)
-
-# --- LOGGING & WARNING SUPPRESSION ---
-import logging
-import warnings
-
-# 1. Global Logging Configuration
-logging.basicConfig(
-    filename='tui_debug.log',
-    level=logging.INFO,
-    format='%(asctime)s %(name)s %(levelname)s %(message)s',
-    filemode='w'
+from textual.app import App, ComposeResult
+from textual.widgets import (
+    Header, Footer, Static, Input, ListView, ListItem,
+    Label, Tree, DataTable, Log, TabbedContent, TabPane
 )
+from textual.containers import Container, Horizontal, Vertical, ScrollableContainer
+from textual.binding import Binding
+from textual.reactive import reactive
+from textual import events
+import asyncio
+from datetime import datetime
+from typing import List, Dict, Optional
+import uuid
 
-# 2. Monkeypatch MT's internal logger to prevent it from resetting to INFO
-# This is required because utils.logger.get_logger() hardcodes level to INFO
-try:
-    import memory_thread.utils.logger
-    def quiet_get_logger(name):
-        logger = logging.getLogger(name)
-        logger.setLevel(logging.ERROR)
-        logger.propagate = False
-        return logger
-    memory_thread.utils.logger.get_logger = quiet_get_logger
-except ImportError:
+# MT imports
+from memory_thread.sdk import MemoryClient
+from memory_thread.core.galaxy import GalaxyCore  # Your new core
+
+# ============================================================================
+# DATA MODELS
+# ============================================================================
+
+class AgentUniverse:
+    def __init__(self, agent_id: str, active: bool = False):
+        self.agent_id = agent_id
+        self.active = active
+        self.fact_count = 0
+        self.belief_count = 0
+        self.activity_pct = 0.0
+
+class Conflict:
+    def __init__(self, fact_id: str, agents: List[str], severity: str):
+        self.fact_id = fact_id
+        self.agents = agents
+        self.severity = severity
+        self.timestamp = datetime.now()
+
+class FactEntry:
+    def __init__(self, fact_id: str, source: str, preview: str):
+        self.fact_id = fact_id
+        self.source = source
+        self.preview = preview
+        self.timestamp = datetime.now()
+
+# ============================================================================
+# CUSTOM WIDGETS
+# ============================================================================
+
+class AgentUniversePanel(Static):
+    """Shows active agent universes"""
+    
+    def __init__(self):
+        super().__init__()
+        self.universes: List[AgentUniverse] = []
+    
+    def compose(self) -> ComposeResult:
+        yield Static("AGENT UNIVERSES", classes="panel-title")
+        yield ListView(id="universe-list")
+    
+    def update_universes(self, universes: List[AgentUniverse]):
+        self.universes = universes
+        list_view = self.query_one("#universe-list", ListView)
+        list_view.clear()
+        
+        for u in universes:
+            indicator = "●" if u.active else "○"
+            line = f"{indicator} {u.agent_id:15} [{u.activity_pct:>3.0f}%]"
+            item = ListItem(Label(line))
+            list_view.append(item)
+
+class ConflictPanel(Static):
+    """Shows active conflicts detected by Galaxy"""
+    
+    def compose(self) -> ComposeResult:
+        yield Static("ACTIVE CONFLICTS", classes="panel-title")
+        yield ListView(id="conflict-list")
+    
+    def update_conflicts(self, conflicts: List[Conflict]):
+        list_view = self.query_one("#conflict-list", ListView)
+        list_view.clear()
+        
+        if not conflicts:
+            list_view.append(ListItem(Label("[dim]No conflicts detected[/]")))
+            return
+        
+        for c in conflicts:
+            agents_str = " vs ".join(c.agents)
+            severity_color = {
+                "LOW": "green",
+                "MEDIUM": "yellow", 
+                "HIGH": "red"
+            }.get(c.severity, "white")
+            
+            item = ListItem(Label(
+                f"[bold]!{/] {c.fact_id[:8]}\n"
+                f"  {agents_str}\n"
+                f"  [{severity_color}]{c.severity}[/]"
+            ))
+            list_view.append(item)
+
+class FactStreamPanel(Static):
+    """Shows recent facts ingested into galaxy"""
+    
+    def compose(self) -> ComposeResult:
+        yield Static("RECENT FACTS", classes="panel-title")
+        yield DataTable(id="fact-table")
+    
+    def on_mount(self):
+        table = self.query_one("#fact-table", DataTable)
+        table.add_columns("ID", "Source", "Preview", "Age")
+        table.zebra_stripes = True
+    
+    def update_facts(self, facts: List[FactEntry]):
+        table = self.query_one("#fact-table", DataTable)
+        table.clear()
+        
+        for f in facts:
+            age = self._format_age(f.timestamp)
+            table.add_row(
+                f.fact_id[:8],
+                f.source[:15],
+                f.preview[:30] + "...",
+                age
+            )
+    
+    def _format_age(self, timestamp: datetime) -> str:
+        delta = datetime.now() - timestamp
+        if delta.seconds < 60:
+            return f"{delta.seconds}s ago"
+        elif delta.seconds < 3600:
+            return f"{delta.seconds // 60}m ago"
+        else:
+            return f"{delta.seconds // 3600}h ago"
+
+class ChatPanel(ScrollableContainer):
+    """Main chat interface with conflict notifications"""
+    
+    def compose(self) -> ComposeResult:
+        yield Log(id="chat-log", auto_scroll=True)
+        yield Input(placeholder="▌ Type your message...", id="chat-input")
+    
+    def add_message(self, role: str, content: str, conflict: bool = False):
+        log = self.query_one("#chat-log", Log)
+        
+        color = {
+            "user": "cyan",
+            "assistant": "white",
+            "system": "yellow"
+        }.get(role, "white")
+        
+        log.write_line(f"[{color}]{role.upper()}:[/] {content}")
+        
+        if conflict:
+            log.write_line("[red]⚠ Conflict detected - press 'c' to resolve[/]")
+
+# ============================================================================
+# MAIN APP
+# ============================================================================
+
+class MTNeuralInterface(App):
+    """Memory Thread Neural Interface"""
+    
+    CSS = """
+    Screen {
+        background: $surface;
+    }
+    
+    .panel-title {
+        background: $primary;
+        color: $text;
+        padding: 0 1;
+        text-style: bold;
+    }
+    
+    #universe-list, #conflict-list {
+        height: 10;
+        border: solid $primary;
+    }
+    
+    #fact-table {
+        height: 6;
+        border: solid $primary;
+    }
+    
+    #chat-log {
+        height: 1fr;
+        border: solid $accent;
+        margin: 1 0;
+    }
+    
+    #chat-input {
+        border: solid $accent;
+    }
+    
+    Input {
+        background: $surface;
+    }
+    """
+    
+    BINDINGS = [
+        Binding("q", "quit", "Quit"),
+        Binding("u", "show_universes", "Universes"),
+        Binding("c", "show_conflicts", "Conflicts"),
+        Binding("f", "show_facts", "Facts"),
+        Binding("slash", "search", "Search"),
+        Binding("question_mark", "help", "Help"),
+        Binding("s", "toggle_secure", "Security"),
+        Binding("g", "toggle_galaxy", "Galaxy"),
+    ]
+    
+    TITLE = "MT NEURAL INTERFACE v2.0"
+    
+    # Reactive properties
+    secure_mode = reactive(False)
+    galaxy_active = reactive(True)
+    active_agent = reactive("SecurityBot")
+    
+    def __init__(self):
+        super().__init__()
+        self.galaxy: Optional[GalaxyCore] = None
+        self.universes: List[AgentUniverse] = []
+        self.conflicts: List[Conflict] = []
+        self.facts: List[FactEntry] = []
+        
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        
+        with Horizontal():
+            # Left column
+            with Vertical(classes="left-panel"):
+                yield AgentUniversePanel()
+                yield ConflictPanel()
+            
+            # Right column (main)
+            with Vertical(classes="main-panel"):
+                yield FactStreamPanel()
+                yield ChatPanel()
+        
+        yield Footer()
+    
+    def on_mount(self):
+        """Initialize Galaxy core and start monitoring"""
+        self.initialize_galaxy()
+        self.set_interval(2.0, self.update_status)
+    
+    def initialize_galaxy(self):
+        """Initialize the Galaxy architecture"""
+        # This will use your actual GalaxyCore
+        from memory_thread.core.galaxy import GalaxyCore
+        from memory_thread.services.persistence import PersistenceEngine
+        
+        # Initialize core components
+        pg_client = None  # Your Postgres client
+        qdrant_client = None  # Your Qdrant client
+        
+        self.galaxy = GalaxyCore(pg_client, qdrant_client)
+        
+        # Register default agents
+        self.galaxy.register_agent("SecurityBot", authority=0.9)
+        self.galaxy.register_agent("MarketingBot", authority=0.5)
+        self.galaxy.register_agent("AuditBot", authority=0.8)
+        
+        # Initialize UI state
+        self.universes = [
+            AgentUniverse("SecurityBot", active=True),
+            AgentUniverse("MarketingBot"),
+            AgentUniverse("AuditBot"),
+        ]
+    
+    async def update_status(self):
+        """Periodic update of UI state from Galaxy"""
+        if not self.galaxy:
+            return
+        
+        # Update agent activity
+        for universe in self.universes:
+            # Query Galaxy for agent activity
+            facts = await self.galaxy.get_agent_facts(universe.agent_id)
+            universe.fact_count = len(facts)
+            universe.activity_pct = (universe.fact_count / 100.0) * 100  # Mock
+        
+        # Update conflicts
+        conflicts = await self.galaxy.get_active_conflicts()
+        self.conflicts = [
+            Conflict(
+                fact_id=c.fact_id,
+                agents=[b.agent_id for b in c.beliefs],
+                severity=self._compute_severity(c)
+            )
+            for c in conflicts
+        ]
+        
+        # Update recent facts
+        recent = await self.galaxy.get_recent_facts(limit=10)
+        self.facts = [
+            FactEntry(
+                fact_id=str(f.id),
+                source=f.source_uri,
+                preview=f.content[:50]
+            )
+            for f in recent
+        ]
+        
+        # Refresh UI
+        self.refresh_panels()
+    
+    def _compute_severity(self, conflict) -> str:
+        """Compute conflict severity based on authority divergence"""
+        authorities = [b.agent_authority for b in conflict.beliefs]
+        if not authorities:
+            return "LOW"
+        
+        max_auth = max(authorities)
+        min_auth = min(authorities)
+        divergence = max_auth - min_auth
+        
+        if divergence > 0.5:
+            return "HIGH"
+        elif divergence > 0.3:
+            return "MEDIUM"
+        else:
+            return "LOW"
+    
+    def refresh_panels(self):
+        """Refresh all UI panels with current data"""
+        universe_panel = self.query_one(AgentUniversePanel)
+        universe_panel.update_universes(self.universes)
+        
+        conflict_panel = self.query_one(ConflictPanel)
+        conflict_panel.update_conflicts(self.conflicts)
+        
+        fact_panel = self.query_one(FactStreamPanel)
+        fact_panel.update_facts(self.facts)
+    
+    async def on_input_submitted(self, event: Input.Submitted):
+        """Handle chat input"""
+        chat_panel = self.query_one(ChatPanel)
+        user_input = event.value
+        
+        if not user_input.strip():
+            return
+        
+        # Clear input
+        event.input.value = ""
+        
+        # Show user message
+        chat_panel.add_message("user", user_input)
+        
+        # Process through Galaxy
+        if self.galaxy:
+            # Ingest as fact
+            fact, belief = await self.galaxy.ingest(
+                agent_id=self.active_agent,
+                raw_observation={"text": user_input, "source": "user:input"}
+            )
+            
+            # Generate response (mock - integrate with your LLM)
+            response = await self.generate_response(user_input, belief)
+            
+            # Check for conflicts
+            has_conflict = len(self.conflicts) > 0
+            
+            # Show response
+            chat_panel.add_message("assistant", response, conflict=has_conflict)
+    
+    async def generate_response(self, user_input: str, belief) -> str:
+        """Generate response using LLM (integrate with your chat logic)"""
+        # This should call your actual LLM integration
+        return f"Processing: {user_input}"
+    
+    # ========================================================================
+    # ACTIONS (Key Bindings)
+    # ========================================================================
+    
+    def action_show_universes(self):
+        """Show detailed universe view"""
+        self.push_screen(UniverseDetailScreen(self.universes))
+    
+    def action_show_conflicts(self):
+        """Show conflict resolution screen"""
+        if self.conflicts:
+            self.push_screen(ConflictResolutionScreen(self.conflicts[0]))
+        else:
+            self.notify("No active conflicts")
+    
+    def action_show_facts(self):
+        """Show fact browser"""
+        self.push_screen(FactBrowserScreen(self.facts))
+    
+    def action_search(self):
+        """Open search interface"""
+        self.notify("Search not implemented yet")
+    
+    def action_help(self):
+        """Show help screen"""
+        self.push_screen(HelpScreen())
+    
+    def action_toggle_secure(self):
+        """Toggle secure mode"""
+        self.secure_mode = not self.secure_mode
+        status = "ENABLED" if self.secure_mode else "DISABLED"
+        self.notify(f"Secure Mode: {status}")
+    
+    def action_toggle_galaxy(self):
+        """Toggle galaxy architecture"""
+        self.galaxy_active = not self.galaxy_active
+        status = "ACTIVE" if self.galaxy_active else "INACTIVE"
+        self.notify(f"Galaxy: {status}")
+    
+    def watch_secure_mode(self, secure: bool):
+        """Update header when secure mode changes"""
+        self.sub_title = "[SECURE]" if secure else ""
+    
+    def watch_galaxy_active(self, active: bool):
+        """Update header when galaxy toggles"""
+        status = "GALAXY ON" if active else "GALAXY OFF"
+        self.sub_title = f"{self.sub_title} {status}".strip()
+
+# ============================================================================
+# DETAIL SCREENS
+# ============================================================================
+
+class UniverseDetailScreen(Screen):
+    """Detailed view of agent universes"""
     pass
 
-# 3. Silence 3rd party libraries
-for lib in ["urllib3", "transformers", "httpx", "httpcore", "apscheduler", "tzlocal"]:
-    logging.getLogger(lib).setLevel(logging.ERROR)
-    logging.getLogger(lib).propagate = False
-
-# 4. Suppress Warnings
-warnings.filterwarnings("ignore")
-os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
-os.environ["TRANSFORMERS_VERBOSITY"] = "error"
-
-try:
-    from rich.console import Console
-    from rich.panel import Panel
-    from rich.table import Table
-    from rich.text import Text
-    from rich.prompt import Prompt
-    from rich.live import Live
-    from rich.spinner import Spinner
-    from rich.align import Align
-    from rich.tree import Tree
-    RICH_AVAILABLE = True
-except ImportError:
-    RICH_AVAILABLE = False
-
-# --- ASSETS ---
-LOGO_LINES = [
-    r" __  __                                      _____ _                        _ ",
-    r"|  \/  | ___ _ __ ___   ___  _ __ _   _     |_   _| |__  _ __ ___  __ _  __| |",
-    r"| |\/| |/ _ \ '_ ` _ \ / _ \| '__| | | |______| | | '_ \| '__/ _ \/ _` |/ _` |",
-    r"| |  | |  __/ | | | | | (_) | |  | |_| |______| | | | | | | |  __/ (_| | (_| |",
-    r"|_|  |_|\___|_| |_| |_|\___/|_|   \__, |      |_| |_| |_|_|  \___|\__,_|\__,_|",
-    r"                                  |___/                                       ",
-]
-
-# --- BRIDGE LOGIC (The Brains) ---
-from dataclasses import dataclass
-
-@dataclass
-class GalaxyRow:
-    """Represents a joined row in the Cognitive Galaxy."""
-    # Fact (Source)
-    source_uri: str
-    # Dimension (Agent)
-    agent_role: str
-    authority: float
-    # Dimension (Belief)
-    belief_id: uuid.UUID
-    content: str
-    confidence: float
-    # Lineage
-    provenance: Dict[str, Any]
-
-class GalaxyQueryEngine:
-    """OLAP for Cognition."""
-    def __init__(self, client):
-        self.client = client
-
-    def slice_by_source(self, source_query: str, limit: int = 20) -> List[GalaxyRow]:
-        """SLICE: Select all beliefs derived from a specific source/fact."""
-        # Use Core Client to get raw data for OLAP to bypass secure filtering masking
-        if not hasattr(self.client, '_core_client'):
-             return []
-
-        core_results = self.client._core_client.recall(source_query, top_k=limit * 2)
-
-        rows = []
-        for mem in core_results.memories:
-            # Parse Raw Payload
-            try:
-                import json
-                payload = json.loads(mem.content)
-                if not isinstance(payload, dict):
-                    # Legacy memory (Fact)
-                    raw_text = mem.content
-                    prov = None
-                else:
-                    # Secure Memory (Dimension)
-                    raw_text = payload.get("text", "")
-                    prov = payload.get("_provenance", {})
-            except:
-                raw_text = mem.content
-                prov = None
-
-            match = False
-            uri = "unknown"
-
-            if source_query.lower() in raw_text.lower():
-                match = True
-                uri = source_query # Inferred
-
-            if match:
-                role = "unknown"
-                if prov and 'actor' in prov:
-                    role = prov['actor'].get('role', 'unknown')
-                elif mem.source:
-                    role = mem.source
-
-                rows.append(GalaxyRow(
-                    source_uri=uri,
-                    agent_role=role,
-                    authority=mem.authority,
-                    belief_id=mem.id,
-                    content=raw_text,
-                    confidence=mem.confidence,
-                    provenance=prov or {}
-                ))
-        return rows[:limit]
-
-    def drill_down(self, belief_id: uuid.UUID) -> Optional[Dict[str, Any]]:
-        """DRILL DOWN: Retrieve the full raw Event Log for a specific belief."""
-        if hasattr(self.client._core_client, '_memories'):
-            mem_state = self.client._core_client._memories.get(belief_id)
-            if mem_state:
-                return {
-                    "current_state": mem_state.current_value,
-                    "history_len": len(mem_state.history),
-                    "events": [e.payload for e in mem_state.history]
-                }
-        return None
-
-class ModelManager:
-    """Manages Local and Cloud Models."""
-    def __init__(self):
-        self.providers = {
-            "groq": "llama-3.3-70b-versatile",
-            "openrouter": "meta-llama/llama-3.1-405b-instruct",
-            "local": "smollm:135m"
-        }
-
-    def get_model_id(self, provider: str) -> str:
-        return self.providers.get(provider, "local")
-
-class ConversationManager:
-    """
-    Manages short-term conversation history (Contextuality).
-    Implements a PERSISTENT sliding window buffer effectively acting as a 'Working Memory'.
-    Saves state to ~/.mt/history.json to survive restarts.
-    """
-    def __init__(self, max_turns: int = 20):
-        self.max_turns = max_turns
-        self.history: List[Dict[str, Any]] = []
-        self.storage_path = Path.home() / ".mt" / "history.json"
-        self._ensure_storage()
-        self.load()
-
-    def _ensure_storage(self):
-        if not self.storage_path.parent.exists():
-            self.storage_path.parent.mkdir(parents=True, exist_ok=True)
-
-    def load(self):
-        if self.storage_path.exists():
-            try:
-                import json
-                with open(self.storage_path, 'r', encoding='utf-8') as f:
-                    self.history = json.load(f)
-            except Exception as e:
-                # If corrupt, start fresh
-                self.history = []
-
-    def save(self):
-        try:
-            import json
-            # Atomic write to prevent corruption
-            tmp_path = self.storage_path.with_suffix(".tmp")
-            with open(tmp_path, 'w', encoding='utf-8') as f:
-                json.dump(self.history, f, indent=2)
-            os.replace(tmp_path, self.storage_path)
-        except:
-            pass
-
-    def add_turn(self, role: str, content: str):
-        priority = self._calculate_priority(content)
-        self.history.append({
-            "role": role,
-            "content": content,
-            "timestamp": time.time(),
-            "priority": priority
-        })
-
-        if len(self.history) > self.max_turns * 2:
-            self._smart_prune()
-
-        self.save()
-
-    def _calculate_priority(self, content: str) -> int:
-        """Simple heuristic for TUI context retention."""
-        score = 1 # Default
-        lower_content = content.lower()
-
-        # High Priority Keywords (Instructions, Facts, Config)
-        high_keywords = ["remember", "always", "config", "key", "api", "set", "use", "important", "never"]
-        if any(w in lower_content for w in high_keywords):
-            score += 2
-
-        # Length Heuristic (Longer messages usually contain more info)
-        if len(content) > 50: score += 1
-
-        # Low Priority (Ack, short output)
-        if len(content) < 10 and "ok" in lower_content: score -= 1
-
-        return max(1, score)
-
-    def _smart_prune(self):
-        """Removes low priority items first, preserving important context."""
-        # separate into priority buckets
-        scored_items = []
-        for i, item in enumerate(self.history):
-            # Recency bias: Last 4 messages are always kept regardless of priority
-            if i >= len(self.history) - 4:
-                priority = 99
-            else:
-                priority = item.get("priority", 1)
-            scored_items.append((priority, i))
-
-        # Sort by priority (lowest first), then by index (oldest first)
-        scored_items.sort(key=lambda x: (x[0], x[1]))
-
-        # Remove the items with lowest effective priority
-        # We need to remove (len - limit) items
-        to_remove_count = len(self.history) - (self.max_turns * 2)
-        if to_remove_count > 0:
-            indices_to_remove = set(x[1] for x in scored_items[:to_remove_count])
-
-            # Rebuild history
-            new_history = [item for i, item in enumerate(self.history) if i not in indices_to_remove]
-            self.history = new_history
-
-    def clear(self):
-        # Guardrail: Don't just delete, archive it first.
-        self.archive()
-        self.history = []
-        self.save()
-
-    def archive(self):
-        """Moves current history to an archive file so nothing is ever truly lost."""
-        if not self.history: return
-
-        try:
-            timestamp = int(time.time())
-            archive_path = self.storage_path.parent / f"history_{timestamp}.json"
-            import json
-            with open(archive_path, 'w', encoding='utf-8') as f:
-                json.dump(self.history, f, indent=2)
-        except:
-            pass
-
-    def get_context_block(self) -> str:
-        if not self.history:
-            return ""
-
-        block = "\nIMMEDIATE CONVERSATION HISTORY (Working Memory):\n"
-        for msg in self.history:
-            role = msg['role'].upper()
-            content = msg['content']
-            if len(content) > 1000: content = content[:1000] + "...(truncated)"
-            block += f"[{role}]: {content}\n"
-        block += "\n--- End of Working Memory ---\n"
-        return block
-
-class AgentManager:
-    """Defines Agent Roles."""
-    AGENTS = {
-        "coder": {
-            "role": "Senior Software Engineer",
-            "namespace": "project",
-            "prompt": "You are a Coder. Focus on code quality, testing, and implementation details."
-        },
-        "architect": {
-            "role": "System Architect",
-            "namespace": "global",
-            "prompt": "You are an Architect. precise, high-level, focus on patterns and scalability."
-        },
-        "reviewer": {
-            "role": "Code Reviewer",
-            "namespace": "project",
-            "prompt": "You are a Reviewer. Be critical, look for bugs, security issues, and style violations."
-        }
-    }
-
-class BridgeState:
-    """
-    Manages state that lives ONLY in the CLI.
-    """
-    def __init__(self):
-        self.agent = "coder"
-        self.provider = self._detect_provider()
-        self.variant = "surface" # surface | deep
-
-        # Workspace State
-        self.active_context_fact_id: Optional[str] = None
-        self.active_filename: str = ""
-
-        # Short-term memory buffer
-        self.conversation = ConversationManager()
-
-        # We re-init SDK when agent changes (namespace switch)
-        from memory_thread.sdk import MemoryClient
-        from memory_thread.utils.secure_sdk import SecureMemoryClient
-        # GalaxyQueryEngine is now local
-
-        self._sdk_class = MemoryClient
-        self._secure_class = SecureMemoryClient
-
-        # Security State
-        self.secure_mode = False
-        self.smart_mode = False # Layer VI toggle
-        self.current_user_role = "employee" # Default role
-        self.client = self._init_client()
-        self.galaxy = GalaxyQueryEngine(self.client) if self.secure_mode else None
-
-    def _detect_provider(self) -> str:
-        if os.environ.get("GROQ_API_KEY") and "your_" not in os.environ.get("GROQ_API_KEY"):
-            return "groq"
-        if os.environ.get("OPENROUTER_API_KEY") and "your_" not in os.environ.get("OPENROUTER_API_KEY"):
-            return "openrouter"
-        return "local"
-
-    def _init_client(self):
-        """Initialize SDK based on current AGENT's namespace or Security Context."""
-        client = None
-        if self.secure_mode:
-            # Use Enterprise Secure Wrapper
-            # We use a fixed user ID for demo purposes
-            client = self._secure_class(user_id="demo-user", role=self.current_user_role)
-        else:
-            # Standard Mode
-            agent_cfg = AgentManager.AGENTS.get(self.agent, AgentManager.AGENTS["coder"])
-            ns = agent_cfg["namespace"]
-            client = self._sdk_class(namespace=ns, use_db=False)
-
-        # Update Galaxy Engine if needed
-        if self.secure_mode:
-             self.galaxy = GalaxyQueryEngine(client)
-        else:
-             self.galaxy = None
-
-        return client
-
-    def set_agent(self, name: str):
-        if name in AgentManager.AGENTS:
-            self.agent = name
-            if not self.secure_mode:
-                self.client = self._init_client()
-            return True
-        return False
-
-    def toggle_security(self):
-        self.secure_mode = not self.secure_mode
-        self.client = self._init_client()
-        return self.secure_mode
-
-    def toggle_smart(self):
-        self.smart_mode = not self.smart_mode
-        return self.smart_mode
-
-    def set_role(self, role: str):
-        # Validate role exists in our policy
-        valid_roles = ["guest", "employee", "developer", "researcher", "executive", "godfather"]
-        if role.lower() in valid_roles:
-            self.current_user_role = role.lower()
-            if self.secure_mode:
-                self.client = self._init_client()
-            return True
-        return False
-
-    def view_audit(self):
-        """View Audit Logs (Root only)."""
-        if not self.secure_mode or not hasattr(self.client, 'audit_log'):
-             return "Audit logs only available in Secure Mode."
-
-        logs = self.client.audit_log(limit=20)
-        if not logs:
-            return "No audit logs found or Access Denied."
-
-        output = "[bold underline]OPERATIONAL AUDIT LEDGER[/]\n"
-        for entry in logs:
-            ts = entry.get('timestamp', '')[:19]
-            actor = entry.get('actor', {}).get('role', 'unknown').upper()
-            action = entry.get('type', 'UNKNOWN')
-            target = entry.get('target', '')
-
-            color = "red" if "DENIED" in action else "green"
-            output += f"[{color}]{ts} | {actor} | {action} | {target}[/]\n"
-
-        return output
-
-    def handle_galaxy(self, args: str):
-        """OLAP for Cognition."""
-        if not self.bridge.secure_mode: return "Enable Secure Mode first (/secure)"
-        if not self.bridge.galaxy: return "Galaxy Engine not initialized."
-
-        parts = args.split()
-        if not parts: return "Usage: /galaxy <slice|dice|drill> <args>"
-
-        op = parts[0].lower()
-        query = " ".join(parts[1:]) if len(parts) > 1 else ""
-
-        if op == "slice":
-            # /galaxy slice <source_uri>
-            if not query: return "Usage: /galaxy slice <source_name>"
-            rows = self.bridge.galaxy.slice_by_source(query)
-            if not rows: return "[yellow]No Cognitive Joins found for this Fact.[/]"
-
-            table = Table(title=f"Cognitive Slice: {query}", border_style="cyan")
-            table.add_column("Belief (Dimension)", style="white")
-            table.add_column("Agent", style="magenta")
-            table.add_column("Auth", justify="right", style="green")
-            table.add_column("ID", style="dim")
-
-            for r in rows:
-                table.add_row(
-                    r.content[:60] + "...",
-                    r.agent_role,
-                    f"{r.authority:.2f}",
-                    str(r.belief_id)[:8]
-                )
-            self.console.print(table)
-
-        elif op == "dice":
-            # /galaxy dice <role>
-            # NOTE: This only dices the *last* slice if we were stateful,
-            # or we assume we query broadly?
-            # For this prototype, let's just warn:
-            return "[yellow]Dice requires an active Slice context (not implemented in stateless CLI). Use Slice first.[/]"
-
-        elif op == "drill":
-            # /galaxy drill <id>
-            if not query: return "Usage: /galaxy drill <belief_id>"
-            try:
-                bid = uuid.UUID(query)
-            except:
-                return "[red]Invalid UUID[/]"
-
-            data = self.bridge.galaxy.drill_down(bid)
-            if not data:
-                return "[red]Fact not found in active memory cache.[/]"
-
-            self.console.print(Panel(str(data), title=f"Drill Down: {query}", border_style="yellow"))
-
-        else:
-            return f"[red]Unknown galaxy operation: {op}[/]"
-
-        return ""
-
-    def handle_grant(self, args: str):
-        if not self.bridge.secure_mode: return "Enable Secure Mode first (/secure)"
-        parts = args.split()
-        if len(parts) < 3: return "Usage: /grant <role> <domain> <score>"
-        try:
-            score = float(parts[2])
-            if self.client.grant(parts[0], parts[1], score):
-                return f"[green]Granted {score} authority to {parts[0]} on {parts[1]}[/]"
-            else:
-                return "[red]Grant Denied (Check Audit Log)[/]"
-        except Exception as e: return f"[red]Error: {e}[/]"
-
-    def handle_revoke(self, args: str):
-        if not self.secure_mode: return "Enable Secure Mode first (/secure)"
-        parts = args.split()
-        if len(parts) < 2: return "Usage: /revoke <role> <domain>"
-        try:
-            if self.client.revoke(parts[0], parts[1]):
-                return f"[yellow]Revoked authority from {parts[0]} on {parts[1]}[/]"
-            else:
-                return "[red]Revoke Denied (Check Audit Log)[/]"
-        except Exception as e: return f"[red]Error: {e}[/]"
-
-    def set_variant(self, variant: str):
-        if variant in ["surface", "deep"]:
-            self.variant = variant
-            return True
-        return False
-
-    def chat(self, user_input: str) -> str:
-        """
-        Intelligent Chat Bridge.
-        """
-        # ... logic moved to _chat_sync ...
-        return self._chat_sync(user_input)
-
-    def _chat_sync(self, user_input: str) -> str:
-        """Synchronous implementation of Chat Logic."""
-        # 1. Update Short-term History
-        self.conversation.add_turn("user", user_input)
-
-        # Record User Input as FACT (if in secure mode)
-        user_fact_id = None
-        if hasattr(self.client, 'ingest_fact'):
-             # Store raw message as immutable fact
-             user_fact_id = self.client.ingest_fact(user_input, source_uri="user:input", namespace="conversation")
-
-        # Context Injection (@file)
-        context_buffer = ""
-
-        # Workspace Injection (Focused File)
-        if self.active_context_fact_id:
-             # Fetch fact content
-             # We rely on Core Client for raw fetch
-             if hasattr(self.client, '_core_client'):
-                 try:
-                     # Attempt recall by ID (SDK doesn't have direct get, so we cheat via private access or search)
-                     # For now, we assume the user just wants the fact they focused on to be "top of mind"
-                     # We can inject a system note:
-                     context_buffer += f"\n[WORKSPACE FOCUS]: {self.active_filename} (ID: {self.active_context_fact_id})\n"
-                     # Ideally we fetch content.
-                     if hasattr(self.client._core_client, '_memories'):
-                         # Try local cache
-                         mem_state = self.client._core_client._memories.get(uuid.UUID(self.active_context_fact_id))
-                         if mem_state:
-                             content = mem_state.current_value.get('content', '')
-                             # Clean if JSON wrapped
-                             if content.startswith('{') and '"text":' in content:
-                                 import json
-                                 try: content = json.loads(content).get('text', content)
-                                 except: pass
-                             context_buffer += f"--- CONTENT ---\n{content}\n----------------\n"
-                 except:
-                     pass
-
-        words = user_input.split()
-        clean_input = []
-        for w in words:
-            if w.startswith("@") and os.path.exists(w[1:]):
-                try:
-                    with open(w[1:], 'r') as f:
-                        context_buffer += f"\n--- File: {w[1:]} ---\n{f.read(2000)}\n"
-                except:
-                    pass
-            else:
-                clean_input.append(w)
-
-        final_query = " ".join(clean_input)
-
-        # Agent Persona Injection
-        agent_cfg = AgentManager.AGENTS[self.agent]
-        sys_prompt = f"Role: {agent_cfg['role']}\n{agent_cfg['prompt']}\n"
-
-        # Add File Context
-        if context_buffer:
-            sys_prompt += f"\nLOCAL FILE CONTEXT:\n{context_buffer}\n"
-
-        # Add Conversation History (The "Contextuality" Fix)
-        history_block = self.conversation.get_context_block()
-        if history_block:
-            sys_prompt += f"\n{history_block}\n"
-
-        # Variant Logic (Depth)
-        top_k = 10 if self.variant == "deep" else 3
-
-        # Check if client supports smart_loop (SecureClient does, Base might not)
-        kwargs = {}
-        if hasattr(self.client, 'chat') and 'smart_loop' in self.client.chat.__code__.co_varnames:
-             kwargs['smart_loop'] = self.smart_mode
-
-        response = self.client.chat(
-            user_message=final_query,
-            system_prompt=sys_prompt,
-            use_local=(self.provider=="local"),
-            **kwargs
-        )
-
-        # Record Response
-        self.conversation.add_turn("assistant", response)
-
-        # Persist Belief (Epistemic Artifact)
-        if hasattr(self.client, 'record_belief') and user_fact_id:
-             self.client.record_belief(
-                 content=response,
-                 derived_from=[user_fact_id],
-                 confidence=0.8, # Assumed confidence for chat
-                 namespace="conversation"
-             )
-
-        return response
-
-    def get_graph_insight(self, query: str) -> Any:
-        """Fetch graph relations for the query context."""
-        # Fix: SDK doesn't have a public 'graph' attribute check.
-        # We rely on get_related returning data.
-
-        # 1. Find relevant nodes
-        results = self.client.recall(query, top_k=2)
-        if not results.memories: return None
-
-        insight_tree = None
-        if RICH_AVAILABLE:
-            insight_tree = Tree("Knowledge Graph")
-        else:
-            insight_text = ""
-
-        seen_edges = set()
-        has_relations = False
-
-        for mem in results.memories:
-            # 2. Get connections for this memory's entity
-            # Fix: Use self.client.get_related() instead of non-existent get_related_entities()
-            related = self.client.get_related(mem.entity_id)
-            if not related: continue
-
-            has_relations = True
-
-            label = f"[bold]{mem.content[:50]}...[/]"
-            if RICH_AVAILABLE:
-                node = insight_tree.add(label)
-            else:
-                insight_text += f"{label}\n"
-
-            for r in related:
-                # relation structure from graph_service:
-                # {'id': ..., 'source_entity_id': ..., 'target_entity_id': ..., 'relation_type': ...}
-                # Wait, SDK.get_related calls GraphService.get_relations which returns raw rows (dicts).
-                # We need to resolve target name if possible, or just show ID.
-                # SDK.infer_user_relations logic stores "target" in memory content usually.
-                # But here we are getting raw DB relations.
-
-                target = str(r.get('target_entity_id'))
-                # Try to resolve target name if it's in our memory cache
-                if hasattr(self.client, '_memories') and uuid.UUID(target) in self.client._memories:
-                     target_state = self.client._memories[uuid.UUID(target)]
-                     target_content = target_state.current_value.get('content', target)
-                     target = target_content[:30]
-
-                relation_type = r.get('relation_type', 'RELATED')
-
-                edge_sig = (mem.entity_id, target, relation_type)
-                if edge_sig in seen_edges: continue
-                seen_edges.add(edge_sig)
-
-                # Format: └─ [WORKS_AT] -> Google
-                if RICH_AVAILABLE:
-                    node.add(f"[{relation_type}] -> {target}")
-                else:
-                    insight_text += f"  └─ [{relation_type}] -> {target}\n"
-
-        if not has_relations:
-            return None
-
-        if RICH_AVAILABLE:
-            return insight_tree
-        else:
-            return insight_text
-
-    def ingest_project(self) -> int:
-        count = 0
-        allowed = ['.py', '.md', '.txt', '.json', '.js', '.ts', '.html', '.css', '.rs', '.go']
-        ignored_dirs = ['node_modules', '.git', 'venv', '__pycache__', 'dist', 'build', '.idea', '.vscode']
-
-        for root, dirs, files in os.walk("."):
-            # Modify dirs in-place to skip ignored directories
-            dirs[:] = [d for d in dirs if d not in ignored_dirs]
-
-            for file in files:
-                if os.path.splitext(file)[1] in allowed:
-                    path = os.path.join(root, file)
-                    try:
-                        with open(path, 'r', encoding='utf-8') as f:
-                            content = f.read(2000)
-                            if content.strip():
-                                # Updated to strict ingestion API
-                                if hasattr(self.client, 'ingest_fact'):
-                                     self.client.ingest_fact(f"File {path}:\n{content}", source_uri=f"file://{path}")
-                                else:
-                                     self.client.remember(f"File {path}:\n{content}", source="ingest")
-                                count += 1
-                    except Exception:
-                        # Ignore encoding errors or permission issues
-                        pass
-        return count
-
-
-# --- UI LAYER ---
-try:
-    from prompt_toolkit import PromptSession
-    from prompt_toolkit.completion import NestedCompleter
-    from prompt_toolkit.styles import Style as PStyle
-    from prompt_toolkit.formatted_text import HTML
-    from prompt_toolkit.key_binding import KeyBindings
-    from prompt_toolkit.filters import Condition
-    PROMPT_TOOLKIT_AVAILABLE = True
-except ImportError:
-    PROMPT_TOOLKIT_AVAILABLE = False
-
-class MTInterface:
-    BG = "#0f0f0f"
-    DIM = "#525252"
-
-    def __init__(self):
-        self.console = Console(highlight=False, soft_wrap=True) if RICH_AVAILABLE else None
-        self.graph_mode = False # F3 to toggle
-        try: from dotenv import load_dotenv; load_dotenv()
-        except: pass
-
-        self.bridge = BridgeState()
-        self.executor = ThreadPoolExecutor(max_workers=1)
-
-        # OpenCode Command Structure
-        self.completer = None
-        if PROMPT_TOOLKIT_AVAILABLE:
-            # Dynamic Role List
-            try:
-                from memory_thread.nervous.access_control import AccessControlService
-                roles = {r: None for r in AccessControlService.ROLE_GRADES.keys()}
-            except ImportError:
-                roles = {'guest': None, 'root': None} # Fallback
-
-            self.completer = NestedCompleter.from_nested_dict({
-                '/agents': {'coder': None, 'architect': None, 'reviewer': None},
-                '/variants': {'surface': None, 'deep': None},
-                '/conf': {'groq': None, 'openrouter': None, 'local': None},
-                '/login': roles,
-                '/secure': None,
-                '/audit': None,
-                '/grant': {r: None for r in roles},
-                '/revoke': {r: None for r in roles},
-                '/smart': None,
-                '/galaxy': {'slice': None, 'dice': None, 'drill': None},
-                '/ingest': None, '/clear': None, '/quit': None, '/help': None,
-            })
-
-        self.p_style = None
-        if PROMPT_TOOLKIT_AVAILABLE:
-            self.p_style = PStyle.from_dict({
-                'prompt': '#3B82F6 bold',
-                'input': '#EEEEEE',
-                'completion-menu': 'bg:#1e1e1e #eeeeee',
-                'completion-menu.completion.current': 'bg:#3B82F6 #ffffff',
-                'bottom-toolbar': 'bg:default #666666',
-                'bottom-toolbar.key': '#ffffff bold',
-                'bottom-toolbar.val': '#ffffff',
-                'bottom-toolbar.sep': '#3B82F6',
-                'bottom-toolbar.on': '#55ff55 bold',
-                'bottom-toolbar.off': '#999999',
-            })
-
-    def clear_screen(self):
-        os.system('cls' if os.name == 'nt' else 'clear')
-
-    def print_logo(self):
-        if not self.console:
-            print("Memory Thread v1.0")
-            return
-        self.console.print()
-        # Cyber/Neural Style Gradient
-        for i, line in enumerate(LOGO_LINES):
-            # Fade from Cyan to Purple
-            if i < 2: style = "bold cyan"
-            elif i < 4: style = "bold blue"
-            else: style = "bold purple"
-
-            self.console.print(Align.center(line, style=style))
-        self.console.print()
-        self.console.print(Align.center("[dim]Memory Thread v1.0 • Neural CLI[/]"))
-        self.console.print()
-
-    def get_bottom_toolbar(self):
-        # OpenCode Style Footer
-        ag = self.bridge.agent.capitalize()
-        pr = self.bridge.provider
-        var = self.bridge.variant
-        graph = "ON" if self.graph_mode else "OFF"
-        g_style = "class:bottom-toolbar.on" if self.graph_mode else "class:bottom-toolbar.off"
-
-        # Security Status
-        sec_status = ""
-        if self.bridge.secure_mode:
-            role = self.bridge.current_user_role.upper()
-            sec_status = f" · [SECURE: {role}]"
-
-        # Smart Status
-        smart_status = ""
-        if self.bridge.smart_mode:
-            smart_status = " · [SMART: ON]"
-
-        return [
-            ('class:bottom-toolbar.key', ' Agent '), ('class:bottom-toolbar.val', f'{ag} '),
-            ('class:bottom-toolbar.key', ' Model '), ('class:bottom-toolbar.val', f'{pr} '),
-            ('class:bottom-toolbar.sep', f' · {var}'),
-            ('class:bottom-toolbar.sep', ' · Graph:'), (g_style, f' {graph} '),
-            ('class:bottom-toolbar.on', sec_status),
-            ('class:bottom-toolbar.on', smart_status),
-            ('class:bottom-toolbar', '    '),
-            ('class:bottom-toolbar', 'F3 Graph  ctrl+t variants  / help')
-        ]
-
-    def _handle_conf(self, provider):
-        """Quick Switch Provider"""
-        if provider in ["groq", "openrouter", "local"]:
-            self.bridge.provider = provider
-            self.console.print(f"[green]Switched model to {provider}[/]")
-        else:
-            self.console.print("[red]Unknown provider[/]")
-
-    async def login_flow(self, arg_role: str):
-        """Hardened Pentagon-style Login."""
-        from memory_thread.nervous.vault import vault
-        from memory_thread.nervous.access_control import AccessControlService
-
-        # 1. Identity Check
-        target_role = arg_role.lower()
-        if target_role == "root": target_role = "godfather" # Alias
-
-        # Strict Validation
-        if target_role not in AccessControlService.ROLE_GRADES:
-            valid = ", ".join(AccessControlService.ROLE_GRADES.keys())
-            self.console.print(f"[red]INVALID IDENTITY: '{target_role}'[/]")
-            self.console.print(f"[dim]Valid personnel: {valid}[/]")
-            return
-
-        # 2. Access Key Prompt
-        self.console.print(f"[bold cyan]IDENTITY > {target_role.upper()}[/]")
-        session = PromptSession()
-        key_input = await session.prompt_async(HTML("<b>ACCESS KEY > </b>"), is_password=True)
-
-        # 3. Visual FX
-        with Live(Spinner("dots", style="red", text="Verifying Biometrics..."), transient=True):
-            await asyncio.sleep(0.8) # Dramatic pause
-
-        # 4. Stealth Elevation Logic
-        is_godfather_key = vault.verify_godfather(key_input)
-
-        if is_godfather_key:
-            # Elevation!
-            self.console.print("[bold red blink]G O D F A T H E R   P R O T O C O L   E N G A G E D[/]")
-            self.bridge.set_role("godfather")
-            self.bridge.secure_mode = True # Force secure
-            self.bridge.client = self.bridge._init_client()
-            return
-
-        # 5. Standard PIN Check
-        if vault.verify_pin(target_role, key_input):
-            if self.bridge.set_role(target_role):
-                # Greetings
-                greetings = {
-                    "guest": "Welcome, Guest. Public access only.",
-                    "employee": "Identity Verified. Internal channels open.",
-                    "developer": "Dev Mode Active. Caution advised.",
-                    "researcher": "Accessing Classified Archives...",
-                    "executive": "Command Uplink Established. Welcome, Commander."
-                }
-                self.console.print(f"[green]{greetings.get(target_role, 'Access Granted.')}[/]")
-                if not self.bridge.secure_mode:
-                     self.console.print("[dim]Note: Security mode is OFF. Type /secure to enable.[/]")
-            else:
-                self.console.print("[red]Role assignment failed.[/]")
-        else:
-            self.console.print("[bold red]ACCESS DENIED. INCIDENT LOGGED.[/]")
-
-    async def async_chat_task(self, user_input):
-        """Async wrapper for the heavy lifting."""
-        loop = asyncio.get_event_loop()
-
-        # 1. Get Sources (Fast-ish, but DB call)
-        sources_view = None
-        if self.bridge.secure_mode:
-             # run_in_executor
-             res = await loop.run_in_executor(self.executor, lambda: self.bridge.client.recall(user_input, top_k=5))
-             if res.memories:
-                 s_text = "[bold]Evidence:[/]\n"
-                 for i, m in enumerate(res.memories, 1):
-                     src_label = getattr(m, 'source', 'unknown')
-                     s_text += f"{i}. {m.content[:60]}... [dim]({src_label})[/]\n"
-                 sources_view = Panel(s_text, title="Reasoning Sources", border_style="blue")
-
-        # 2. Get Response (Slow - LLM)
-        response = await loop.run_in_executor(self.executor, lambda: self.bridge._chat_sync(user_input))
-
-        # 3. Graph Insight
-        graph_insight = None
-        if self.graph_mode:
-             graph_insight = await loop.run_in_executor(self.executor, lambda: self.bridge.get_graph_insight(user_input))
-
-        return sources_view, response, graph_insight
-
-    def run(self):
-        self.clear_screen()
-        self.print_logo()
-
-        if not PROMPT_TOOLKIT_AVAILABLE:
-            print("Error: 'prompt_toolkit' is not installed. Please run 'pip install prompt_toolkit'.")
-            return
-        if not RICH_AVAILABLE:
-             print("Warning: 'rich' is not installed. UI will be degraded. Please run 'pip install rich'.")
-
-        # Initialize Vault (Print Godfather Key once if new)
-        from memory_thread.nervous.vault import vault
-        g_key = vault.get_or_create_godfather_key()
-        if "MT-" in g_key:
-            self.console.print(Panel(f"[bold red]NUCLEAR KEY GENERATED:[/]\n{g_key}\n[dim]Save this. It will not be shown again.[/]", border_style="red"))
-
-        # System Overview
-        status_panel = (
-            f"[bold]System:[/]\t[green]ONLINE[/]\n"
-            f"[bold]Identity:[/]\t{self.bridge.current_user_role.upper()}\n"
-            f"[bold]Security:[/]\t{'[green]ACTIVE[/]' if self.bridge.secure_mode else '[dim]INACTIVE[/]'}\n"
-            f"[bold]Smart Loop:[/]\t{'[cyan]READY[/]' if self.bridge.smart_mode else '[dim]OFF[/]'}\n\n"
-            f"[dim]Try: /login guest (PIN: 0000) or /help[/]"
-        )
-        self.console.print(Panel(status_panel, title="System Overview", border_style="blue", padding=(0, 1)))
-
-        # --- Key Bindings ---
-        bindings = KeyBindings()
-
-        @bindings.add('f3')
-        def _(event):
-            self.graph_mode = not self.graph_mode
-            # Force refresh of toolbar
-            # app.invalidate() is hard to reach here without reference to app,
-            # but next render will pick it up.
-
-        @bindings.add('enter') # Enter submits
-        def _(event):
-             event.current_buffer.validate_and_handle()
-
-        @bindings.add('escape', 'enter') # Alt+Enter for newline
-        def _(event):
-            event.current_buffer.insert_text('\n')
-
-        @bindings.add('c-t') # Ctrl+T to toggle variant
-        def _(event):
-            new_var = "deep" if self.bridge.variant == "surface" else "surface"
-            self.bridge.set_variant(new_var)
-
-        session = PromptSession(
-            completer=self.completer,
-            style=self.p_style,
-            multiline=True,
-            key_bindings=bindings
-        )
-
-        # Main Loop logic
-        async def main_loop():
-            code_buffer = []
-            in_code_mode = False
-
-            while True:
-                try:
-                    self.console.print()
-
-                    if in_code_mode:
-                        # Code Mode Prompt
-                        line = await session.prompt_async([('class:prompt', '... ')], bottom_toolbar=self.get_bottom_toolbar)
-                        if line.strip() == ":::":
-                            # End of Code Block
-                            in_code_mode = False
-                            full_code = "\n".join(code_buffer)
-                            self.console.print(Panel(full_code, title="Code Preview", border_style="blue"))
-
-                            # Ask for Action
-                            action = await session.prompt_async(HTML("<b>[1] Ingest Fact  [2] Ask Agent  [3] Both > </b>"))
-
-                            fact_id = None
-                            # Action 1 or 3: Ingest
-                            if action in ["1", "3"]:
-                                if hasattr(self.bridge.client, 'ingest_fact'):
-                                    fact_id = self.bridge.client.ingest_fact(full_code, source_uri="user:code_block", namespace="project")
-                                    self.console.print(f"[green]Ingested as Fact: {fact_id}[/]")
-                                else:
-                                    self.console.print("[red]Secure Mode required for Fact Ingestion.[/]")
-
-                            # Action 2 or 3: Chat
-                            if action in ["2", "3"]:
-                                user_input = full_code # Treat code as the message
-                                # Fallthrough to chat logic below...
-                            else:
-                                code_buffer = []
-                                continue
-                        else:
-                            code_buffer.append(line)
-                            continue
-                    else:
-                        # Standard Chat Prompt
-                        user_input = await session.prompt_async([('class:prompt', '▌ ')], bottom_toolbar=self.get_bottom_toolbar)
-
-                    if not user_input.strip(): continue
-                    user_input = user_input.strip()
-
-                    if user_input.startswith("/"):
-                        parts = user_input.split()
-                        cmd = parts[0].lower()
-                        arg = parts[1] if len(parts) > 1 else ""
-
-                        if cmd == "/code":
-                            in_code_mode = True
-                            code_buffer = []
-                            self.console.print("[bold yellow]--- Entering Code Mode (end with :::) ---[/]")
-                            continue
-                        arg = parts[1] if len(parts) > 1 else ""
-
-                        if cmd == "/quit": break
-                        elif cmd == "/agents":
-                            if self.bridge.set_agent(arg): self.console.print(f"[green]Agent: {arg}[/]")
-                            else: self.console.print("[red]Use: /agents <coder|architect|reviewer>[/]")
-                        elif cmd == "/variants":
-                            if self.bridge.set_variant(arg): self.console.print(f"[green]Variant: {arg}[/]")
-                            else: self.console.print("[red]Use: /variants <surface|deep>[/]")
-                        elif cmd == "/conf": self._handle_conf(arg)
-                        elif cmd == "/login":
-                            if arg:
-                                await self.login_flow(arg)
-                            else:
-                                self.console.print("[red]Usage: /login <role>[/]")
-                        elif cmd == "/secure":
-                            state = self.bridge.toggle_security()
-                            status = "ENABLED" if state else "DISABLED"
-                            color = "green" if state else "red"
-                            self.console.print(f"[{color}]Enterprise Security: {status}[/]")
-                        elif cmd == "/smart":
-                            state = self.bridge.toggle_smart()
-                            status = "ENABLED" if state else "DISABLED"
-                            self.console.print(f"[cyan]Smart Reflection Loop: {status}[/]")
-                        elif cmd == "/audit":
-                            log_view = self.bridge.view_audit()
-                            self.console.print(Panel(log_view, title="Audit Log", border_style="red"))
-                        elif cmd == "/grant":
-                            self.console.print(self.bridge.handle_grant(arg))
-                        elif cmd == "/revoke":
-                            self.console.print(self.bridge.handle_revoke(arg))
-                        elif cmd == "/facts":
-                            # Alias for ls but broader
-                            if hasattr(self.bridge.client, 'recall'):
-                                res = self.bridge.client.recall("source:manual OR source:file", top_k=20)
-                                table = Table(title="Canonical Facts", border_style="green")
-                                table.add_column("Type", style="yellow")
-                                table.add_column("Source", style="cyan")
-                                table.add_column("ID", style="dim")
-                                for m in res.memories:
-                                    # Heuristic type detection
-                                    mtype = "File" if "file://" in m.source else "Manual"
-                                    table.add_row(mtype, m.source, str(m.id)[:8])
-                                self.console.print(table)
-                        elif cmd == "/beliefs":
-                            # /beliefs <fact_id>
-                            if not arg:
-                                self.console.print("[red]Usage: /beliefs <fact_id>[/]")
-                            else:
-                                if self.bridge.galaxy:
-                                    # Use Galaxy Slice to find beliefs derived from this fact
-                                    # We search for the ID in the text or provenance
-                                    # This works because record_belief links derived_from=[id]
-                                    # But slice_by_source currently searches text/uri.
-                                    # We might need to broaden slice_by_source to search IDs?
-                                    # GalaxyQueryEngine.slice_by_source uses "source_query" in recall.
-                                    # If we pass the UUID, and if 'derived_from' is indexed or in text?
-                                    # The secure payload hides it in JSON.
-                                    # We rely on text match or core search.
-                                    # Let's try passing the ID.
-                                    rows = self.bridge.galaxy.slice_by_source(arg)
-                                    if not rows:
-                                        self.console.print("[yellow]No beliefs found derived from this fact.[/]")
-                                    else:
-                                        table = Table(title=f"Beliefs about {arg}", border_style="magenta")
-                                        table.add_column("Agent", style="blue")
-                                        table.add_column("Content", style="white")
-                                        table.add_column("Conf", style="green")
-                                        for r in rows:
-                                            table.add_row(r.agent_role, r.content[:80], f"{r.confidence:.2f}")
-                                        self.console.print(table)
-                                else:
-                                    self.console.print("[red]Galaxy Engine not active.[/]")
-
-                        elif cmd == "/galaxy":
-                             self.handle_galaxy(arg)
-                        elif cmd == "/ls":
-                            # List persisted facts
-                            if hasattr(self.bridge.client, '_core_client'):
-                                res = self.bridge.client._core_client.recall("memory_type:fact", top_k=50) # keyword hack if supported
-                                # Or better: just generic list if backend supported it.
-                                # For prototype: we scan "file://" sources
-                                res = self.bridge.client.recall("file://", top_k=20)
-                                table = Table(title="Workspace Facts (Canonical Truth)", border_style="blue")
-                                table.add_column("Source", style="cyan")
-                                table.add_column("ID", style="dim")
-                                for m in res.memories:
-                                    if m.source.startswith("file://"):
-                                        table.add_row(m.source, str(m.id)[:8])
-                                self.console.print(table)
-                        elif cmd == "/focus":
-                             # focus <id>
-                             self.bridge.active_context_fact_id = arg
-                             self.bridge.active_filename = f"Fact-{arg[:8]}"
-                             self.console.print(f"[green]Workspace Focused: {arg}[/]")
-                        elif cmd == "/ingest":
-                             with Live(Spinner("dots", text="Scanning..."), transient=True):
-                                 # This is heavy, run in executor
-                                 c = await asyncio.get_event_loop().run_in_executor(self.executor, self.bridge.ingest_project)
-                             self.console.print(f"[green]Ingested {c} files[/]")
-                        elif cmd == "/clear":
-                            self.bridge.client.clear()
-                            self.console.print("[green]Cleared memory[/]")
-                        elif cmd == "/help":
-                            self.console.print("[dim]/agents, /variants, /conf, /login, /secure, /smart, /grant, /revoke, /audit, /ingest, /clear, /quit[/]")
-                        else: self.console.print(f"[red]Unknown: {cmd}[/]")
-                        continue
-
-                    # --- CHAT (ASYNC) ---
-                    # Now the spinner will actually spin!
-                    sources_view = None
-                    response = ""
-                    graph_insight = None
-
-                    with Live(Spinner("dots", style=self.DIM), transient=True, refresh_per_second=10):
-                        sources_view, response, graph_insight = await self.async_chat_task(user_input)
-
-                    if sources_view:
-                        self.console.print(sources_view)
-
-                    if graph_insight:
-                        title = "Knowledge Graph"
-                        if RICH_AVAILABLE:
-                             self.console.print(Panel(graph_insight, title=title, border_style="yellow", padding=(0, 1)))
-                        else:
-                             print(f"--- {title} ---\n{graph_insight}")
-
-                    self.console.print()
-                    self.console.print(response)
-
-                except KeyboardInterrupt:
-                    self.console.print("\n[dim]Bye[/]")
-                    break
-                except EOFError:
-                    break
-                except Exception as e:
-                    self.console.print(f"[red]Err: {e}[/]")
-
-        # Run asyncio loop
-        # Run asyncio loop
-        try:
-            # Check for existing loop (e.g. if embedded)
-            try:
-                loop = asyncio.get_running_loop()
-            except RuntimeError:
-                loop = asyncio.new_event_loop()
-                asyncio.set_event_loop(loop)
-
-            loop.run_until_complete(main_loop())
-        except KeyboardInterrupt:
-            self.console.print("\n[dim]Bye[/]")
-        except EOFError:
-            pass
-        except Exception as e:
-            self.console.print(f"[red]Err: {e}[/]")
+class ConflictResolutionScreen(Screen):
+    """Interactive conflict resolution"""
+    pass
+
+class FactBrowserScreen(Screen):
+    """Browse and search facts"""
+    pass
+
+class HelpScreen(Screen):
+    """Help and keybindings"""
+    
+    BINDINGS = [("escape", "app.pop_screen", "Close")]
+    
+    def compose(self) -> ComposeResult:
+        yield Static("""
+# MT NEURAL INTERFACE - HELP
+
+## Keybindings
+
+q         - Quit application
+u         - Show universe details
+c         - Resolve conflicts
+f         - Browse facts
+/         - Search
+?         - This help screen
+s         - Toggle secure mode
+g         - Toggle galaxy architecture
+
+## Concepts
+
+AGENT UNIVERSES
+Each agent maintains their own fact space and beliefs.
+Galaxy architecture automatically links related beliefs.
+
+CONFLICTS
+When agents disagree about the same fact, conflicts are detected.
+Press 'c' to resolve using authority, consensus, or manual selection.
+
+FACTS vs BELIEFS
+Facts are immutable observations.
+Beliefs are agent interpretations of facts.
+        """, id="help-text")
+
+# ============================================================================
+# ENTRY POINT
+# ============================================================================
 
 if __name__ == "__main__":
-    if not RICH_AVAILABLE:
-        print("Install rich: pip install rich")
-    if not PROMPT_TOOLKIT_AVAILABLE:
-        print("Install prompt_toolkit: pip install prompt_toolkit")
-
-    try:
-        MTInterface().run()
-    except KeyboardInterrupt:
-        pass
+    app = MTNeuralInterface()
+    app.run()
