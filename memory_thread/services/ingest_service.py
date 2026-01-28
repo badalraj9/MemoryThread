@@ -169,11 +169,23 @@ class IngestionService:
             self.allocator.mark_as_written(slab.slab_id)
 
     def shutdown(self):
+        log.info("Shutdown initiated...")
+
+        # 1. Stop accepting new requests (implicitly done by stopping app logic calling ingest)
+
+        # 2. Flush workers
+        # Wait for workers to finish current slabs?
+        # Slabs are guarded by semaphores.
+
+        # 3. Stop Persistence Engine (It will finish its buffer)
         self.persistence_engine.stop()
+
         for p in self.workers:
             p.terminate()
             p.join()
+
         self.allocator.unlink()
+        log.info("Ingestion Service Shutdown Complete.")
 
 # Global instance
 ingestion_service = IngestionService()
