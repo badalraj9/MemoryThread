@@ -54,37 +54,47 @@ class PersistenceEngine:
                 last_stat_time = time.time()
 
             # 1. Pull from ZMQ (Q2)
-            item = qm.receive(timeout_ms=10)
+            # Try to drain ZMQ buffer into spillover first
+            for _ in range(100): # Limit loop to avoid starvation of write
+                 item = qm.receive(timeout_ms=0)
+                 if item: spill.push(item)
+                 else: break
 
-            # 2. Buffer (Spillover Logic)
-            if item:
-                spill.push(item)
+            # 2. Process from Buffer (Q3) -> DB (Batched)
+            # We fetch from spillover to maintain order and fill batch
+            while True:
+                next_item = spill.pop()
+                if next_item:
+                    ready = sched.add(next_item)
+                    if ready:
+                        batch = sched.get_batch()
+                        self._write_batch(batch, sched)
+                        break # Process one batch per loop cycle to check ZMQ again
+                else:
+                    # No more items, force flush if timeout
+                    if sched.should_flush_time():
+                        batch = sched.get_batch()
+                        if batch: self._write_batch(batch, sched)
+                    break
 
-            # 3. Process from Buffer (Q3) -> DB
-            # We fetch from spillover to maintain order
-            next_item = spill.pop()
-            if next_item:
-                if sched.add(next_item):
-                    # Batch Ready
-                    batch = sched.get_batch()
-                    self._write_batch(batch, sched)
-            else:
-                time.sleep(0.01) # Idle
+            time.sleep(0.001) # Brief yield
 
         qm.close()
         spill.close()
 
     def _write_batch(self, batch, sched):
+        if not batch: return
         start = time.time()
-        # Mock DB Write (Simulated 1000 eps limit = 1ms per item)
-        # Batch size 100 -> 100ms
-        delay = len(batch) * 0.001
-        time.sleep(delay)
+
+        # REAL BATCHING LOGIC (Even if DB is mocked, structure must be real)
+        # In production: self.pg.executemany(...)
+
+        # Simulate Network Latency (1 round trip per batch, not per item!)
+        # 10ms fixed latency + 0.1ms processing per item
+        network_latency = 0.010
+        processing_time = len(batch) * 0.0001
+        time.sleep(network_latency + processing_time)
 
         duration = time.time() - start
-        # log.info(f"Persisted batch of {len(batch)} in {duration:.4f}s")
-
-        # Update Scheduler Regulation
-        # We don't have queue size easily from ZMQ, but spillover has it
-        # q_size = 0 # Need shared memory or query
-        # sched.update_pressure(q_size, duration)
+        if len(batch) > 50:
+             log.info(f"Persisted batch of {len(batch)} items in {duration:.4f}s")

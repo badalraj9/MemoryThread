@@ -22,9 +22,10 @@ class PersistenceScheduler:
         self.current_batch.append(item)
         if len(self.current_batch) >= self.batch_size:
             return True
-        if (time.time() - self.last_flush_time) * 1000 > self.max_latency_ms:
-            return True
         return False
+
+    def should_flush_time(self) -> bool:
+        return (time.time() - self.last_flush_time) * 1000 > self.max_latency_ms
 
     def get_batch(self) -> List[Any]:
         batch = self.current_batch

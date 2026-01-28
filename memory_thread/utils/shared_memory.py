@@ -81,9 +81,10 @@ class SlabAllocator:
         # We stick to a cursor scan for written items, but optimize it.
         self.next_read_slab = mp.Value(ctypes.c_int, 0)
 
-    def reserve_slab(self) -> SlabHandle:
+    def reserve_slab(self, timeout: float = None) -> SlabHandle:
         # Wait for a free slab
-        self.free_list_semaphore.acquire()
+        if not self.free_list_semaphore.acquire(timeout=timeout):
+             raise TimeoutError("Slab allocation timed out (Buffer Full)")
 
         with self.lock:
             # O(1) Pop from stack
