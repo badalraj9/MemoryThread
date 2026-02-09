@@ -2,7 +2,30 @@
 
 Memory Thread Engine REST API documentation.
 
-**Base URL:** `http://localhost:8000`
+**Base URL:** `http://localhost:8000`  
+**Version:** `2.0.0`
+
+---
+
+## Authentication
+
+All mutating endpoints require a Bearer token. Obtain tokens via the client registry:
+
+```bash
+# Register an API client (S-CLASS required)
+mt clients create my-app
+
+# Use the returned API key in requests
+curl -H "Authorization: Bearer mt_sk_..." http://localhost:8000/memory/recall
+```
+
+**Header Format:**
+
+```
+Authorization: Bearer <api_key>
+```
+
+**Unauthenticated endpoints:** `/`, `/health`, `/health/ready`, `/health/live`, `/version`
 
 ---
 
@@ -17,7 +40,7 @@ Quick health check for load balancers.
 ```json
 {
   "status": "active",
-  "version": "0.4.0"
+  "version": "2.0.0"
 }
 ```
 
@@ -42,14 +65,16 @@ Detailed health check with service statuses.
       "latency_ms": 5
     }
   },
-  "timestamp": "2025-01-24T10:00:00Z"
+  "memory_count": 1523,
+  "wal_pending": 0,
+  "timestamp": "2026-02-10T02:00:00Z"
 }
 ```
 
 **Status Values:**
 
 - `healthy` — All services operational
-- `degraded` — Some services down, but functional
+- `degraded` — Some services down, but functional (using fallbacks)
 - `unhealthy` — Critical services down
 
 ---
@@ -100,6 +125,10 @@ mt_requests_total 1234
 # TYPE mt_events_processed counter
 mt_events_processed 567890
 
+# HELP mt_truth_score_avg Average truth score
+# TYPE mt_truth_score_avg gauge
+mt_truth_score_avg 0.82
+
 # HELP mt_up Service up status
 # TYPE mt_up gauge
 mt_up 1
@@ -115,10 +144,179 @@ Version and build information.
 
 ```json
 {
-  "version": "0.4.0",
+  "version": "2.0.0",
   "name": "Memory Thread Engine",
-  "api_version": "v1"
+  "api_version": "v2"
 }
+```
+
+---
+
+## Memory Operations
+
+### `POST /memory/chat`
+
+**Auth Required.** Autonomous chat — auto-remembers input, builds context, generates response.
+
+**Request:**
+
+```json
+{
+  "message": "My project deadline is March 15th",
+  "system_prompt": "You are a helpful assistant with memory.",
+  "use_local": false
+}
+```
+
+**Response:**
+
+```json
+{
+  "response": "I've noted that your project deadline is March 15th. Would you like me to help you plan the remaining milestones?",
+  "memories_used": 12,
+  "contradiction_detected": false
+}
+```
+
+---
+
+### `POST /memory/remember`
+
+**Auth Required.** Explicitly store a memory with truth vector.
+
+**Request:**
+
+```json
+{
+  "content": "User prefers dark mode",
+  "source": "agent",
+  "confidence": 0.9,
+  "authority": 0.5,
+  "memory_type": "preference"
+}
+```
+
+**Response:**
+
+```json
+{
+  "entity_id": "550e8400-e29b-41d4-a716-446655440000",
+  "truth_score": 0.72
+}
+```
+
+---
+
+### `POST /memory/recall`
+
+**Auth Required.** Query stored memories with truth-ranked results.
+
+**Request:**
+
+```json
+{
+  "query": "project deadline",
+  "top_k": 10,
+  "min_truth_score": 0.3,
+  "search_type": "hybrid"
+}
+```
+
+**Response:**
+
+```json
+{
+  "results": [
+    {
+      "entity_id": "550e8400-...",
+      "content": "Project deadline is March 15th",
+      "truth_score": 0.92,
+      "memory_type": "fact",
+      "created_at": "2026-02-10T02:00:00Z"
+    }
+  ],
+  "total": 1
+}
+```
+
+---
+
+## Galaxy Schema
+
+### `POST /galaxy/fact`
+
+**Auth Required.** Ingest an immutable fact into Layer 0.
+
+**Request:**
+
+```json
+{
+  "content": "auth_service.py handles JWT token parsing",
+  "source_uri": "file://src/auth_service.py"
+}
+```
+
+**Response:**
+
+```json
+{
+  "fact_id": "fact-uuid",
+  "status": "ingested"
+}
+```
+
+---
+
+### `POST /galaxy/belief`
+
+**Auth Required.** Derive a belief from a fact (Layer 1).
+
+**Request:**
+
+```json
+{
+  "fact_id": "fact-uuid",
+  "belief": "Legacy OAuth implementation; potential vulnerability",
+  "agent_id": "security-bot",
+  "confidence": 0.7
+}
+```
+
+**Response:**
+
+```json
+{
+  "belief_id": "belief-uuid",
+  "status": "derived"
+}
+```
+
+---
+
+### `GET /galaxy/conflicts`
+
+**Auth Required.** Get conflicting beliefs across agents.
+
+**Response:**
+
+```json
+[
+  {
+    "fact_id": "fact-uuid",
+    "beliefs": [
+      {
+        "agent": "coder-bot",
+        "belief": "JWT handling is secure",
+        "confidence": 0.9
+      },
+      {
+        "agent": "security-bot",
+        "belief": "Legacy OAuth is vulnerable",
+        "confidence": 0.7
+      }
+    ]
+  }
+]
 ```
 
 ---
@@ -154,7 +352,7 @@ Register a producer (client) with the engine.
 
 ### `POST /ingest`
 
-Ingest a batch of events into the memory system.
+**Auth Required.** Ingest a batch of events into the memory system.
 
 **Request:**
 
@@ -164,11 +362,7 @@ Ingest a batch of events into the memory system.
   "events": [
     {
       "content": "User prefers dark mode",
-      "timestamp": "2025-01-24T10:00:00Z"
-    },
-    {
-      "content": "User lives in Mumbai",
-      "timestamp": "2025-01-24T10:01:00Z"
+      "timestamp": "2026-02-10T10:00:00Z"
     }
   ]
 }
@@ -179,7 +373,7 @@ Ingest a batch of events into the memory system.
 ```json
 {
   "status": "accepted",
-  "count": 2
+  "count": 1
 }
 ```
 
@@ -209,7 +403,7 @@ Get current system pressure for adaptive ingestion.
 
 ### `GET /maintenance/proposals`
 
-Get duplicate entity merge proposals.
+**Auth Required.** Get duplicate entity merge proposals.
 
 **Response:**
 
@@ -228,7 +422,7 @@ Get duplicate entity merge proposals.
 
 ### `POST /maintenance/approve/merge`
 
-Approve and execute a merge proposal.
+**Auth Required.** Approve and execute a merge proposal.
 
 **Request:**
 
@@ -254,7 +448,7 @@ Approve and execute a merge proposal.
 
 ### `GET /maintenance/health/stats`
 
-Dashboard metrics for system health.
+**Auth Required.** Dashboard metrics for system health.
 
 **Response:**
 
@@ -263,7 +457,9 @@ Dashboard metrics for system health.
   "entities_count": 1000,
   "duplicates_detected": 5,
   "pruning_candidates": 20,
-  "average_freshness": 0.88
+  "average_freshness": 0.88,
+  "wal_entries": 42,
+  "health_score": 0.95
 }
 ```
 
@@ -276,6 +472,8 @@ All endpoints may return:
 | Status | Meaning                                               |
 | ------ | ----------------------------------------------------- |
 | `400`  | Bad request (invalid JSON)                            |
+| `401`  | Unauthorized (missing or invalid API key)             |
+| `403`  | Forbidden (insufficient RBAC clearance)               |
 | `500`  | Internal server error                                 |
 | `503`  | Service unavailable (overloaded or dependencies down) |
 
@@ -291,10 +489,6 @@ All endpoints may return:
 
 ## Rate Limiting
 
-Currently no rate limiting is enforced. Use the `/control/throttle` endpoint to implement client-side adaptive throttling based on system pressure.
+Rate limiting is enforced per API key based on the client's associated RBAC role. Exceeding limits returns `429 Too Many Requests` with a `Retry-After` header.
 
----
-
-## Authentication
-
-Currently no authentication required. For production, implement JWT or API key authentication.
+Use the `/control/throttle` endpoint for client-side adaptive throttling based on system pressure.

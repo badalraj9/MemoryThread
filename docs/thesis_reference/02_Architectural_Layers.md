@@ -1,115 +1,146 @@
 # Architectural Layers: A Deep Dive
 
-The **Memory Thread** architecture is designed as a biological mimic, moving away from standard CRUD applications towards a "Nervous System" model. It is composed of four distinct layers, each with specific responsibilities and isolation boundaries.
+The **Memory Thread** architecture is designed as a layered cognitive system, separating concerns between interface, processing, access control, and persistence.
 
-## 1. The API Gateway (The Senses)
-*   **Location:** `memory_thread/api/`
-*   **Role:** The system's interface with the outside world (LLMs, Users, Agents).
-*   **Key Component:** `IngestService`
+## 1. The Interface Layer (Interaction Points)
 
-The Gateway is "dumb" by design. It does not attempt to understand the data; it only validates its shape and stamps it with a receipt.
+- **Location:** `memory_thread/cli.py`, `memory_thread/api/`
 
-### The "Smart Ingestion" Protocol
-Unlike standard REST APIs that block until data is saved to a database, the Gateway uses a **Length-Header Protocol** to push data immediately into shared memory.
+The system provides three interfaces for different use cases:
 
-```mermaid
-sequenceDiagram
-    participant Client
-    participant API_Gateway
-    participant Slab_Allocator
-    participant Worker_Process
+### CLI (Primary — Typer + Rich)
 
-    Client->>API_Gateway: POST /memory/ingest (JSON)
-    API_Gateway->>Slab_Allocator: Reserve Slab (Lock-free)
-    Slab_Allocator-->>API_Gateway: Slab Pointer
-    API_Gateway->>Slab_Allocator: Write Length + Payload
-    API_Gateway->>Client: 202 Accepted (Correlation ID)
-    Worker_Process->>Slab_Allocator: Poll for "Written" Slabs
-    Slab_Allocator-->>Worker_Process: Payload
-```
+The autonomy-first CLI. `mt` with no arguments enters interactive chat where everything is auto-handled:
+
+- Auto-remembering of user messages and agent responses
+- Entity extraction and relation inference
+- Contradiction detection against existing memories
+- Context building from all stored knowledge
+
+Commands are RBAC-gated by Pentagon clearance grades (E-CLASS → SSS-CLASS).
+
+### REST API (FastAPI)
+
+Authenticated endpoints for programmatic access. Bearer token authentication via the client registry. Full CRUD for memories, Galaxy Schema operations, and maintenance endpoints.
+
+### Python SDK (`MemoryClient`)
+
+Direct integration via `from memory_thread.sdk import MemoryClient`. The SDK is the foundation — both CLI and API are thin wrappers around it.
 
 ## 2. The Service Layer (The Brain)
-*   **Location:** `memory_thread/services/`
-*   **Role:** Processing, Logic, and Derivation.
 
-This is where the raw sensory input is converted into "Meaning."
+- **Location:** `memory_thread/services/`
+- **Role:** Processing, Logic, and Derivation.
+
+This is where raw input is converted into "Meaning."
 
 ### Key Services:
+
 1.  **TMSService (Truth Maintenance System):**
-    *   The core logic engine.
-    *   Calculates `TruthVector` scores.
-    *   Decides if a new fact (Event) overrides an old fact (State).
-    *   *Code:* `memory_thread/services/tms_service.py`
+    - The core logic engine.
+    - Calculates `TruthVector` scores: $S = 0.4C + 0.35A + 0.25F + 0.1 \ln(1 + R)$.
+    - Decides if a new fact (Event) overrides an old fact (State).
+    - _Code:_ `memory_thread/services/tms_service.py`
 
 2.  **StateDerivationService:**
-    *   A pure function $S_{t+1} = f(S_t, E)$.
-    *   Applies `DeltaPatch` (JSON Diff) to entity states.
-    *   Handles arithmetic for numeric fields (e.g., `tree_count += 5`).
+    - A pure function $S_{t+1} = f(S_t, E)$.
+    - Applies `DeltaPatch` (JSON Diff) to entity states.
+    - Handles arithmetic for numeric fields (e.g., `tree_count += 5`).
 
-3.  **MetaStabilityService (The Immune System):**
-    *   Runs *before* the TMS to check for "viruses" (contradictions, hallucinations).
-    *   Checks "Drift" (is the topic changing too fast?).
-    *   Checks "Integrity" (are values negative that shouldn't be?).
-    *   *Code:* `memory_thread/services/meta_stability_service.py`
+3.  **GalaxyQueryService:**
+    - OLAP-style cognitive queries across belief dimensions.
+    - SLICE (by source), DICE (multi-filter), DRILL_DOWN (to source fact), ROLL_UP (aggregate).
+    - _Code:_ `memory_thread/services/galaxy_query.py`
 
-## 3. The Nervous System (The Messaging Fabric)
-*   **Location:** `memory_thread/nervous/`
-*   **Role:** Connecting the brain to the muscles (Storage) without latency.
+4.  **DecayEngine:**
+    - Exponential decay: $F_{new} = F_{old} \cdot e^{-\lambda t}$
+    - Configurable decay rates per memory type.
+    - _Code:_ `memory_thread/services/decay_engine.py`
 
-This layer uses a **Dual-Path Architecture**:
+5.  **EntityExtractor (NER):**
+    - Extracts named entities and relations from natural language.
+    - Builds structured relationships between concepts.
+    - _Code:_ `memory_thread/services/ner.py`
 
-1.  **The Fast Path (Reflexes) - ZeroMQ:**
-    *   **Protocol:** `ROUTER/DEALER` pattern.
-    *   **Why:** Microsecond latency. No broker overhead.
-    *   **Usage:** Moving data from Ingestion Workers to the Persistence Engine.
-    *   **Backpressure:** Implements a "Traffic Light" system. If the database is slow, the fabric signals the producers to slow down (Sleep), preventing OOM crashes.
-    *   *Code:* `memory_thread/nervous/fabric.py`, `queue_manager.py`.
+## 3. The Access Control Layer
 
-2.  **The Durable Path (Memory Consolidation) - Kafka:**
-    *   **Protocol:** Pub/Sub.
-    *   **Why:** Disk-based durability. If the server crashes, the event log remains.
-    *   **Usage:** "Mirroring" every event to a durable log for later replay.
-    *   *Code:* `memory_thread/nervous/fabric.py` (Class `KafkaMirror`).
+- **Location:** `memory_thread/services/access_control.py`, `memory_thread/vault.py`
+- **Role:** Pentagon-grade RBAC enforcement.
+
+### Components:
+
+1.  **AccessControlService:**
+    - Enforces grade-based command access (E-CLASS → SSS-CLASS).
+    - Calculates write authority based on user grade and target namespace.
+    - Filters read results by namespace clearance.
+
+2.  **Vault:**
+    - Stores API keys (Base64 encoded), PINs (SHA-256 hashed).
+    - Per-user provider credentials for LLM services.
+    - _Location:_ `~/.mt/vault.json`
+
+3.  **Client Registry:**
+    - Manages API keys for external consumers.
+    - Issues `mt_sk_*` prefixed bearer tokens.
 
 ## 4. The Persistence Layer (The Hippocampus)
-*   **Location:** `memory_thread/db/`
-*   **Role:** Long-term storage and index retrieval.
 
-We employ a **Hybrid Storage Strategy**:
+- **Location:** `memory_thread/db/`
+- **Role:** Durable storage with crash safety.
 
-### A. The Event Log (Postgres)
-*   **Table:** `events`
-*   **Role:** The absolute source of truth. An append-only log of every interaction.
-*   **Schema:** Immutable JSONB.
+We employ a **Hybrid Storage Strategy** with automatic fallback:
 
-### B. The Entity State (Postgres)
-*   **Table:** `entity_state`
-*   **Role:** A cache of the "Now."
-*   **Schema:** `current_value` (JSONB) + `truth_vector`.
-*   **Logic:** This table can be deleted and fully rebuilt from the Event Log at any time (Replay).
+### A. Write-Ahead Log (WAL)
 
-### C. The Vector Store (Qdrant)
-*   **Collection:** `memories`
-*   **Role:** Associative memory. "Find me things *like* this."
-*   **Schema:** High-dimensional float vectors + Payload (Metadata).
+- **Role:** Crash-proof durability guarantee.
+- **Protocol:** Pre-write → fsync → Process → Commit.
+- **Recovery:** Uncommitted entries replayed on startup.
+
+### B. The Event Log (PostgreSQL)
+
+- **Table:** `events`
+- **Role:** The absolute source of truth. An append-only log of every interaction.
+- **Schema:** Immutable JSONB with GIN indices for fast queries.
+
+### C. The Entity State (PostgreSQL)
+
+- **Table:** `entity_state`
+- **Role:** A cache of the "Now."
+- **Schema:** `current_value` (JSONB) + `truth_vector`.
+- **Logic:** This table can be deleted and fully rebuilt from the Event Log at any time (Replay).
+
+### D. SQLite Fallback
+
+- **Role:** Automatic fallback when PostgreSQL is unavailable.
+- **Guarantees:** Same schema, same query interface, reduced scale.
+
+### E. The Vector Store (Qdrant)
+
+- **Collection:** `memories`
+- **Role:** Associative memory — "Find me things _like_ this."
+- **Fallback:** When Qdrant is unavailable, keyword search via PostgreSQL `websearch_to_tsquery`.
 
 ---
 
 ## 5. Data Structure Definitions
 
 ### 5.1 The Event Object
+
 The atomic unit of memory.
-*   **ID:** UUID4 (Unique Identifier)
-*   **Timestamp:** UTC Datetime
-*   **Actor:** Enum (`USER`, `AGENT`, `SYSTEM`)
-*   **Action:** Enum (`PLANT`, `ADD`, `REMOVE`, `UPDATE`, `OBSERVE`, `INFER`)
-*   **Object ID:** UUID (The entity being acted upon)
-*   **Delta:** JSON Dictionary (The change payload)
-*   **Truth Vector:** Embedded `TruthVector` object
+
+- **ID:** UUID4 (Unique Identifier)
+- **Timestamp:** UTC Datetime
+- **Actor:** Enum (`USER`, `AGENT`, `SYSTEM`)
+- **Action:** Enum (`ADD`, `UPDATE`, `REMOVE`, `OBSERVE`, `INFER`)
+- **Object ID:** UUID (The entity being acted upon)
+- **Delta:** JSON Dictionary (The change payload)
+- **Truth Vector:** Embedded `TruthVector` object
 
 ### 5.2 The Truth Vector
+
 The tensor of validity.
-*   **Confidence:** Float [0.0 - 1.0]
-*   **Authority:** Float [0.0 - 1.0]
-*   **Freshness:** Float [0.0 - 1.0]
-*   **Corroboration:** Float [0.0 - inf)
+
+- **Confidence:** Float [0.0 - 1.0]
+- **Authority:** Float [0.0 - 1.0]
+- **Freshness:** Float [0.0 - 1.0]
+- **Corroboration:** Float [0.0 - inf)

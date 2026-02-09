@@ -4,144 +4,171 @@ This document provides a microscopic trace of data flow within the system, detai
 
 ---
 
-## 1. The Ingestion Workflow (The "Hot Path")
-**Objective:** Accept high-velocity data (47k EPS) with zero blocking.
+## 1. The Chat Workflow (Autonomous Path)
 
-### Step 1.1: Stimulus (API Gateway)
-*   **Component:** `memory_thread.api.endpoints.ingest`
-*   **Input:** HTTP `POST /memory/ingest`
-*   **Payload:** JSON `{"content": "...", "timestamp": "...", "meta": {...}}`
-*   **Action:**
-    1.  **Validation:** `Pydantic` verifies basic schema (presence of fields).
-    2.  **Slab Request:** Calls `ingestion_service.allocator.reserve_slab()`.
-        *   **Mechanism:** Acquires Semaphore -> Pops `slab_id` from Shared Memory Stack (Lock-Free) -> Returns `SlabHandle`.
-    3.  **Binary Write:**
-        *   Serializes payload to JSON bytes.
-        *   Calculates Length $L$.
-        *   Writes `Header (4 bytes)` + `Payload ($L$ bytes)` to `SharedMemory`.
-        *   Sets `metadata[slab_id] = WRITTEN`.
-    4.  **Response:** Returns HTTP `202 Accepted` + `correlation_id`.
-    *   **Latency:** < 100μs (Microseconds).
+**Objective:** Accept a user message, auto-remember it, detect contradictions, build context, generate a response, and store the response — all transparently.
 
-### Step 1.2: The Reflex (Worker Pickup)
-*   **Component:** `memory_thread.services.ingest_service.worker_process`
-*   **Trigger:** Infinite loop scanning `metadata` array for `WRITTEN` flag.
-*   **Action:**
-    1.  **Read:** Extracts payload from Shared Memory using Length Header.
-    2.  **Meta-Stability Check (Layer 0):**
-        *   Calls `MetaStabilityService.check_drift(content)`.
-        *   *Logic:* Compares content embedding distance against domain centroid.
-        *   *Outcome:* If drift > threshold, flag as `QUARANTINED`.
-    3.  **Classification:**
-        *   Calls `ClassifyService.classify_memory(text)`.
-        *   *Logic:* Regex pattern matching for Identity/Preference/Event triggers.
+### Step 1.1: User Input
 
----
+- **Component:** `cli.py` → `MemoryClient.chat()`
+- **Input:** User message string (e.g., "My project deadline is March 15th")
+- **Action:**
+  1.  CLI passes message to `client.chat(user_message)`.
+  2.  Chat orchestrates all downstream operations.
 
-## 2. The Processing Workflow (The "Brain")
-**Objective:** Convert raw data into structured, valid knowledge.
+### Step 1.2: Auto-Remember (Write Path)
 
-### Step 2.1: Truth Maintenance (TMS)
-*   **Component:** `TMSService.create_event`
-*   **Action:**
-    1.  **ID Generation:** Generates deterministic UUIDv5 based on `(namespace, sha256(content))`.
-    2.  **Truth Scoring:** Calculates `TruthVector`:
-        *   $C$ (Confidence): Default 1.0 or from API.
-        *   $A$ (Authority): 1.0 (User) vs 0.5 (Agent).
-        *   $F$ (Freshness): 1.0 (New).
-        *   $R$ (Corroboration): 0.0 (Initial).
-    3.  **Event Construction:** Wraps data into `Event` object with `TruthVector`.
+- **Component:** `MemoryClient.remember()`
+- **Action:**
+  1.  **WAL Pre-Write:** Serialize operation → `fsync()` to WAL file.
+  2.  **Entity ID Generation:** Deterministic UUID based on `(namespace, content_hash)`.
+  3.  **Truth Vector Init:** $(C=0.8, A=1.0, F=1.0, R=0)$ for user messages.
+  4.  **Event Creation:** `TMSService.create_event(actor=USER, action=ADD, delta={content, type})`.
+  5.  **State Derivation:** $S_{new} = f(S_{old}, Event)$. Apply delta to entity state.
+  6.  **Entity Extraction:** NER extracts named entities (people, places, dates).
+  7.  **Relation Inference:** Builds structured relationships between entities.
+  8.  **Persistence:**
+      - PostgreSQL: `INSERT INTO events` + `UPSERT entity_state`.
+      - Qdrant: Embed text → `upsert(points=[...])`.
+      - Fallback: SQLite if Postgres unavailable. Skip Qdrant if unavailable.
+  9.  **WAL Commit:** Mark entry as committed.
 
-### Step 2.2: State Derivation
-*   **Component:** `StateDerivationService.apply_event`
-*   **Action:**
-    1.  **Fetch Previous:** (Mocked in Ingest) Gets $S_t$ from local cache/context.
-    2.  **Apply Delta:** Computes $S_{t+1} = S_t \oplus \text{DeltaPatch}$.
-        *   *Arithmetic:* `tree_count += 5`.
-        *   *Replacement:* `location = "Paris"`.
-    3.  **Integrity Check:** `MetaStabilityService.check_integrity($S_{t+1}$)`.
-        *   *Logic:* Validates invariants (e.g., `count >= 0`).
+### Step 1.3: Contradiction Detection
 
-### Step 2.3: Extraction (Enrichment)
-*   **Component:** `ExtractService.extract_structured_data`
-*   **Action:**
-    1.  **NER:** Runs spaCy/Regex to find Entities (People, Places) and Dates.
-    2.  **Embedding:** Calls `VectorService.generate_embeddings(text)`.
-        *   *Model:* `all-MiniLM-L6-v2` (384 dimensions).
+- **Component:** `MemoryClient.check_contradiction()`
+- **Action:**
+  1.  Compare new message against all stored memories.
+  2.  If semantic conflict detected (e.g., "I'm vegan" vs stored "ordered steak"):
+      - Return `{has_contradiction: true, conflicting_memory: "..."}`.
+      - Contradiction note injected into LLM prompt.
 
----
+### Step 1.4: Context Building
 
-## 3. The Nervous System (Transmission)
-**Objective:** Move processed thoughts to long-term storage without stalling the brain.
+- **Component:** `MemoryClient.chat()` (inline)
+- **Action:**
+  1.  Iterate all stored entity states: `self._memories.items()`.
+  2.  Filter by memory type: `fact`, `relation`, `preference`, `identity`.
+  3.  Build context string: "What I know about the user: [memory1, memory2, ...]".
+  4.  Limit to top 15 memories.
 
-### Step 3.1: The Synapse (ZeroMQ)
-*   **Component:** `QueueManager` -> `FabricRouter`
-*   **Protocol:** ZMQ `PUSH` (Worker) -> `PULL` (Router).
-*   **Payload:** `{"event": E, "state": S, "vector": V}`.
-*   **Mechanism:**
-    *   **Backpressure:** If Persistence is slow, ZMQ High-Water Mark (HWM) fills up.
-    *   **Throttling:** Fabric signals Workers to sleep, preventing OOM.
+### Step 1.5: LLM Response Generation
+
+- **Component:** `MemoryClient._generate_local()` or `._generate_cloud()`
+- **Action:**
+  1.  Construct full prompt: `system_prompt + context + contradiction_notes + user_message`.
+  2.  Provider selection:
+      - `use_local=True` → SmolLM (local, offline).
+      - `use_local=False` → Groq SDK or OpenRouter API.
+  3.  Generate response text.
+
+### Step 1.6: Auto-Remember Response
+
+- **Component:** `MemoryClient.remember(response, source="agent")`
+- **Action:**
+  1.  Same write path as Step 1.2.
+  2.  Authority set lower: $(C=0.7, A=0.5, F=1.0, R=0)$.
+  3.  Agent responses are stored but trusted less than user input.
 
 ---
 
-## 4. The Persistence Workflow (The "Hippocampus")
-**Objective:** Durable storage and indexing.
+## 2. The Search Workflow (Retrieval)
 
-### Step 4.1: The Persistence Engine
-*   **Component:** `PersistenceEngine.run`
-*   **Action:** Batches incoming messages (Batch Size: 100 or 50ms timeout).
+**Objective:** Find relevant memories ranked by truth score.
 
-### Step 4.2: Hybrid Storage Strategy
-1.  **Event Log (Postgres):**
-    *   **Table:** `events`.
-    *   **Write:** `INSERT INTO events VALUES (...)`.
-    *   **Role:** Immutable History.
-2.  **Entity State (Postgres):**
-    *   **Table:** `entity_state`.
-    *   **Write:** `INSERT ... ON CONFLICT UPDATE` (Upsert).
-    *   **Role:** Current Truth.
-3.  **Vector Store (Qdrant):**
-    *   **Collection:** `memories`.
-    *   **Write:** `qdrant_client.upsert(points=[...])`.
-    *   **Role:** Semantic Index.
+### Step 2.1: Search Strategy
 
----
+- **Component:** `MemoryClient.recall()`
+- **Input:** Query string $Q$.
+- **Parallel Execution:**
+  1.  **Vector Search:** Embed $Q$ → search Qdrant → semantically similar items.
+  2.  **Keyword Search:** PostgreSQL `websearch_to_tsquery(Q)` → exact matches.
+  3.  **Hybrid Mode:** Combine both result sets.
 
-## 5. The Retrieval Workflow (Recall)
-**Objective:** Reconstruct the most relevant "truth" for a query.
+### Step 2.2: The Ranking Equation
 
-### Step 5.1: Search Strategy
-*   **Component:** `RetrievalService.retrieve_memories`
-*   **Input:** Query string $Q$.
-*   **Parallel Execution:**
-    1.  **Vector Search:** `search_vectors(Embed(Q))`.
-        *   *Returns:* Semantically similar items.
-    2.  **Keyword Search:** Postgres `websearch_to_tsquery(Q)`.
-        *   *Returns:* Exact matches.
-    3.  **Graph Traversal (Phase 7):** `GraphService.get_neighbors(Entities(Q))`.
-        *   *Returns:* Related concepts.
-
-### Step 5.2: The Ranking Equation
-*   **Action:** Merge results and compute Final Score ($Score_{final}$).
-*   **Formula:**
-    $$ Score = w_v \cdot Sim_{vec} + w_k \cdot Score_{kw} + w_g \cdot Density_{graph} + w_t \cdot Truth $$
-*   **Output:** Top-K sorted JSON objects.
+- **Action:** Merge results and compute Final Score.
+- **Formula:**
+  $$ Score = 0.4 C + 0.35 A + 0.25 F + 0.1 \ln(1 + R) $$
+- **RBAC Filter:** Remove results from namespaces above user's clearance grade.
+- **Output:** Top-K sorted results with provenance metadata.
 
 ---
 
-## 6. The Maintenance Workflow (Sleep Cycle)
+## 3. The Replay Workflow (Time Travel)
+
+**Objective:** Verify that current state is mathematically correct.
+
+### Step 3.1: Replay Execution
+
+- **Component:** `ReplayService`
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant ReplayService
+    participant Postgres
+    participant Logic_Engine
+
+    User->>ReplayService: Replay(EntityID)
+    ReplayService->>Postgres: SELECT * FROM events WHERE id=... ORDER BY time
+    Postgres-->>ReplayService: List[Events] (E1, E2, ... En)
+    ReplayService->>Logic_Engine: Init State S0
+    loop For Every Event
+        ReplayService->>Logic_Engine: Apply(State, Event)
+        Logic_Engine-->>ReplayService: New State
+    end
+    ReplayService->>User: Golden Trace (Proven History)
+```
+
+---
+
+## 4. The Maintenance Workflow (Sleep Cycle)
+
 **Objective:** Optimize storage and remove noise.
 
-### Step 6.1: Decay & Pruning
-*   **Component:** `DecayService`
-*   **Trigger:** Scheduled Cron (e.g., nightly).
-*   **Action:**
-    1.  **Decay:** $F_{new} = F_{old} \cdot e^{-\lambda t}$. Update DB.
-    2.  **Prune:** If $Score < 0.1$, move to `archive_events` table.
+### Step 4.1: Decay & Pruning
 
-### Step 6.2: Assimilation
-*   **Component:** `Assimilator`
-*   **Action:**
-    1.  **Clustering:** Group events by semantic similarity > 0.9.
-    2.  **Summarization:** (Mocked/LLM) "Ate apple", "Ate pear" -> "Ate fruit".
-    3.  **Rewrite:** Insert Summary Event, mark originals as `consolidated`.
+- **Component:** `DecayEngine` / `PrunerService`
+- **Trigger:** CLI command (`mt decay`, `mt prune`) or future scheduled job.
+- **Action:**
+  1.  **Decay:** $F_{new} = F_{old} \cdot e^{-\lambda t}$. Update all freshness values.
+  2.  **Prune:** If $Score < 0.3$, remove from active storage.
+
+### Step 4.2: Consolidation
+
+- **Component:** `AssimilatorService`
+- **Action:**
+  1.  **Pattern Detection:** Find repetitive event sequences on same entity.
+  2.  **Consolidation:** Merge into summary event with combined data.
+  3.  **Audit:** Source events marked as `consolidated_into: summary_id`, never deleted.
+
+---
+
+## 5. The Galaxy Workflow (Multi-Agent Cognition)
+
+**Objective:** Enable multiple agents to hold different beliefs about the same facts.
+
+### Step 5.1: Fact Ingestion
+
+- **Component:** `MemoryClient.ingest_fact()`
+- **Action:** Store immutable fact in Layer 0 (content-addressed, versioned).
+
+### Step 5.2: Belief Derivation
+
+- **Component:** `MemoryClient.derive_belief()`
+- **Action:** Agent creates interpretation of fact in Layer 1 with confidence score and provenance.
+
+### Step 5.3: Conflict Detection
+
+- **Component:** `MemoryClient.get_galaxy_conflicts()`
+- **Action:** Identify beliefs about the same fact with contradictory interpretations across agents.
+
+### Step 5.4: OLAP Queries
+
+- **Component:** `MemoryClient.query_galaxy()`
+- **Operations:**
+  - **SLICE:** Filter by source ("beliefs from auth.py")
+  - **DICE:** Multi-filter ("beliefs from SecurityBot with authority > 0.8")
+  - **DRILL_DOWN:** Get source fact for a belief
+  - **ROLL_UP:** Aggregate beliefs into summary
+  - **SEARCH:** Semantic search across beliefs

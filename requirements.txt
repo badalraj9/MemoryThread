@@ -15,6 +15,7 @@ tenacity
 torch
 transformers
 typer
+rich
 prometheus-client
 fastapi
 uvicorn

@@ -85,17 +85,19 @@ class MemoryClient:
     Falls back to in-memory if DB unavailable.
     """
     
-    def __init__(self, namespace: str = "default", use_db: bool = True):
+    def __init__(self, namespace: str = "default", use_db: bool = True, default_authority: float = 0.5):
         """
         Initialize the Memory Client.
         
         Args:
             namespace: Logical grouping for memories
             use_db: If True, use Postgres/Qdrant. If False, in-memory only.
+            default_authority: Default authority score for memories (0.0-1.0)
         """
         self.namespace = namespace
         self.tms = TMSService()
         self.use_db = use_db
+        self.default_authority = min(1.0, max(0.0, default_authority))
         
         # In-memory cache (always available)
         self._memories: Dict[uuid.UUID, EntityState] = {}

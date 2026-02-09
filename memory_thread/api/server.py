@@ -275,9 +275,42 @@ def get_client(
     x_namespace: str = Header("default", alias="X-Namespace"),
     x_api_key: Optional[str] = Header(None, alias="X-API-Key")
 ) -> MemoryClient:
-    """Get or create a MemoryClient for the request."""
-    # TODO: Validate API key against client registry
-    return MemoryClient(namespace=x_namespace, use_db=False)
+    """Get or create a MemoryClient for the request with authentication."""
+    from memory_thread.nervous.client_registry import client_registry
+    from memory_thread.nervous.access_control import AccessControlService
+    
+    # Authenticate API key if provided
+    authority = 0.5  # Default authority
+    role = "guest"
+    client_id = None
+    
+    if x_api_key:
+        authenticated_client = client_registry.authenticate(x_api_key)
+        if authenticated_client:
+            # Valid API key - use client's role and authority
+            authority = authenticated_client.authority
+            role = authenticated_client.role
+            client_id = authenticated_client.client_id
+            
+            # Check if client can access this namespace
+            user_ctx = AccessControlService.create_context(
+                user_id=client_id, 
+                role=role
+            )
+            if x_namespace not in user_ctx.domains and "*" not in user_ctx.domains:
+                raise HTTPException(
+                    status_code=403, 
+                    detail=f"Access denied to namespace '{x_namespace}'"
+                )
+        else:
+            # Invalid API key provided
+            raise HTTPException(
+                status_code=401, 
+                detail="Invalid API key"
+            )
+    
+    # Create client with authenticated authority
+    return MemoryClient(namespace=x_namespace, use_db=False, default_authority=authority)
 
 
 # ==============================================================================

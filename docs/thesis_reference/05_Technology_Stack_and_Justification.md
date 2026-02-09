@@ -2,34 +2,69 @@
 
 The choice of technology in **Memory Thread** is non-trivial. Every component was selected to solve a specific problem inherent to cognitive architectures.
 
-## 1. ZeroMQ (The Nervous System)
-*   **Role:** Inter-process communication.
-*   **Why not HTTP?** HTTP adds millisecond-level overhead (headers, handshake) per request. For a "brain" processing 47k thoughts per second, this is unacceptable.
-*   **Why not RabbitMQ?** RabbitMQ is a broker. It introduces a central point of failure and latency.
-*   **Justification:** ZeroMQ allows "brokerless" messaging. The `DEALER` socket on the client talks directly to the `ROUTER` socket on the server over TCP or IPC (Inter-Process Communication). This mimics the direct synaptic connections of neurons.
+## 1. PostgreSQL (The Hippocampus)
 
-## 2. The Slab Allocator (Memory Management)
-*   **Role:** Buffering incoming requests.
-*   **Why not standard Python Lists/Queues?** Python's `multiprocessing.Queue` uses pickling (serialization) which is CPU expensive and slow.
-*   **Justification:** By using a pre-allocated block of shared memory (`multiprocessing.SharedMemory`) and slicing it into fixed-size "slabs," we eliminate the OS overhead of allocating/freeing memory for every single request. This is the same technique used by the Linux Kernel (SLAB allocator).
+- **Role:** Event Store, Entity State, and Relational Source of Truth.
+- **Why not MongoDB?** Cognitive integrity requires strict schemas and ACID transactions.
+- **Justification:**
+  - **JSONB:** Allows flexibility for the `delta` (payload) of events while maintaining query performance via GIN indices.
+  - **ACID Transactions:** Crucial for replay and state derivation. When we rewrite history, it must be an all-or-nothing operation.
+  - **GIN Indices:** `CREATE INDEX ON entity_state USING gin (current_value jsonb_path_ops)` for sub-millisecond JSONB queries.
+  - **Reliability:** Postgres is the industry standard for "don't lose data."
+
+## 2. SQLite (The Fallback Brain)
+
+- **Role:** Automatic fallback when PostgreSQL is unavailable.
+- **Why SQLite?** Zero-configuration, embedded, file-based. No server process needed.
+- **Justification:** A cognitive system should not become amnesiac just because a database server is down. SQLite provides identical schema with reduced scale, enabling local-only mode for development and edge deployment.
 
 ## 3. Qdrant (The Association Cortex)
-*   **Role:** Vector Database.
-*   **Why not pgvector?** While Postgres has vector extensions, Qdrant is built from the ground up for high-dimensional search with HNSW (Hierarchical Navigable Small World) indexing.
-*   **Justification:** Qdrant supports "Payload Filtering" natively. This allows us to say "Find vectors near X, BUT only if `timestamp > Y` and `truth_score > 0.8`" efficiently.
 
-## 4. Postgres (The Hippocampus)
-*   **Role:** Event Store and Relational Source of Truth.
-*   **Why not MongoDB?** Cognitive integrity requires strict schemas.
-*   **Justification:**
-    *   **JSONB:** Allows flexibility for the `delta` (payload) of events.
-    *   **ACID Transactions:** Crucial for the `Timewarp` feature. When we rewrite history, it must be an all-or-nothing operation.
-    *   **Reliability:** Postgres is the industry standard for "don't lose data."
+- **Role:** Vector Database for semantic search.
+- **Why not pgvector?** While Postgres has vector extensions, Qdrant is built from the ground up for high-dimensional search with HNSW (Hierarchical Navigable Small World) indexing.
+- **Justification:** Qdrant supports "Payload Filtering" natively. This allows us to say "Find vectors near X, BUT only if `timestamp > Y` and `truth_score > 0.8`" efficiently.
+- **Fallback:** When Qdrant is unavailable, MT falls back to PostgreSQL `websearch_to_tsquery` keyword search. Degraded but functional.
+
+## 4. Write-Ahead Log (The Safety Net)
+
+- **Role:** Crash-proof durability guarantee.
+- **Why a custom WAL?** PostgreSQL has its own WAL, but we need application-level durability that spans multiple storage backends (Postgres + Qdrant).
+- **Justification:**
+  - Pre-write → `fsync()` → Process → Commit. If the system crashes between pre-write and commit, uncommitted entries are replayed on startup.
+  - This ensures no memory is ever lost, even during power failures or process crashes.
 
 ## 5. Pydantic (The Validation Layer)
-*   **Role:** Data Serialization and Type Checking.
-*   **Justification:** In a system where data evolves (Phase 3 -> Phase 6), type safety is paramount. Pydantic ensures that a `TruthVector` always has exactly 4 float fields, preventing "bit rot" where data structures degrade over time.
+
+- **Role:** Data Serialization and Type Checking.
+- **Justification:** In a system where data evolves across phases, type safety is paramount. Pydantic ensures that a `TruthVector` always has exactly 4 float fields, preventing "bit rot" where data structures degrade over time.
 
 ## 6. FastAPI (The Interface)
-*   **Role:** API Server.
-*   **Justification:** Native support for asynchronous programming (`async/await`) allows the Gateway to handle thousands of concurrent connections while waiting for the Slab Allocator, without blocking threads.
+
+- **Role:** REST API Server.
+- **Justification:** Native support for asynchronous programming (`async/await`) allows the API to handle concurrent requests while waiting for database operations. Automatic OpenAPI documentation provides self-documenting endpoints.
+
+## 7. Typer + Rich (The CLI)
+
+- **Role:** Command-line interface for direct user interaction.
+- **Why not Textual?** Textual provides a full TUI but adds complexity for a system that is primarily autonomous. Typer provides clean command parsing; Rich provides beautiful terminal output.
+- **Justification:** The CLI defaults to interactive chat (`mt` with no arguments). Commands are RBAC-gated, and Rich panels/tables provide clear, scannable output for inspection commands.
+
+## 8. Sentence-Transformers (The Encoding Layer)
+
+- **Role:** Text-to-vector embedding generation.
+- **Model:** `all-MiniLM-L6-v2` (384 dimensions).
+- **Justification:** Lightweight, fast, runs locally without GPU. Produces high-quality embeddings for semantic search. No external API dependency for core functionality.
+
+## 9. Multi-LLM Architecture
+
+- **Role:** Response generation during autonomous chat.
+- **Providers:**
+  - **SmolLM (135M):** Local, offline, default. No API keys needed.
+  - **Groq:** Fast cloud inference via Groq SDK. Low latency.
+  - **OpenRouter:** Multi-model access (GPT-4, Claude, Mixtral, etc.).
+- **Justification:** A cognitive system should not depend on a single cloud provider. The fallback chain (Groq → OpenRouter → local) ensures MT always works, even offline.
+
+## 10. structlog (The Observability Layer)
+
+- **Role:** Structured logging with context propagation.
+- **Justification:** Traditional logging (`print` or `logging`) produces unstructured text. `structlog` produces structured JSON logs with context variables (user_id, namespace, operation), enabling debugging of complex multi-step cognitive operations.

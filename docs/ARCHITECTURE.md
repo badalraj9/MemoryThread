@@ -1,12 +1,12 @@
 # Memory Thread: Architecture Specification
 
-**Version 1.0** | **Date: February 2026**
+**Version 2.0** | **Date: February 2026**
 
 ---
 
 ## Abstract
 
-Memory Thread (MT) is a **truth-preserving cognitive memory system** designed for multi-agent AI environments. Unlike traditional vector databases that treat all data as equally valid, MT maintains explicit **truth vectors** (confidence, authority, freshness) for every memory, enabling agents to reason about the reliability of their knowledge. This document specifies MT's architecture, theoretical foundations, and implementation details.
+Memory Thread (MT) is a **truth-preserving cognitive memory system** designed for multi-agent AI environments. Unlike traditional vector databases that treat all data as equally valid, MT maintains explicit **truth vectors** (confidence, authority, freshness, corroboration) for every memory, enabling agents to reason about the reliability of their knowledge. The system is **autonomous** — during chat interactions, MT automatically remembers, extracts entities, detects contradictions, and builds context without explicit user commands.
 
 ---
 
@@ -28,6 +28,7 @@ MT addresses these limitations through:
 - **Galaxy Schema**: OLAP-style cognitive queries across belief dimensions
 - **Event Sourcing**: Complete audit trail with time-travel capabilities
 - **Write-Ahead Logging**: Crash-proof persistence guarantees
+- **Autonomous Chat**: Auto-remember, entity extraction, contradiction detection
 
 ---
 
@@ -61,7 +62,7 @@ $$
 Where:
 
 - $f_0$ = initial freshness (1.0)
-- $\lambda$ = decay rate (configurable)
+- $\lambda$ = decay rate (configurable per memory type)
 - $t$ = time since creation
 
 ### 2.3 Galaxy Schema (OLAP for Cognition)
@@ -83,33 +84,61 @@ Inspired by data warehouse star schemas, the Galaxy Schema separates:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                        Memory Thread                             │
+│                        Memory Thread                            │
 ├─────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐  │
-│  │   REST API  │  │  Python SDK │  │  Terminal UI (TUI)      │  │
-│  │  (FastAPI)  │  │MemoryClient │  │  (Textual)              │  │
-│  └──────┬──────┘  └──────┬──────┘  └───────────┬─────────────┘  │
-│         └────────────────┼─────────────────────┘                │
-│                          ▼                                       │
+│  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────────┐ │
+│  │   REST API  │  │  Python SDK │  │     CLI (Typer+Rich)    │ │
+│  │  (FastAPI)  │  │MemoryClient │  │  RBAC-gated, mt command │ │
+│  └──────┬──────┘  └──────┬──────┘  └───────────┬─────────────┘ │
+│         └────────────────┼─────────────────────┘               │
+│                          ▼                                      │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │                    Core Services                           │  │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌──────────────┐  │  │
-│  │  │   TMS   │  │ Galaxy  │  │Timewarp │  │ Contemplator │  │  │
-│  │  │ Service │  │ Schema  │  │ Engine  │  │              │  │  │
-│  │  └────┬────┘  └────┬────┘  └────┬────┘  └──────────────┘  │  │
-│  └───────┼────────────┼────────────┼─────────────────────────┘  │
-│          ▼            ▼            ▼                             │
+│  │                    Core Services                          │  │
+│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌────────────┐  │  │
+│  │  │   TMS   │  │ Galaxy  │  │ Decay / │  │   Access   │  │  │
+│  │  │ Service │  │ Schema  │  │ Prune   │  │  Control   │  │  │
+│  │  └────┬────┘  └────┬────┘  └────┬────┘  └────┬───────┘  │  │
+│  └───────┼────────────┼────────────┼─────────────┼──────────┘  │
+│          ▼            ▼            ▼             ▼              │
 │  ┌───────────────────────────────────────────────────────────┐  │
-│  │                  Persistence Layer                         │  │
-│  │  ┌─────────┐  ┌─────────┐  ┌─────────┐  ┌─────────────┐   │  │
-│  │  │   WAL   │  │PostgreSQL│  │ Qdrant  │  │File Fallback│   │  │
-│  │  │(fsync)  │  │ (Events) │  │(Vectors)│  │  (~/.mt/)   │   │  │
-│  │  └─────────┘  └─────────┘  └─────────┘  └─────────────┘   │  │
+│  │                  Persistence Layer                        │  │
+│  │  ┌─────────┐  ┌──────────┐  ┌─────────┐  ┌───────────┐  │  │
+│  │  │   WAL   │  │PostgreSQL│  │ Qdrant  │  │  SQLite   │  │  │
+│  │  │(fsync)  │  │ (Events) │  │(Vectors)│  │(Fallback) │  │  │
+│  │  └─────────┘  └──────────┘  └─────────┘  └───────────┘  │  │
 │  └───────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Data Flow
+### 3.2 Autonomous Chat Flow
+
+The primary interaction mode. When a user chats, MT performs all operations automatically:
+
+```
+User Message
+    │
+    ├─1─▶ remember(message, source="user")
+    │       ├── WAL pre-write (crash safety)
+    │       ├── Create TruthVector (c=0.8, a=1.0, f=1.0, r=0)
+    │       ├── Entity extraction (NER)
+    │       ├── Relation inference
+    │       ├── Persist to DB + index in Qdrant
+    │       └── WAL commit
+    │
+    ├─2─▶ check_contradiction(message)
+    │       └── Flag if user previously said something conflicting
+    │
+    ├─3─▶ build_context()
+    │       └── Aggregate ALL stored memories into context window
+    │
+    ├─4─▶ generate_response(context + message)
+    │       └── Local LLM or Cloud API (Groq/OpenRouter)
+    │
+    └─5─▶ remember(response, source="agent")
+            └── Store agent response with lower authority (0.5)
+```
+
+### 3.3 Data Flow (Write Path)
 
 ```
 User Input
@@ -154,30 +183,31 @@ for entry in uncommitted:
 
 ### 4.2 Graceful Degradation
 
-| Dependency | If Unavailable    | Fallback Behavior |
-| ---------- | ----------------- | ----------------- |
-| PostgreSQL | Skip DB persist   | File-based JSON   |
-| Qdrant     | Skip vector index | Keyword search    |
-| Network    | API inaccessible  | Local-only mode   |
+| Dependency | If Unavailable    | Fallback Behavior       |
+| ---------- | ----------------- | ----------------------- |
+| PostgreSQL | Skip DB persist   | SQLite file-based store |
+| Qdrant     | Skip vector index | Keyword search          |
+| Cloud LLM  | API unavailable   | Local SmolLM model      |
+| Network    | API inaccessible  | Local-only mode         |
 
 ---
 
 ## 5. Security Model
 
-### 5.1 RBAC Hierarchy
+### 5.1 RBAC Hierarchy (Pentagon Classification)
 
 ```
-        GODFATHER (Root)
-             │
-        ADMIN (Nuclear)
-             │
-    ┌────────┼────────┐
-    │        │        │
-ENGINEER   ANALYST   AUDITOR
-    │
-  AGENT
-    │
-  GUEST
+    SSS-CLASS (Godfather) ─── Nuclear: clear, rootkey, su, sudo
+         │
+    S-CLASS (Executive) ─── Operations: prune, audit, clients
+         │
+    A-CLASS (Researcher) ─── Maintenance: decay, consolidate, export, snapshot
+         │
+    B-CLASS (Developer) ─── Deep Inspection: galaxy, conflicts, provenance, agent, provider
+         │
+    C-CLASS (Employee) ─── Inspection: status, search, load
+         │
+    E-CLASS (Guest) ─── Chat only: mt, ask, whoami
 ```
 
 ### 5.2 Vault Storage
@@ -187,6 +217,13 @@ Sensitive data stored in `~/.mt/vault.json`:
 - API keys: Base64 encoded (AES recommended for production)
 - PINs: SHA-256 hashed
 - Per-user provider credentials
+- Client registry with API key management
+
+### 5.3 Access Control Enforcement
+
+- **CLI**: Commands gated by `MT_ROLE` environment variable
+- **API**: Bearer token authentication via client registry
+- **SDK**: `SecureMemoryClient` wraps `MemoryClient` with authority scoring
 
 ---
 
@@ -194,23 +231,47 @@ Sensitive data stored in `~/.mt/vault.json`:
 
 ### 6.1 Core SDK Methods
 
-| Method            | Signature                                  | Description       |
-| ----------------- | ------------------------------------------ | ----------------- |
-| `remember()`      | `(content, confidence, authority) → UUID`  | Store memory      |
-| `recall()`        | `(query, top_k, min_truth) → RecallResult` | Retrieve memories |
-| `ingest_fact()`   | `(content, source_uri) → fact_id`          | Galaxy L0         |
-| `derive_belief()` | `(fact_id, belief, agent_id) → belief_id`  | Galaxy L1         |
-| `query_galaxy()`  | `(op, **kwargs) → QueryResult`             | OLAP query        |
+| Method                  | Signature                                  | Description         |
+| ----------------------- | ------------------------------------------ | ------------------- |
+| `chat()`                | `(message, system_prompt) → str`           | Autonomous chat     |
+| `remember()`            | `(content, confidence, authority) → UUID`  | Store memory        |
+| `recall()`              | `(query, top_k, min_truth) → RecallResult` | Retrieve memories   |
+| `check_contradiction()` | `(content) → dict`                         | Detect conflicts    |
+| `apply_decay()`         | `(rate) → int`                             | Decay freshness     |
+| `consolidate()`         | `(entity_id, window_days) → int`           | Merge events        |
+| `prune()`               | `(threshold) → int`                        | Remove low-truth    |
+| `take_snapshot()`       | `(entity_id) → str`                        | Create checkpoint   |
+| `get_provenance()`      | `(entity_id) → List[str]`                  | Event history chain |
+| `ingest_fact()`         | `(content, source_uri) → fact_id`          | Galaxy L0           |
+| `derive_belief()`       | `(fact_id, belief, agent_id) → belief_id`  | Galaxy L1           |
+| `query_galaxy()`        | `(op, **kwargs) → QueryResult`             | OLAP query          |
 
 ### 6.2 REST Endpoints
 
-| Method | Path               | Description    |
-| ------ | ------------------ | -------------- |
-| POST   | `/memory/remember` | Store memory   |
-| POST   | `/memory/recall`   | Query memories |
-| POST   | `/galaxy/fact`     | Ingest fact    |
-| POST   | `/galaxy/belief`   | Derive belief  |
-| GET    | `/health`          | Health check   |
+| Method | Path               | Auth Required | Description    |
+| ------ | ------------------ | ------------- | -------------- |
+| POST   | `/memory/remember` | Yes           | Store memory   |
+| POST   | `/memory/recall`   | Yes           | Query memories |
+| POST   | `/memory/chat`     | Yes           | Chat with MT   |
+| POST   | `/galaxy/fact`     | Yes           | Ingest fact    |
+| POST   | `/galaxy/belief`   | Yes           | Derive belief  |
+| GET    | `/health`          | No            | Health check   |
+| GET    | `/version`         | No            | Version info   |
+
+### 6.3 CLI Commands
+
+See [COMMANDS.md](COMMANDS.md) for full CLI reference. Primary entry point:
+
+```bash
+# Install
+pip install memory-thread[full]
+
+# Chat (default)
+mt
+
+# One-shot
+mt ask "What do you know about me?"
+```
 
 ---
 
@@ -232,7 +293,21 @@ Where:
 
 ---
 
-## 8. References
+## 8. LLM Integration
+
+MT supports multiple LLM providers with automatic fallback:
+
+| Provider   | Model         | Usage                |
+| ---------- | ------------- | -------------------- |
+| Local      | SmolLM (135M) | Default, offline     |
+| Groq       | llama/mixtral | Fast cloud inference |
+| OpenRouter | Various       | Multi-model access   |
+
+Provider selection via CLI: `mt provider use groq`
+
+---
+
+## 9. References
 
 1. Doyle, J. (1979). A Truth Maintenance System. _Artificial Intelligence_, 12(3), 231-272.
 2. de Kleer, J. (1986). An Assumption-based TMS. _Artificial Intelligence_, 28(2), 127-162.
@@ -241,13 +316,13 @@ Where:
 
 ---
 
-## 9. Appendix: Installation
+## 10. Appendix: Installation
 
 ```bash
 # Standard installation
 pip install memory-thread
 
-# With all components
+# With all components (CLI + vector search + PostgreSQL)
 pip install memory-thread[full]
 
 # Development
@@ -257,4 +332,4 @@ pytest tests/
 
 ---
 
-_Document generated for Memory Thread v1.0.0_
+_Document generated for Memory Thread v2.0.0_

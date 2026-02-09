@@ -28,16 +28,21 @@ class Vault:
             try:
                 with open(VAULT_PATH, 'r', encoding='utf-8') as f:
                     return json.load(f)
-            except:
-                pass
+            except json.JSONDecodeError as e:
+                import logging
+                logging.getLogger(__name__).warning(f"Vault file corrupted, starting fresh: {e}")
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).error(f"Failed to load vault: {e}")
         return {}
 
     def _save(self):
         try:
             with open(VAULT_PATH, 'w', encoding='utf-8') as f:
                 json.dump(self._cache, f, indent=2)
-        except:
-            pass
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).error(f"Failed to save vault: {e}")
 
     def _hash(self, secret: str) -> str:
         return hashlib.sha256(secret.encode()).hexdigest()

@@ -54,6 +54,10 @@ streaming = [
 tui = [
     "textual>=0.40",
 ]
+cli = [
+    "typer>=0.9",
+    "rich>=13.0",
+]
 nlp = [
     "spacy>=3.5",
 ]
@@ -64,7 +68,7 @@ observability = [
     "opentelemetry-exporter-otlp>=1.20",
 ]
 full = [
-    "memory-thread[api,db,streaming,tui,nlp,observability]",
+    "memory-thread[api,db,streaming,cli,nlp,observability]",
 ]
 dev = [
     "pytest>=7.0",
@@ -82,7 +86,7 @@ Repository = "https://github.com/badalraj/MemoryThread"
 Issues = "https://github.com/badalraj/MemoryThread/issues"
 
 [project.scripts]
-mt = "memory_thread.cli:main"
+mt = "memory_thread.cli:run"
 mt-api = "memory_thread.api.server:main"
 
 [tool.setuptools.packages.find]

@@ -24,7 +24,11 @@ class QdrantClientWrapper:
         """Create a collection if it doesn't exist."""
         try:
             self.client.get_collection(collection_name)
-        except Exception:
+        except Exception as e:
+            # Collection doesn't exist, create it
+            from memory_thread.utils.logger import get_logger
+            log = get_logger(__name__)
+            log.debug(f"Creating collection {collection_name}: {e}")
             self.client.create_collection(
                 collection_name=collection_name,
                 vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
@@ -49,7 +53,10 @@ class QdrantClientWrapper:
                 query_vector=query_vector,
                 limit=limit
             )
-        except Exception:
+        except Exception as e:
+            from memory_thread.utils.logger import get_logger
+            log = get_logger(__name__)
+            log.warning(f"Qdrant search failed on {collection_name}: {e}")
             return []
 
 
