@@ -34,6 +34,16 @@ from rich.text import Text
 from rich import print as rprint
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# WINDOWS UTF-8 FIX — no more Wakandan runes
+# ═══════════════════════════════════════════════════════════════════════════════
+
+if sys.platform == "win32":
+    import subprocess
+    subprocess.run(["chcp", "65001"], capture_output=True, shell=True)
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # APP SETUP
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -716,7 +726,7 @@ def audit(
     _require(Grade.S_CLASS, "audit")
     try:
         from memory_thread.nervous.audit_ledger import ledger
-        entries = ledger.recent(limit)
+        entries = ledger.query(limit=limit)
         if as_json:
             print(json.dumps([e.to_dict() if hasattr(e, 'to_dict') else str(e) for e in entries]))
             return

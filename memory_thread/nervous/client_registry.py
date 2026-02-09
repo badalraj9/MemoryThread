@@ -52,8 +52,12 @@ class ClientRegistry:
     # Role hierarchy (higher = more access)
     ROLE_HIERARCHY = {
         "root": 5,
+        "godfather": 5,  # SSS-CLASS (same as root)
         "admin": 4,
+        "executive": 4,  # S-CLASS (same as admin)
+        "researcher": 3, # A-CLASS
         "engineer": 3,
+        "developer": 3,  # B-CLASS (same as engineer)
         "employee": 2,
         "guest": 1,
         "agent": 2,  # Same as employee
