@@ -271,6 +271,23 @@ class MemoryClient:
         if entity_id is None:
             entity_id = uuid.uuid4()
         
+        # ====== WAL: Pre-write for crash safety ======
+        wal_seq = None
+        try:
+            from memory_thread.services.wal import get_wal
+            wal = get_wal(self.namespace)
+            wal_seq = wal.append("remember", {
+                "entity_id": str(entity_id),
+                "content": content,
+                "source": source,
+                "confidence": confidence,
+                "authority": authority,
+                "memory_type": memory_type,
+            })
+        except Exception as e:
+            log.warning(f"WAL unavailable: {e}")
+        # =============================================
+        
         # Adjust authority based on source
         if source == "user":
             authority = max(authority, 0.9)  # User input is high authority
@@ -394,6 +411,16 @@ class MemoryClient:
                 self._index_in_qdrant(entity_id, content, memory_type, state)
             except Exception as e:
                 log.warning(f"Qdrant index failed: {e}")
+        
+        # ====== WAL: Commit after successful processing ======
+        if wal_seq is not None:
+            try:
+                from memory_thread.services.wal import get_wal
+                wal = get_wal(self.namespace)
+                wal.commit(wal_seq)
+            except Exception as e:
+                log.warning(f"WAL commit failed: {e}")
+        # =====================================================
         
         return entity_id
     
@@ -1206,6 +1233,159 @@ Assistant:"""
         except Exception as e:
             log.error(f"Cloud generation failed: {e}")
             return self._generate_local(prompt)
+
+    # ========== GALAXY SCHEMA METHODS (Layer 3) ==========
+    
+    def ingest_fact(
+        self,
+        content: str,
+        source_uri: str = None,
+        content_type: str = "text",
+        metadata: dict = None
+    ) -> str:
+        """
+        Ingest a fact into the Galaxy Schema.
+        
+        Facts are:
+        - Immutable (stored once)
+        - Content-addressed (deduped by hash)
+        - The foundation for all beliefs
+        
+        Args:
+            content: Raw content (code, text, log)
+            source_uri: Origin (file path, URL)
+            content_type: Type (text, code, log, document)
+            metadata: Additional metadata
+            
+        Returns:
+            fact_id (content hash)
+        """
+        try:
+            from memory_thread.services.fact_store import fact_store
+            return fact_store.store(
+                content=content,
+                source_uri=source_uri,
+                content_type=content_type,
+                metadata=metadata
+            )
+        except Exception as e:
+            log.error(f"Fact ingestion failed: {e}")
+            # Fallback: use regular remember
+            entity_id = self.remember(content, source="fact", memory_type="fact")
+            return str(entity_id)
+    
+    def derive_belief(
+        self,
+        fact_id: str,
+        belief: str,
+        agent_id: str = None,
+        confidence: float = 0.8,
+        authority: float = 0.5,
+        metadata: dict = None
+    ) -> str:
+        """
+        Derive a belief from a fact.
+        
+        Beliefs are:
+        - Agent-specific interpretations
+        - Linked to source facts
+        - Subject to decay and truth scoring
+        
+        Args:
+            fact_id: The source fact hash
+            belief: The interpretation/belief text
+            agent_id: Which agent holds this belief (default: namespace)
+            confidence: Confidence level (0-1)
+            authority: Agent authority in this domain (0-1)
+            metadata: Additional metadata
+            
+        Returns:
+            belief_id
+        """
+        try:
+            from memory_thread.services.belief_store import belief_store
+            return belief_store.derive(
+                fact_id=fact_id,
+                belief_content=belief,
+                agent_id=agent_id or self.namespace,
+                confidence=confidence,
+                authority=authority,
+                metadata=metadata
+            )
+        except Exception as e:
+            log.error(f"Belief derivation failed: {e}")
+            # Fallback: just remember the belief
+            entity_id = self.remember(belief, source="agent", memory_type="belief")
+            return str(entity_id)
+    
+    def query_galaxy(
+        self,
+        operation: str,
+        **kwargs
+    ):
+        """
+        Query the cognitive galaxy using OLAP-style operations.
+        
+        Operations:
+        - SLICE: Filter by source ("beliefs from auth.py")
+        - DICE: Multi-filter ("beliefs from SecurityBot with authority > 0.8")
+        - DRILL_DOWN: Get source fact for a belief
+        - ROLL_UP: Aggregate beliefs into summary
+        - SEARCH: Semantic search across beliefs
+        
+        Args:
+            operation: SLICE, DICE, DRILL_DOWN, ROLL_UP, SEARCH
+            **kwargs: Operation-specific filters
+            
+        Returns:
+            GalaxyQueryResult or dict
+        """
+        try:
+            from memory_thread.services.galaxy_query import galaxy_query
+            
+            if operation.upper() == "SEARCH":
+                return galaxy_query.semantic_search(
+                    query=kwargs.get("query", ""),
+                    agent_id=kwargs.get("agent_id"),
+                    top_k=kwargs.get("top_k", 10)
+                )
+            
+            return galaxy_query.query(operation, **kwargs)
+        except Exception as e:
+            log.error(f"Galaxy query failed: {e}")
+            # Fallback: use regular recall
+            return self.recall(kwargs.get("query", ""), top_k=kwargs.get("top_k", 10))
+    
+    def get_galaxy_conflicts(self) -> list:
+        """
+        Get conflicts across agent dimensions.
+        
+        Returns beliefs about the same fact with different interpretations.
+        """
+        try:
+            from memory_thread.services.galaxy_query import galaxy_query
+            return galaxy_query.get_conflicts()
+        except Exception as e:
+            log.error(f"Conflict detection failed: {e}")
+            return []
+    
+    def galaxy_stats(self) -> dict:
+        """Get statistics from the Galaxy Schema stores."""
+        stats = {"layer": "galaxy"}
+        
+        try:
+            from memory_thread.services.fact_store import fact_store
+            stats["facts"] = fact_store.get_stats()
+        except Exception:
+            stats["facts"] = {"error": "unavailable"}
+        
+        try:
+            from memory_thread.services.belief_store import belief_store
+            stats["beliefs"] = belief_store.get_stats()
+        except Exception:
+            stats["beliefs"] = {"error": "unavailable"}
+        
+        return stats
 
 
 # Convenience function

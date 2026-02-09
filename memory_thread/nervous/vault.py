@@ -75,5 +75,107 @@ class Vault:
             return pin_input == "0000"
         return self._hash(pin_input) == stored
 
+    # ========== PROVIDER CREDENTIALS (User-Scoped) ==========
+    
+    def set_provider(self, name: str, api_key: str, base_url: str = None, model: str = None, user_id: str = "default"):
+        """
+        Store provider credentials securely (per-user).
+        
+        Args:
+            name: Provider name (groq, openrouter, openai, etc.)
+            api_key: API key (stored encoded)
+            base_url: Optional base URL for custom endpoints
+            model: Default model for this provider
+            user_id: User who owns this key (for multi-user vaults)
+        """
+        import base64
+        encoded_key = base64.b64encode(api_key.encode()).decode()
+        
+        provider_data = {
+            "key_hash": self._hash(api_key),
+            "key_enc": encoded_key,
+            "base_url": base_url,
+            "model": model,
+            "owner": user_id,
+        }
+        
+        # Store under user namespace
+        key = f"providers_{user_id}"
+        if key not in self._cache:
+            self._cache[key] = {}
+        
+        self._cache[key][name.lower()] = provider_data
+        self._save()
+    
+    def get_provider(self, name: str, user_id: str = "default") -> dict:
+        """
+        Get provider credentials for a user.
+        
+        Falls back to 'default' user if user doesn't have the provider.
+        
+        Returns:
+            {api_key, base_url, model, owner} or None
+        """
+        # Try user-specific first
+        user_providers = self._cache.get(f"providers_{user_id}", {})
+        provider = user_providers.get(name.lower())
+        
+        # Fallback to default user
+        if not provider and user_id != "default":
+            default_providers = self._cache.get("providers_default", {})
+            provider = default_providers.get(name.lower())
+        
+        # Legacy fallback (global providers)
+        if not provider:
+            global_providers = self._cache.get("providers", {})
+            provider = global_providers.get(name.lower())
+        
+        if not provider:
+            return None
+        
+        import base64
+        try:
+            api_key = base64.b64decode(provider["key_enc"]).decode()
+        except:
+            api_key = None
+        
+        return {
+            "api_key": api_key,
+            "base_url": provider.get("base_url"),
+            "model": provider.get("model"),
+            "owner": provider.get("owner", "default"),
+        }
+    
+    def list_providers(self, user_id: str = "default") -> list:
+        """List configured providers for a user (includes inherited from default)."""
+        user_providers = set(self._cache.get(f"providers_{user_id}", {}).keys())
+        default_providers = set(self._cache.get("providers_default", {}).keys())
+        global_providers = set(self._cache.get("providers", {}).keys())
+        
+        return list(user_providers | default_providers | global_providers)
+    
+    def delete_provider(self, name: str, user_id: str = "default") -> bool:
+        """Remove a provider for a user."""
+        key = f"providers_{user_id}"
+        providers = self._cache.get(key, {})
+        if name.lower() in providers:
+            del providers[name.lower()]
+            self._save()
+            return True
+        return False
+    
+    def get_active_provider(self, user_id: str = "default") -> str:
+        """Get active provider for a user."""
+        user_active = self._cache.get(f"active_provider_{user_id}")
+        if user_active:
+            return user_active
+        return self._cache.get("active_provider", "local")
+    
+    def set_active_provider(self, name: str, user_id: str = "default"):
+        """Set active provider for a user."""
+        self._cache[f"active_provider_{user_id}"] = name.lower()
+        self._save()
+
+
 # Singleton
 vault = Vault()

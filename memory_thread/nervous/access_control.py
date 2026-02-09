@@ -279,3 +279,114 @@ class AccessControlService:
         if "research" in domain: return Grade.A_CLASS
         if "secret" in domain: return Grade.S_CLASS
         return Grade.C_CLASS
+
+    # --- SUDO COMMANDS (Top-Down RBAC) ---
+    
+    # Role alias mapping for CLI
+    ROLE_ALIASES = {
+        "root": "godfather",
+        "admin": "executive",
+        "engineer": "developer",
+        "employee": "employee",
+        "guest": "guest",
+    }
+    
+    @classmethod
+    def sudo_enable_role(
+        cls, 
+        granter: UserContext, 
+        target_role: str, 
+        target_user: str
+    ) -> Dict[str, Any]:
+        """
+        Enable a role for a user (top-down hierarchy).
+        
+        Granter must have higher grade than target role.
+        
+        Args:
+            granter: The user performing the grant
+            target_role: Role to grant (guest, employee, engineer, admin, root)
+            target_user: User receiving the role
+            
+        Returns:
+            {success, message, new_role}
+        """
+        # Normalize role
+        target_role = target_role.lower()
+        mapped_role = cls.ROLE_ALIASES.get(target_role, target_role)
+        
+        if mapped_role not in cls.ROLE_GRADES:
+            return {"success": False, "message": f"Unknown role: {target_role}"}
+        
+        target_grade = cls.ROLE_GRADES[mapped_role]
+        
+        # Hierarchy check: granter must be STRICTLY higher
+        if granter.grade <= target_grade:
+            ledger.log(AuditEvent(
+                action_type="SUDO_ENABLE_DENIED",
+                actor_id=granter.user_id,
+                role=granter.role,
+                target=f"{target_user}:{target_role}",
+                details={"reason": "hierarchy_violation", "granter_grade": str(granter.grade), "target_grade": str(target_grade)}
+            ))
+            return {
+                "success": False,
+                "message": f"Cannot grant {target_role} - requires higher rank than {target_role}"
+            }
+        
+        # Log the grant
+        ledger.log(AuditEvent(
+            action_type="SUDO_ENABLE",
+            actor_id=granter.user_id,
+            role=granter.role,
+            target=f"{target_user}:{target_role}",
+            details={"granted_role": mapped_role}
+        ))
+        
+        # In production, this would update a user-role mapping in the database
+        # For now, we just return success
+        return {
+            "success": True,
+            "message": f"Granted {target_role} to {target_user}",
+            "new_role": mapped_role,
+            "new_grade": str(target_grade)
+        }
+    
+    @classmethod
+    def sudo_disable_role(
+        cls,
+        revoker: UserContext,
+        target_role: str,
+        target_user: str
+    ) -> Dict[str, Any]:
+        """
+        Disable a role for a user.
+        
+        Revoker must have higher grade than target role.
+        """
+        target_role = target_role.lower()
+        mapped_role = cls.ROLE_ALIASES.get(target_role, target_role)
+        
+        if mapped_role not in cls.ROLE_GRADES:
+            return {"success": False, "message": f"Unknown role: {target_role}"}
+        
+        target_grade = cls.ROLE_GRADES[mapped_role]
+        
+        if revoker.grade <= target_grade:
+            return {
+                "success": False,
+                "message": f"Cannot revoke {target_role} - requires higher rank"
+            }
+        
+        ledger.log(AuditEvent(
+            action_type="SUDO_DISABLE",
+            actor_id=revoker.user_id,
+            role=revoker.role,
+            target=f"{target_user}:{target_role}"
+        ))
+        
+        return {
+            "success": True,
+            "message": f"Revoked {target_role} from {target_user}"
+        }
+

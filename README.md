@@ -1,205 +1,266 @@
-# Memory Thread 🧠
+# Memory Thread
 
-**The Truth-Aware Memory Engine for AI Agents**
+> **A Truth-Preserving Cognitive Memory System for AI**
 
-Memory Thread (MT) is an event-sourced memory system that gives AI agents the ability to remember facts, handle contradictions, and know when to say "I don't know."
-
-> _Not a vector database. Not a chatbot. A Truth Maintenance System._
-
----
-
-## 🎯 What Makes MT Different
-
-| Feature            | Typical AI Memory   | Memory Thread             |
-| ------------------ | ------------------- | ------------------------- |
-| **Data Model**     | Key-value / Vectors | Events → States           |
-| **Uncertainty**    | Hidden or none      | Explicit (Truth Vectors)  |
-| **Contradictions** | Last-write-wins     | Higher authority wins     |
-| **"I don't know"** | Empty response      | Formal `None` with reason |
-| **Audit Trail**    | Logs (maybe)        | Immutable event log       |
-
-### Core Capabilities
-
-- **🔄 Deterministic Replay** — Reconstruct any entity's state at any point in time
-- **📊 Truth Vectors** — 4D truth scoring: (Confidence, Authority, Freshness, Corroboration)
-- **⏱️ Memory Decay** — Facts fade naturally based on configurable decay curves
-- **🔀 Contradiction Resolution** — Mathematical resolution based on authority
-- **⚡ High Performance** — ~3,600 EPS full pipeline, ~40,000+ transport layer
+[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
+[![API Docs](https://img.shields.io/badge/docs-OpenAPI-orange.svg)](#api-documentation)
 
 ---
 
-## 🚀 Quick Start
+## Overview
 
-### Prerequisites
+Memory Thread (MT) is a **cognitive memory layer** for AI systems that solves the fundamental problem of **truth preservation** in multi-agent environments. Unlike traditional vector databases, MT tracks the _provenance_, _confidence_, and _decay_ of every piece of information.
 
-- Python 3.10+
-- PostgreSQL 14+ (event store)
-- Qdrant (optional, for vector search)
+### Key Features
+
+| Feature               | Description                                                  |
+| --------------------- | ------------------------------------------------------------ |
+| **Truth Vectors**     | Every memory has confidence, authority, and freshness scores |
+| **Galaxy Schema**     | OLAP-style queries across fact and belief dimensions         |
+| **Multi-Agent**       | Each agent has its own belief dimension                      |
+| **Graceful Fallback** | DB → File → Memory (never loses data)                        |
+| **RBAC**              | Role-based access control with audit logging                 |
+| **Time Travel**       | Event-sourced history reconstruction                         |
+
+---
+
+## Quick Start
 
 ### Installation
 
 ```bash
-git clone https://github.com/badalraj9/MemoryThread.git
+# Basic installation
+pip install memory-thread
+
+# With all extras
+pip install memory-thread[full]
+
+# Development
+pip install memory-thread[dev]
+```
+
+### From Source
+
+```bash
+git clone https://github.com/badalraj/MemoryThread.git
 cd MemoryThread
-pip install -r requirements.txt
+pip install -e .[dev]
 ```
 
-### Set Up Database
+### Basic Usage
 
-```bash
-# Create database
-psql -U postgres -c "CREATE DATABASE memory_thread_db;"
+```python
+from memory_thread.sdk import MemoryClient
 
-# Apply schema
-psql -U postgres -d memory_thread_db -f memory_thread/db/schema_phase_3_4.sql
-```
+# Create a client
+mt = MemoryClient(namespace="my_app")
 
-### Configure Environment
+# Store memories with truth metadata
+mt.remember("User prefers dark mode", confidence=0.9, source="observation")
+mt.remember("Project deadline is Friday", confidence=1.0, source="user")
 
-```bash
-export POSTGRES_USER=postgres
-export POSTGRES_PASSWORD=your_password
-export POSTGRES_DB=memory_thread_db
-export POSTGRES_HOST=localhost
-```
+# Recall with truth filtering
+results = mt.recall("user preferences", min_truth_score=0.5)
 
-### Run the API
-
-```bash
-uvicorn memory_thread.api.main:app --host 0.0.0.0 --port 8000
-```
-
-### Test It
-
-```bash
-# Health check
-curl http://localhost:8000/health
-
-# Ingest a memory
-curl -X POST http://localhost:8000/ingest \
-  -H "Content-Type: application/json" \
-  -d '{
-    "producer_id": "agent-001",
-    "events": [{
-      "content": "User prefers dark mode",
-      "timestamp": "2025-01-01T10:00:00Z"
-    }]
-  }'
+for memory in results.memories:
+    print(f"{memory.content} (truth: {memory.truth_score:.2f})")
 ```
 
 ---
 
-## 📡 API Reference
-
-### Health & Monitoring
-
-| Endpoint            | Method | Description                           |
-| ------------------- | ------ | ------------------------------------- |
-| `GET /`             | GET    | Quick health check                    |
-| `GET /health`       | GET    | Detailed health with service statuses |
-| `GET /health/ready` | GET    | Kubernetes readiness probe            |
-| `GET /health/live`  | GET    | Kubernetes liveness probe             |
-| `GET /metrics`      | GET    | Prometheus-compatible metrics         |
-| `GET /version`      | GET    | Version and build info                |
-
-### Event Ingestion
-
-| Endpoint                | Method | Description                 |
-| ----------------------- | ------ | --------------------------- |
-| `POST /register`        | POST   | Register a producer         |
-| `POST /ingest`          | POST   | Ingest a batch of events    |
-| `GET /control/throttle` | GET    | Get current system pressure |
-
-### Maintenance
-
-| Endpoint                          | Method | Description                   |
-| --------------------------------- | ------ | ----------------------------- |
-| `GET /maintenance/proposals`      | GET    | Get duplicate merge proposals |
-| `POST /maintenance/approve/merge` | POST   | Approve a merge proposal      |
-| `GET /maintenance/health/stats`   | GET    | Dashboard metrics             |
-
----
-
-## 🏗️ Architecture
+## Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                      MEMORY THREAD                          │
+│                    Memory Thread Architecture                │
 ├─────────────────────────────────────────────────────────────┤
-│                                                             │
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐        │
-│  │ FastAPI     │  │ ZMQ Fabric  │  │ Slab        │        │
-│  │ Gateway     │→ │ (Transport) │→ │ Allocator   │        │
-│  └─────────────┘  └─────────────┘  └─────────────┘        │
-│         │                                  │                │
-│         ▼                                  ▼                │
-│  ┌─────────────────────────────────────────────────┐      │
-│  │          TRUTH MANAGEMENT SYSTEM (TMS)          │      │
-│  │  • Truth Vector Scoring                         │      │
-│  │  • State Derivation                             │      │
-│  │  • Freshness Decay                              │      │
-│  └─────────────────────────────────────────────────┘      │
-│         │                                                   │
-│         ▼                                                   │
-│  ┌──────────────┐  ┌──────────────┐                       │
-│  │ PostgreSQL   │  │ Qdrant       │                       │
-│  │ (Events)     │  │ (Vectors)    │                       │
-│  └──────────────┘  └──────────────┘                       │
-│                                                             │
+│  SDK / API Layer                                             │
+│  ├── MemoryClient (Python SDK)                               │
+│  ├── REST API (FastAPI)                                      │
+│  └── TUI (Terminal Interface)                                │
+├─────────────────────────────────────────────────────────────┤
+│  Galaxy Schema (OLAP for Cognition)                          │
+│  ├── Fact Store (Layer 0) - Immutable, content-addressed     │
+│  ├── Belief Store (Layer 1) - Agent-specific interpretations │
+│  └── Query Engine (Layer 2) - SLICE/DICE/DRILL/ROLLUP        │
+├─────────────────────────────────────────────────────────────┤
+│  Core Services                                               │
+│  ├── TMS (Truth Maintenance System)                          │
+│  ├── Identity Service                                        │
+│  ├── Timewarp Engine (Event Sourcing)                        │
+│  └── Contemplator (Self-Observation)                         │
+├─────────────────────────────────────────────────────────────┤
+│  Storage                                                     │
+│  ├── PostgreSQL (Events/States)                              │
+│  ├── Qdrant (Vector Search)                                  │
+│  └── File Fallback (~/.mt/)                                  │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## 📚 Documentation
+## Galaxy Schema
 
-| Document                                                                               | Description                        |
-| -------------------------------------------------------------------------------------- | ---------------------------------- |
-| [Unified System Overview](docs/thesis_reference/00_Unified_System_Overview.md)         | Philosophy and high-level concepts |
-| [Architectural Layers](docs/thesis_reference/02_Architectural_Layers.md)               | Deep dive into system layers       |
-| [Mathematical Specifications](docs/thesis_reference/06_Mathematical_Specifications.md) | Truth Vector algebra               |
-| [End-to-End Workflow](docs/thesis_reference/07_End_to_End_Workflow.md)                 | Data flow from API to storage      |
+The Galaxy Schema applies **OLAP data warehouse principles to cognition**:
 
----
+```python
+# Store raw facts (immutable, deduplicated)
+fact_id = mt.ingest_fact(
+    content=code,
+    source_uri="file://auth.py",
+    content_type="code"
+)
 
-## 🧪 Running Tests
+# Multiple agents derive beliefs from the same fact
+mt.derive_belief(fact_id, "Handles JWT securely", agent_id="SecurityBot", confidence=0.95)
+mt.derive_belief(fact_id, "Needs refactoring", agent_id="CodeReviewer", authority=0.8)
 
-```bash
-# All tests
-pytest tests/ -v
-
-# Specific test suites
-pytest tests/test_tms_complete.py -v      # TMS logic
-pytest tests/test_realworld_scenarios.py -v  # AI agent simulation
-pytest tests/test_persistence_roundtrip.py -v  # Database persistence
+# OLAP-style queries
+mt.query_galaxy("SLICE", source_uri="file://auth.py")  # All beliefs about auth.py
+mt.query_galaxy("DICE", agent_id="SecurityBot", min_authority=0.8)
+mt.query_galaxy("ROLL_UP", entity_query="authentication")  # Summarize
 ```
 
 ---
 
-## 📊 Benchmarks
+## API Documentation
+
+### REST API
+
+Start the API server:
 
 ```bash
-# Full pipeline benchmark
-python benchmarks/benchmark_realworld.py
+uvicorn memory_thread.api.server:app --reload
+```
 
-# Expected results (i5-12450H):
-# • Event Creation: ~50,000 EPS
-# • State Derivation: ~30,000 EPS
-# • Full Pipeline: ~3,600 EPS
+Access documentation:
+
+- **Swagger UI**: http://localhost:8000/docs
+- **ReDoc**: http://localhost:8000/redoc
+
+### Endpoints
+
+| Method | Endpoint           | Description     |
+| ------ | ------------------ | --------------- |
+| POST   | `/memory/remember` | Store a memory  |
+| POST   | `/memory/recall`   | Recall memories |
+| POST   | `/galaxy/fact`     | Ingest a fact   |
+| POST   | `/galaxy/belief`   | Derive a belief |
+| POST   | `/galaxy/query`    | OLAP query      |
+| GET    | `/galaxy/stats`    | Get statistics  |
+| GET    | `/health`          | Health check    |
+
+---
+
+## TUI (Terminal Interface)
+
+```bash
+python -m memory_thread.utils.cli_bridge
+```
+
+### Commands
+
+| Command           | Description                   |
+| ----------------- | ----------------------------- |
+| `just type`       | Auto-remembered, LLM responds |
+| `/recall <query>` | Search memories               |
+| `/galaxy stats`   | Show fact/belief counts       |
+| `/provider list`  | List LLM providers            |
+| `/secure`         | Toggle secure mode            |
+| `/help`           | Show all commands             |
+
+---
+
+## Configuration
+
+### Environment Variables
+
+```bash
+# Database
+MT_POSTGRES_URL=postgresql://user:pass@localhost/mt
+MT_QDRANT_URL=http://localhost:6333
+
+# LLM Providers (or use /secure mode)
+GROQ_API_KEY=your_key
+OPENROUTER_API_KEY=your_key
+
+# Identity
+MT_USER=yourname
+MT_ROLE=admin
 ```
 
 ---
 
-## 🤝 Contributing
+## Testing
 
-We welcome contributions! Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting.
+```bash
+# Run all tests
+pytest
+
+# With coverage
+pytest --cov=memory_thread
+
+# Specific test file
+pytest tests/test_sdk.py -v
+```
 
 ---
 
-## 📜 License
+## Project Structure
 
-MIT License — see [LICENSE](LICENSE) for details.
+```
+MemoryThread/
+├── memory_thread/
+│   ├── api/              # REST API (FastAPI)
+│   ├── db/               # Database clients
+│   ├── nervous/          # Access control, vault, fabric
+│   ├── services/         # Core services (TMS, Galaxy, etc.)
+│   └── utils/            # CLI, logging, embeddings
+├── tests/                # Test suite
+├── docs/                 # Documentation
+├── pyproject.toml        # Modern packaging
+└── README.md
+```
 
 ---
 
-**Built for AI that needs to remember.** 🚀
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/amazing`
+3. Write tests for your changes
+4. Ensure tests pass: `pytest`
+5. Submit a pull request
+
+---
+
+## Citation
+
+If you use Memory Thread in research, please cite:
+
+```bibtex
+@software{memorythread2024,
+  title = {Memory Thread: A Truth-Preserving Cognitive Memory System},
+  author = {Raj, Badal},
+  year = {2024},
+  url = {https://github.com/badalraj/MemoryThread}
+}
+```
+
+---
+
+## License
+
+MIT License - see [LICENSE](LICENSE) for details.
+
+---
+
+## Acknowledgments
+
+- Truth Maintenance Systems (TMS) research
+- OLAP/Galaxy Schema concepts from data warehousing
+- The open-source AI community

@@ -110,3 +110,8 @@ def get_embedding_dimension() -> int:
 def embed_text(text: str) -> List[float]:
     """Embed a single text string."""
     return generate_embeddings((text,))[0]
+
+
+# Canonical API alias (single-text embedding)
+def get_embedding(text: str) -> List[float]:
+    return embed_text(text)

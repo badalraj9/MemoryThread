@@ -1,78 +1,129 @@
-# Contributing to Memory Thread 🧠
+# Contributing to Memory Thread
 
-Hey! Thanks for checking out Memory Thread. Whether you're fixing a typo or adding a major feature, every contribution matters.
+Thank you for your interest in contributing to Memory Thread! This document provides guidelines and best practices for contributing.
 
-## What is MT?
+## Getting Started
 
-Memory Thread is an AI memory system — think of it as the "hippocampus" for intelligent agents. It helps AI remember facts, handle contradictions, and know when to say "I don't know."
-
-## The Vibe
-
-We're building something cool here. The core principles:
-
-- **Truth over hacks** — If a shortcut breaks correctness, we don't take it
-- **"I don't know" is valid** — Uncertainty is explicit, not hidden
-- **Events are immutable** — The past doesn't change
-
-## Quick Start
+### 1. Fork and Clone
 
 ```bash
-# Clone it
-git clone https://github.com/your-org/memory-thread.git
-cd memory-thread
-
-# Install deps
-pip install -r requirements.txt
-
-# Set up your env
-cp .env.example .env
-# Edit .env with your Postgres credentials
+git clone https://github.com/YOUR_USERNAME/MemoryThread.git
+cd MemoryThread
 ```
 
-**You'll need:**
-
-- Python 3.10+
-- PostgreSQL (we use 14+, but 18 works great too)
-- Qdrant (vector DB) — optional for basic testing
-
-## Want to Contribute?
-
-### 1. Start with an Issue ✋
-
-Before diving into code, open an issue to discuss what you want to do. Saves everyone time and we can point you in the right direction.
-
-### 2. Fork & Branch
+### 2. Set Up Development Environment
 
 ```bash
-git checkout -b feature/your-cool-thing
+# Create virtual environment
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Install with dev dependencies
+pip install -e .[dev]
 ```
 
-### 3. Write Tests
-
-We love tests. If you're adding logic, add a test for it:
+### 3. Verify Setup
 
 ```bash
-pytest tests/ -v
+pytest tests/test_sdk.py -v
 ```
 
-### 4. Submit a PR
+---
 
-Open a PR against `main`. We'll review it, maybe suggest tweaks, and merge it once it's ready.
+## Development Workflow
 
-## Code Style
+### Branch Naming
 
-- **PEP 8** — Standard Python style
-- **Type hints** — We use Pydantic, so types matter
-- **Comments explain _why_**, not _what_ — The code shows what it does
+- `feature/description` - New features
+- `fix/description` - Bug fixes
+- `docs/description` - Documentation
+- `refactor/description` - Code refactoring
 
-## Need Help?
+### Code Style
 
-- Check the `docs/` folder for architecture details
-- Open an issue with questions
-- We don't bite! 🙂
+We use:
 
-## The Bottom Line
+- **Black** for formatting
+- **Ruff** for linting
+- **MyPy** for type checking
 
-This isn't just another CRUD app — it's infrastructure for AI that needs to _remember_. If that excites you, we'd love to have you contribute.
+```bash
+# Format code
+black memory_thread/
 
-Welcome aboard! 🚀
+# Lint
+ruff check memory_thread/
+
+# Type check
+mypy memory_thread/
+```
+
+### Testing
+
+All changes must have tests:
+
+```bash
+# Run all tests
+pytest
+
+# With coverage
+pytest --cov=memory_thread --cov-report=html
+
+# Specific test
+pytest tests/test_sdk.py::TestRemember -v
+```
+
+---
+
+## Pull Request Process
+
+1. **Create a branch** from `main`
+2. **Write tests** for your changes
+3. **Ensure all tests pass**
+4. **Update documentation** if needed
+5. **Submit PR** with clear description
+
+### PR Checklist
+
+- [ ] Tests pass locally (`pytest`)
+- [ ] Code is formatted (`black .`)
+- [ ] No lint errors (`ruff check .`)
+- [ ] Documentation updated (if applicable)
+- [ ] Commit messages are clear
+
+---
+
+## Code Architecture
+
+### Key Directories
+
+| Directory                 | Purpose               |
+| ------------------------- | --------------------- |
+| `memory_thread/sdk.py`    | Main SDK entry point  |
+| `memory_thread/services/` | Core business logic   |
+| `memory_thread/nervous/`  | Security, RBAC, vault |
+| `memory_thread/api/`      | REST API              |
+| `tests/`                  | Test suite            |
+
+### Adding New Features
+
+1. **Services**: Add to `memory_thread/services/`
+2. **API Endpoints**: Add to `memory_thread/api/server.py`
+3. **TUI Commands**: Add to `memory_thread/utils/cli_bridge.py`
+4. **Tests**: Add to `tests/test_*.py`
+
+---
+
+## Documentation
+
+- **Code**: Use docstrings (Google style)
+- **README**: Update for user-facing changes
+- **API**: Pydantic models auto-generate OpenAPI docs
+
+---
+
+## Questions?
+
+Open an issue or reach out to the maintainers.
+
+Thank you for contributing! 🚀
