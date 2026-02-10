@@ -25,6 +25,7 @@ import os
 import sys
 import json
 import typer
+import requests
 from typing import Optional, List
 from enum import IntEnum
 from rich.console import Console
@@ -62,11 +63,13 @@ agent_app = typer.Typer(help="Manage multi-agent memory spaces. [dim]B-CLASS[/di
 provider_app = typer.Typer(help="Manage LLM providers. [dim]B-CLASS[/dim]")
 galaxy_app = typer.Typer(help="Galaxy Schema inspection. [dim]B-CLASS[/dim]")
 clients_app = typer.Typer(help="API client management. [dim]S-CLASS[/dim]")
+ollama_app = typer.Typer(help="Manage local Ollama models. [dim]E-CLASS[/dim]")
 
 app.add_typer(agent_app, name="agent")
 app.add_typer(provider_app, name="provider")
 app.add_typer(galaxy_app, name="galaxy")
 app.add_typer(clients_app, name="clients")
+app.add_typer(ollama_app, name="ollama")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -622,6 +625,64 @@ def provider_remove(name: str = typer.Argument(..., help="Provider to remove")):
             console.print(f"[green]✔ Removed: {name}[/green]")
         else:
             console.print(f"[yellow]Provider '{name}' not found[/yellow]")
+    except Exception as e:
+        console.print(f"[red]✘ {e}[/red]")
+
+
+# --- Ollama sub-commands ---
+
+@ollama_app.command("scan")
+def ollama_scan():
+    """Scan for local Ollama models."""
+    _require(Grade.E_CLASS, "ollama scan")
+    try:
+        url = "http://localhost:11434/api/tags"
+        resp = requests.get(url, timeout=5)
+        if resp.status_code == 200:
+            models = resp.json().get("models", [])
+            if not models:
+                console.print("[yellow]No models found in Ollama.[/yellow]")
+                return
+
+            table = Table(title="Local Ollama Models", show_lines=False)
+            table.add_column("Name", style="cyan")
+            table.add_column("Size", style="dim")
+            table.add_column("Modified")
+
+            for m in models:
+                size_gb = m.get("size", 0) / (1024**3)
+                table.add_row(m["name"], f"{size_gb:.1f} GB", m.get("modified_at", "")[:10])
+
+            console.print(table)
+            console.print("[dim]Use 'mt ollama use <name>' to select one.[/dim]")
+        else:
+            console.print(f"[red]Ollama API error: {resp.status_code}[/red]")
+    except requests.exceptions.ConnectionError:
+        console.print("[red]✘ Could not connect to Ollama (localhost:11434)[/red]")
+        console.print("[dim]Is 'ollama serve' running?[/dim]")
+    except Exception as e:
+        console.print(f"[red]✘ {e}[/red]")
+
+
+@ollama_app.command("list")
+def ollama_list():
+    """Alias for scan."""
+    ollama_scan()
+
+
+@ollama_app.command("use")
+def ollama_use(
+    model: str = typer.Argument(..., help="Model name (e.g., llama3)"),
+):
+    """Set Ollama as the active provider with this model."""
+    _require(Grade.E_CLASS, "ollama use")
+    try:
+        from memory_thread.nervous.vault import vault
+        # Store config for ollama
+        # API key is dummy for ollama
+        vault.set_provider("ollama", "local", "http://localhost:11434", model, _user())
+        vault.set_active_provider("ollama", _user())
+        console.print(f"[green]✔ Switched to Ollama (model: {model})[/green]")
     except Exception as e:
         console.print(f"[red]✘ {e}[/red]")
 

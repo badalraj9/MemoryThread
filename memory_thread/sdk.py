@@ -14,6 +14,8 @@ Usage:
 """
 import uuid
 import json
+import os
+import requests
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
@@ -22,6 +24,7 @@ from memory_thread.models.events import Event, EntityState, TruthVector, ActorEn
 from memory_thread.services.tms_service import TMSService, TruthVectorService, StateDerivationService
 from memory_thread.config.settings import settings
 from memory_thread.utils.logger import get_logger
+from memory_thread.nervous.vault import vault
 
 log = get_logger(__name__)
 
@@ -120,6 +123,7 @@ class MemoryClient:
             self._db_type = "postgres"
             log.info("PostgreSQL connected")
         except Exception as e:
+            # Clean logging: only warn in file, not console (unless debug)
             log.warning(f"PostgreSQL unavailable: {e}. Trying SQLite...")
             self._pg = None
             
@@ -141,6 +145,7 @@ class MemoryClient:
             self._ensure_collection()
             log.info("Qdrant connected")
         except Exception as e:
+            # Clean logging
             log.warning(f"Qdrant unavailable: {e}. Using keyword search.")
             self._qdrant = None
     
@@ -1075,7 +1080,7 @@ class MemoryClient:
         Args:
             user_message: User's input
             system_prompt: Optional system prompt
-            use_local: If True, use local SmolLM. If False, use cloud API.
+            use_local: If True, prefer local models (Ollama/SmolLM).
         
         Returns:
             LLM response with memory context
@@ -1110,19 +1115,58 @@ RECALLED MEMORY CONTEXT:
 User: {user_message}
 Assistant:"""
         
-        # 5. Generate response
-        if use_local:
-            response = self._generate_local(full_prompt)
+        # 5. Determine Provider via Vault
+        # Priority:
+        # 1. Env vars (legacy overrides)
+        # 2. Vault active provider
+        # 3. Default fallback (SmolLM)
+
+        user_id = os.environ.get("MT_USER", "default")
+        active_provider = vault.get_active_provider(user_id)
+
+        log.info(f"Generating response using provider: {active_provider}")
+
+        if active_provider == "ollama":
+            # Get configured model for ollama, or default
+            creds = vault.get_provider("ollama", user_id)
+            model = creds.get("model") if creds else "llama3"
+            response = self._generate_ollama(full_prompt, model=model)
+
+        elif active_provider in ["groq", "openrouter", "openai"]:
+            response = self._generate_cloud(full_prompt, provider=active_provider)
+
         else:
-            response = self._generate_cloud(full_prompt)
+            # Fallback to SmolLM (local transformers)
+            response = self._generate_smollm(full_prompt)
         
         # 6. Remember agent response (lower authority)
         self.remember(response, source="agent", confidence=0.7, authority=0.5)
         
         return response
     
-    def _generate_local(self, prompt: str) -> str:
-        """Generate response using local SmolLM."""
+    def _generate_ollama(self, prompt: str, model: str = "llama3") -> str:
+        """Generate response using local Ollama instance."""
+        try:
+            url = "http://localhost:11434/api/generate"
+            payload = {
+                "model": model,
+                "prompt": prompt,
+                "stream": False
+            }
+
+            resp = requests.post(url, json=payload, timeout=60)
+            if resp.status_code == 200:
+                return resp.json().get("response", "")
+            else:
+                log.warning(f"Ollama error {resp.status_code}: {resp.text}")
+                return f"[Ollama failed ({resp.status_code}). Falling back...]"
+
+        except Exception as e:
+            log.warning(f"Ollama connection failed: {e}")
+            return f"[Ollama unavailable. ensure 'ollama serve' is running.]"
+
+    def _generate_smollm(self, prompt: str) -> str:
+        """Generate response using local SmolLM (Transformers)."""
         try:
             from transformers import AutoTokenizer, AutoModelForCausalLM
             import torch
@@ -1162,34 +1206,26 @@ Assistant:"""
     def _generate_cloud(self, prompt: str, provider: str = "auto") -> str:
         """
         Generate response using cloud API.
-        
-        Providers:
-            - "groq": Uses GROQ_MODEL (default: llama-3.1-70b-versatile)
-            - "openrouter": Uses OPENROUTER_MODEL (default: meta-llama/llama-3.1-405b-instruct)
-            - "auto": Try Groq first, then OpenRouter, then local
-        
-        Set via environment variables:
-            - GROQ_API_KEY, GROQ_MODEL
-            - OPENROUTER_API_KEY, OPENROUTER_MODEL
+        Checks Vault for credentials first, then Env Vars.
         """
         try:
-            import os
             import requests
             
-            groq_key = os.environ.get("GROQ_API_KEY")
-            groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-            openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-            openrouter_model = os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-405b-instruct")
+            user_id = os.environ.get("MT_USER", "default")
             
-            # Provider selection
-            if provider == "groq" or (provider == "auto" and groq_key):
-                if groq_key:
-                    log.info(f"Using Groq ({groq_model})")
+            # Groq
+            if provider == "groq" or provider == "auto":
+                creds = vault.get_provider("groq", user_id)
+                key = creds.get("api_key") if creds else os.environ.get("GROQ_API_KEY")
+                model = creds.get("model") if creds else os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+                if key:
+                    log.info(f"Using Groq ({model})")
                     response = requests.post(
                         "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {groq_key}"},
+                        headers={"Authorization": f"Bearer {key}"},
                         json={
-                            "model": groq_model,
+                            "model": model,
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": 500,
                             "temperature": 0.7
@@ -1199,21 +1235,25 @@ Assistant:"""
                     if response.ok:
                         return response.json()["choices"][0]["message"]["content"]
                     else:
-                        log.warning(f"Groq error: {response.status_code} - {response.text[:100]}")
-            
-            # Try OpenRouter
-            if provider == "openrouter" or (provider == "auto" and openrouter_key):
-                if openrouter_key:
-                    log.info(f"Using OpenRouter ({openrouter_model})")
+                        log.warning(f"Groq error: {response.status_code}")
+
+            # OpenRouter
+            if provider == "openrouter" or provider == "auto":
+                creds = vault.get_provider("openrouter", user_id)
+                key = creds.get("api_key") if creds else os.environ.get("OPENROUTER_API_KEY")
+                model = creds.get("model") if creds else os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-405b-instruct")
+
+                if key:
+                    log.info(f"Using OpenRouter ({model})")
                     response = requests.post(
                         "https://openrouter.ai/api/v1/chat/completions",
                         headers={
-                            "Authorization": f"Bearer {openrouter_key}",
+                            "Authorization": f"Bearer {key}",
                             "HTTP-Referer": "https://github.com/badalraj9/MemoryThread",
                             "X-Title": "MemoryThread"
                         },
                         json={
-                            "model": openrouter_model,
+                            "model": model,
                             "messages": [{"role": "user", "content": prompt}],
                             "max_tokens": 500,
                             "temperature": 0.7
@@ -1223,17 +1263,15 @@ Assistant:"""
                     if response.ok:
                         return response.json()["choices"][0]["message"]["content"]
                     else:
-                        log.warning(f"OpenRouter error: {response.status_code} - {response.text[:100]}")
-            
+                        log.warning(f"OpenRouter error: {response.status_code}")
+
             # Fallback to local
-            log.warning("No cloud API available, falling back to local model")
-            return self._generate_local(prompt)
+            log.warning("No cloud API available/configured, falling back to local model")
+            return self._generate_smollm(prompt)
             
         except Exception as e:
             log.error(f"Cloud generation failed: {e}")
-            return self._generate_local(prompt)
-
-    # ========== GALAXY SCHEMA METHODS (Layer 3) ==========
+            return self._generate_smollm(prompt)
     
     def ingest_fact(
         self,
@@ -1391,4 +1429,3 @@ Assistant:"""
 def create_memory_client(namespace: str = "default", use_db: bool = True) -> MemoryClient:
     """Create a new MemoryClient instance."""
     return MemoryClient(namespace=namespace, use_db=use_db)
-
