@@ -46,7 +46,8 @@ class FileIngestService:
     def _get_client(self):
         if not self._client:
             from memory_thread.sdk import MemoryClient
-            self._client = MemoryClient(namespace="files", use_db=False)
+            ns = os.environ.get("MT_NAMESPACE", "default")
+            self._client = MemoryClient(namespace=ns, use_db=True)
         return self._client
     
     def ingest_file(self, path: str) -> Dict[str, Any]:
@@ -65,7 +66,7 @@ class FileIngestService:
         if ext not in SUPPORTED_EXTENSIONS:
             log.warning(f"Unsupported file type: {ext}")
         
-        # 1. Store original in vault
+        # 1. Store original in vault (read-only — never modifies user files)
         vault_result = self.vault.store(path)
         vault_id = vault_result["vault_id"]
         
@@ -75,15 +76,51 @@ class FileIngestService:
         # 3. Chunk content
         chunks = self._chunk_content(content, ext)
         
-        # 4. Store chunks in memory
+        # 4. Store file-level metadata as a Galaxy fact
         client = self._get_client()
+        abs_path = str(file_path.resolve())
+        file_meta = (
+            f"[FILE] {file_path.name}\n"
+            f"  Path: {abs_path}\n"
+            f"  Type: {ext}\n"
+            f"  Size: {file_path.stat().st_size} bytes\n"
+            f"  Chunks: {len(chunks)}"
+        )
+        try:
+            client.ingest_fact(file_meta, source_uri=abs_path)
+        except Exception:
+            # Fallback: store as regular memory if Galaxy not available
+            client.remember(content=file_meta, source="file", confidence=1.0, memory_type="document")
+        
+        # 5. Store chunks in memory — prepend source path so agents know origin
         for i, chunk in enumerate(chunks):
+            tagged_chunk = f"[{file_path.name}:{i+1}/{len(chunks)}]\n{chunk}"
             client.remember(
-                content=chunk,
+                content=tagged_chunk,
                 source="file",
                 confidence=1.0,
-                memory_type="document"
+                memory_type="code" if ext in {".py", ".js", ".ts", ".go", ".rs", ".java", ".c", ".cpp"} else "document"
             )
+        
+        # 6. Run document intelligence for PDFs and text docs
+        doc_facts = 0
+        if ext in {".pdf", ".md", ".txt", ".rst"}:
+            try:
+                from memory_thread.services.document_intelligence import doc_intelligence
+                doc_analysis = doc_intelligence.analyze_document(str(file_path))
+                if doc_analysis:
+                    facts = doc_intelligence.to_galaxy_facts(doc_analysis)
+                    for fact in facts:
+                        client.remember(
+                            content=fact["content"],
+                            source="system",
+                            confidence=1.0,
+                            memory_type="fact"
+                        )
+                        doc_facts += 1
+                    log.info(f"Document intelligence: {doc_facts} facts from {file_path.name}")
+            except Exception as e:
+                log.warning(f"Document intelligence failed (non-critical): {e}")
         
         log.info(f"Ingested {file_path.name}: {len(chunks)} chunks")
         
@@ -93,12 +130,16 @@ class FileIngestService:
             "original_name": file_path.name,
             "file_type": ext,
             "chunks_created": len(chunks),
+            "doc_facts": doc_facts,
             "content_length": len(content),
         }
     
     def ingest_folder(self, path: str) -> Dict[str, Any]:
         """
         Ingest all supported files in a folder.
+        
+        For code projects, also runs AST analysis to extract
+        classes, functions, call graphs, and import relationships.
         """
         folder = Path(path)
         if not folder.is_dir():
@@ -108,20 +149,74 @@ class FileIngestService:
         total_chunks = 0
         errors = []
         
-        for file_path in folder.rglob("*"):
-            if file_path.is_file() and file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
-                try:
-                    result = self.ingest_file(str(file_path))
-                    results.append(result)
-                    total_chunks += result["chunks_created"]
-                except Exception as e:
-                    errors.append({"file": str(file_path), "error": str(e)})
-                    log.error(f"Failed to ingest {file_path}: {e}")
+        # Skip common non-code directories
+        skip_dirs = {
+            "__pycache__", ".git", ".venv", "venv", "node_modules",
+            ".egg-info", "dist", "build", ".tox", ".mypy_cache",
+            ".pytest_cache", "memory_thread.egg-info",
+        }
+        
+        for dirpath, dirnames, filenames in os.walk(folder):
+            dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+            
+            for filename in filenames:
+                file_path = Path(dirpath) / filename
+                if file_path.suffix.lower() in SUPPORTED_EXTENSIONS:
+                    try:
+                        result = self.ingest_file(str(file_path))
+                        results.append(result)
+                        total_chunks += result["chunks_created"]
+                    except Exception as e:
+                        errors.append({"file": str(file_path), "error": str(e)})
+                        log.error(f"Failed to ingest {file_path}: {e}")
+        
+        # Run code intelligence analysis on the entire project
+        code_facts = 0
+        try:
+            from memory_thread.services.code_intelligence import code_intelligence
+            project = code_intelligence.analyze_project(str(folder))
+            
+            if project.total_files > 0:
+                client = self._get_client()
+                
+                # Store project summary
+                summary = code_intelligence.project_summary_fact(project)
+                client.remember(content=summary, source="system", confidence=1.0, memory_type="fact")
+                code_facts += 1
+                
+                # Store dependency graph
+                dep_graph = code_intelligence.dependency_graph_fact(project)
+                if dep_graph and len(dep_graph.splitlines()) > 1:
+                    client.remember(content=dep_graph, source="system", confidence=1.0, memory_type="fact")
+                    code_facts += 1
+                
+                # Store call graph
+                call_graph = code_intelligence.call_graph_fact(project)
+                if call_graph:
+                    client.remember(content=call_graph, source="system", confidence=1.0, memory_type="fact")
+                    code_facts += 1
+                
+                # Store per-file structured facts
+                for file_analysis in project.files:
+                    facts = code_intelligence.to_galaxy_facts(file_analysis)
+                    for fact in facts:
+                        client.remember(
+                            content=fact["content"],
+                            source="system",
+                            confidence=1.0,
+                            memory_type="fact"
+                        )
+                        code_facts += 1
+                
+                log.info(f"Code intelligence: {code_facts} structured facts from {project.total_files} files")
+        except Exception as e:
+            log.warning(f"Code intelligence analysis failed (non-critical): {e}")
         
         return {
             "folder_path": str(folder),
             "files_processed": len(results),
             "chunks_created": total_chunks,
+            "code_facts": code_facts,
             "errors": errors,
             "vault_path": str(self.vault.root),
         }

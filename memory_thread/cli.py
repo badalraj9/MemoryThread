@@ -396,8 +396,11 @@ def load(
         from memory_thread.services.file_ingest_service import ingest_path
         result = ingest_path(path)
         console.print(f"[green]✔ Ingested[/green]")
-        console.print(f"  Files: {result['files_processed']}")
+        console.print(f"  Files: {result.get('files_processed', 1)}")
         console.print(f"  Chunks: {result['chunks_created']}")
+        code_facts = result.get('code_facts', 0)
+        if code_facts:
+            console.print(f"  Code Intel: [cyan]{code_facts} structured facts[/cyan] (classes, functions, imports, call graph)")
         console.print(f"  Vault: [dim]{result['vault_path']}[/dim]")
     except ImportError:
         # Fallback: read file and remember contents
@@ -869,6 +872,246 @@ def sudo(
         console.print(f"[red]✘ Cannot grant {role} — requires higher rank[/red]")
         raise typer.Exit(1)
     console.print(f"[green]✔ Granted {role} to {username}[/green]")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# WORKSPACE & CODE INTELLIGENCE
+# ═══════════════════════════════════════════════════════════════════════════════
+
+@app.command()
+def init(
+    path: str = typer.Argument(".", help="Project root (default: current dir)"),
+    namespace: str = typer.Option(None, help="Namespace for this project"),
+):
+    """Initialize MT workspace in a project. [dim]E-CLASS[/dim]"""
+    _require(Grade.E_CLASS, "init")
+    project_root = os.path.abspath(path)
+    mt_dir = os.path.join(project_root, ".mt")
+    
+    if os.path.exists(mt_dir):
+        console.print(f"[yellow]⚠ Already initialized:[/yellow] {mt_dir}")
+        return
+    
+    os.makedirs(mt_dir, exist_ok=True)
+    
+    # Create config
+    ns = namespace or os.path.basename(project_root).lower().replace(" ", "_")
+    config = {
+        "namespace": ns,
+        "created_at": __import__("datetime").datetime.utcnow().isoformat(),
+        "version": "1.0.0",
+        "user": _user(),
+        "role": os.environ.get("MT_ROLE", "guest"),
+    }
+    
+    import json as _json
+    config_path = os.path.join(mt_dir, "config.json")
+    with open(config_path, "w", encoding="utf-8") as f:
+        _json.dump(config, f, indent=2)
+    
+    # Create .gitignore for MT workspace
+    gitignore_path = os.path.join(mt_dir, ".gitignore")
+    with open(gitignore_path, "w", encoding="utf-8") as f:
+        f.write("# MT workspace files\n*.jsonl\nwal/\nvault/\n")
+    
+    console.print(Panel(
+        f"[green]✔ Initialized Memory Thread workspace[/green]\n\n"
+        f"  Project:   [cyan]{os.path.basename(project_root)}[/cyan]\n"
+        f"  Namespace: [cyan]{ns}[/cyan]\n"
+        f"  Config:    [dim]{config_path}[/dim]\n\n"
+        f"  Next steps:\n"
+        f"    [dim]mt load . [/dim]        Ingest this project\n"
+        f"    [dim]mt codebase . [/dim]    Analyze code structure\n"
+        f"    [dim]mt search \"query\" [/dim] Search memories",
+        title="MT Init",
+        border_style="green",
+    ))
+
+
+@app.command()
+def codebase(
+    path: str = typer.Argument(".", help="Project root to analyze"),
+    store: bool = typer.Option(False, "--store", "-s", help="Store analysis as memories"),
+):
+    """Analyze a codebase — classes, functions, imports, call graph. [dim]B-CLASS[/dim]"""
+    _require(Grade.B_CLASS, "codebase")
+    
+    if not os.path.isdir(path):
+        console.print(f"[red]✘ Not a directory: {path}[/red]")
+        raise typer.Exit(1)
+    
+    try:
+        from memory_thread.services.code_intelligence import code_intelligence
+        
+        with console.status("[cyan]Analyzing codebase..."):
+            project = code_intelligence.analyze_project(path)
+        
+        if project.total_files == 0:
+            console.print("[yellow]No supported source files found.[/yellow]")
+            return
+        
+        # Project summary
+        lang_str = ", ".join(f"{lang}: {count}" for lang, count in sorted(project.languages.items(), key=lambda x: -x[1]))
+        console.print(Panel(
+            f"[bold cyan]{os.path.basename(os.path.abspath(path))}[/bold cyan]\n\n"
+            f"  Files:     [green]{project.total_files}[/green]\n"
+            f"  Classes:   [green]{project.total_classes}[/green]\n"
+            f"  Functions: [green]{project.total_functions}[/green]\n"
+            f"  Lines:     [green]{project.total_lines:,}[/green]\n"
+            f"  Languages: [dim]{lang_str}[/dim]",
+            title="Codebase Analysis",
+            border_style="cyan",
+        ))
+        
+        # Classes table
+        if project.total_classes > 0:
+            cls_table = Table(title="Classes", show_lines=False)
+            cls_table.add_column("Class", style="cyan")
+            cls_table.add_column("File", style="dim")
+            cls_table.add_column("Methods", style="green")
+            cls_table.add_column("Bases", style="yellow")
+            
+            for fa in project.files:
+                for cls in fa.classes:
+                    cls_table.add_row(
+                        cls.name,
+                        fa.file_name,
+                        str(len(cls.methods)),
+                        ", ".join(cls.bases) or "-",
+                    )
+            console.print(cls_table)
+        
+        # Dependency graph
+        dep_graph = code_intelligence.dependency_graph_fact(project)
+        if dep_graph and len(dep_graph.splitlines()) > 1:
+            console.print(Panel(
+                dep_graph,
+                title="Dependency Graph",
+                border_style="yellow",
+            ))
+        
+        # Directory tree
+        if project.tree:
+            console.print(Panel(
+                project.tree[:2000],  # Cap output
+                title="Project Structure",
+                border_style="dim",
+            ))
+        
+        # Store to memory if requested
+        if store:
+            client = _client()
+            summary = code_intelligence.project_summary_fact(project)
+            client.remember(content=summary, source="system", confidence=1.0, memory_type="fact")
+            
+            dep = code_intelligence.dependency_graph_fact(project)
+            if dep:
+                client.remember(content=dep, source="system", confidence=1.0, memory_type="fact")
+            
+            cg = code_intelligence.call_graph_fact(project)
+            if cg:
+                client.remember(content=cg, source="system", confidence=1.0, memory_type="fact")
+            
+            total_facts = 0
+            for fa in project.files:
+                facts = code_intelligence.to_galaxy_facts(fa)
+                for fact in facts:
+                    client.remember(content=fact["content"], source="system", confidence=1.0, memory_type="fact")
+                    total_facts += 1
+            
+            console.print(f"\n[green]✔ Stored {total_facts + 3} structured facts to memory[/green]")
+    
+    except Exception as e:
+        console.print(f"[red]✘ {e}[/red]")
+
+
+@app.command()
+def document(
+    path: str = typer.Argument(..., help="PDF, markdown, or text file to analyze"),
+    store: bool = typer.Option(False, "--store", "-s", help="Store analysis as memories"),
+):
+    """Analyze a document — sections, citations, key terms. [dim]C-CLASS[/dim]"""
+    _require(Grade.C_CLASS, "document")
+    
+    if not os.path.isfile(path):
+        console.print(f"[red]✘ Not a file: {path}[/red]")
+        raise typer.Exit(1)
+    
+    try:
+        from memory_thread.services.document_intelligence import doc_intelligence
+        
+        with console.status("[cyan]Analyzing document..."):
+            analysis = doc_intelligence.analyze_document(path)
+        
+        if not analysis:
+            console.print("[yellow]Unsupported document type.[/yellow]")
+            return
+        
+        # Document summary
+        console.print(Panel(
+            f"[bold cyan]{analysis.title}[/bold cyan]\n\n"
+            f"  File:       [dim]{analysis.file_name}[/dim]\n"
+            f"  Type:       {analysis.doc_type}\n"
+            f"  Pages:      [green]{analysis.total_pages or 'N/A'}[/green]\n"
+            f"  Words:      [green]{analysis.total_words:,}[/green]\n"
+            f"  Sections:   [green]{len(analysis.sections)}[/green]\n"
+            f"  Citations:  [green]{len(analysis.citations)}[/green]\n"
+            f"  Definitions:[green] {len(analysis.definitions)}[/green]\n"
+            f"  Figures:    [green]{len(analysis.figures)}[/green]",
+            title="Document Analysis",
+            border_style="cyan",
+        ))
+        
+        # Table of contents
+        if analysis.sections:
+            toc_lines = []
+            for section in analysis.sections:
+                indent = "  " * section.level
+                page_str = f" (p.{section.page_start})" if section.page_start else ""
+                toc_lines.append(f"{indent}[cyan]{section.title}[/cyan]{page_str} [{section.word_count} words]")
+            console.print(Panel(
+                "\n".join(toc_lines),
+                title="Table of Contents",
+                border_style="green",
+            ))
+        
+        # Key terms
+        if analysis.key_terms:
+            console.print(Panel(
+                ", ".join(f"[yellow]{t}[/yellow]" for t in analysis.key_terms[:20]),
+                title="Key Terms",
+                border_style="yellow",
+            ))
+        
+        # Definitions
+        if analysis.definitions:
+            def_table = Table(title="Definitions", show_lines=False)
+            def_table.add_column("Term", style="cyan", max_width=25)
+            def_table.add_column("Definition", style="dim", max_width=60)
+            def_table.add_column("Section", style="green", max_width=20)
+            for defn in analysis.definitions[:15]:
+                def_table.add_row(defn.term, defn.definition[:80], defn.section[:20])
+            console.print(def_table)
+        
+        # Citations
+        if analysis.citations:
+            unique_cites = list({c.text for c in analysis.citations})
+            console.print(Panel(
+                ", ".join(f"[dim]{c}[/dim]" for c in unique_cites[:20]),
+                title=f"Citations ({len(unique_cites)} unique)",
+                border_style="magenta",
+            ))
+        
+        # Store if requested
+        if store:
+            client = _client()
+            facts = doc_intelligence.to_galaxy_facts(analysis)
+            for fact in facts:
+                client.remember(content=fact["content"], source="system", confidence=1.0, memory_type="fact")
+            console.print(f"\n[green]✔ Stored {len(facts)} structured facts to memory[/green]")
+    
+    except Exception as e:
+        console.print(f"[red]✘ {e}[/red]")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
