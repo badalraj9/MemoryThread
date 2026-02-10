@@ -45,6 +45,7 @@ class SmallLLMWithMemory:
                 - "tinyllama": TinyLlama-1.1B (local)
                 - "smollm": SmolLM-135M (very small)
                 - "phi": Phi-2 (2.7B, good reasoning)
+                - "deepseek-1.5b": DeepSeek-R1-Distill-Qwen-1.5B
         """
         self.model_name = model_name
         self.memory = MemoryClient(namespace="assistant")
@@ -67,6 +68,7 @@ class SmallLLMWithMemory:
                 "tinyllama": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
                 "smollm": "HuggingFaceTB/SmolLM-135M",
                 "phi": "microsoft/phi-2",
+                "deepseek-1.5b": "deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B",
             }
             
             hf_name = model_map.get(model_name, model_name)
@@ -306,7 +308,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--model", 
         default="mock",
-        choices=["mock", "tinyllama", "smollm", "phi"],
+        choices=["mock", "tinyllama", "smollm", "phi", "deepseek-1.5b"],
         help="Model to use (mock for testing without GPU)"
     )
     

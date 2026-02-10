@@ -1070,6 +1070,8 @@ class MemoryClient:
         """
         Chat with memory-augmented LLM.
         
+        Uses Qdrant semantic recall to find relevant memories/code chunks.
+        
         Args:
             user_message: User's input
             system_prompt: Optional system prompt
@@ -1087,27 +1089,22 @@ class MemoryClient:
         if contradiction.get("has_contradiction"):
             contradiction_note = f"\n[Note: User previously said: {contradiction.get('conflicting_memory', '')}]"
         
-        # 3. Build context from ALL stored memories (not just semantic search)
-        context_lines = ["What I know about the user:"]
-        for eid, state in self._memories.items():
-            content = state.current_value.get("content", "")
-            mtype = state.current_value.get("type", "fact")
-            # Only include facts and relations, not entities
-            if content and mtype in ["fact", "relation", "preference", "identity"]:
-                context_lines.append(f"- {content}")
-        
-        if len(context_lines) == 1:
-            context = "No previous information about the user."
-        else:
-            context = "\n".join(context_lines[:15])  # Limit to 15 memories
+        # 3. Semantic recall from Qdrant — finds relevant code chunks, facts, etc.
+        context = self.get_context_for_llm(
+            query=user_message, 
+            max_tokens=1000,  # ~4000 chars — enough for code context
+            include_scores=True
+        )
         
         # 4. Build prompt
-        default_system = """You are a helpful assistant with memory about the user.
-Use the provided context to give personalized, relevant responses.
-Reference the user's information when appropriate."""
+        default_system = """You are a helpful assistant with deep memory about the user's codebase and documents.
+Use the recalled memory context below to give accurate, specific answers.
+When answering about code, reference file names, classes, and functions from the context.
+If the context doesn't contain relevant information, say so honestly."""
         
         full_prompt = f"""{system_prompt or default_system}
 
+RECALLED MEMORY CONTEXT:
 {context}{contradiction_note}
 
 User: {user_message}
