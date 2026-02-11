@@ -1145,7 +1145,43 @@ Assistant:"""
         return response
     
     def _generate_ollama(self, prompt: str, model: str = "llama3") -> str:
-        """Generate response using local Ollama instance."""
+        """Generate response using local Ollama instance via Chat API."""
+        try:
+            # Use /api/chat which is better for chat models than /api/generate
+            url = "http://localhost:11434/api/chat"
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "stream": False,
+                # Keep context window reasonable
+                "options": {
+                    "num_ctx": 4096
+                }
+            }
+
+            resp = requests.post(url, json=payload, timeout=60)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                # Chat API returns message content in message.content
+                return data.get("message", {}).get("content", "")
+            elif resp.status_code == 404:
+                # Fallback to generate if chat endpoint missing (old versions) or model not found
+                log.warning(f"Ollama chat endpoint/model failed (404). Trying /api/generate...")
+                return self._generate_ollama_legacy(prompt, model)
+            else:
+                log.warning(f"Ollama error {resp.status_code}: {resp.text}")
+                return f"[Ollama error ({resp.status_code}). Check logs.]"
+
+        except requests.exceptions.ConnectionError:
+            log.warning("Ollama unreachable at localhost:11434")
+            return "[Ollama unreachable. Is 'ollama serve' running?]"
+        except Exception as e:
+            log.warning(f"Ollama connection failed: {e}")
+            return f"[Ollama error: {e}]"
+
+    def _generate_ollama_legacy(self, prompt: str, model: str) -> str:
+        """Fallback for older Ollama versions or completion models."""
         try:
             url = "http://localhost:11434/api/generate"
             payload = {
@@ -1153,17 +1189,12 @@ Assistant:"""
                 "prompt": prompt,
                 "stream": False
             }
-
             resp = requests.post(url, json=payload, timeout=60)
             if resp.status_code == 200:
                 return resp.json().get("response", "")
-            else:
-                log.warning(f"Ollama error {resp.status_code}: {resp.text}")
-                return f"[Ollama failed ({resp.status_code}). Falling back...]"
-
-        except Exception as e:
-            log.warning(f"Ollama connection failed: {e}")
-            return f"[Ollama unavailable. ensure 'ollama serve' is running.]"
+            return f"[Ollama legacy failed ({resp.status_code})]"
+        except Exception:
+            return "[Ollama legacy failed]"
 
     def _generate_smollm(self, prompt: str) -> str:
         """Generate response using local SmolLM (Transformers)."""
