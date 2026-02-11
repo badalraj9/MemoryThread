@@ -182,7 +182,7 @@ def main(
       SSS      (godfather)  + clear, rootkey, su, sudo
     """
     if version:
-        console.print("[bold cyan]Memory Thread[/bold cyan] v1.0.0")
+        console.print("[bold cyan]Memory Thread[/bold cyan] v3.0.0")
         raise typer.Exit()
 
     if role:

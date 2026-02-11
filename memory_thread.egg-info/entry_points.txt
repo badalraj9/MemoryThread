@@ -1,3 +1,0 @@
-[console_scripts]
-mt = memory_thread.cli:run
-mt-api = memory_thread.api.server:main

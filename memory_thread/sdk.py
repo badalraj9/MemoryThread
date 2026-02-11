@@ -1122,14 +1122,21 @@ Assistant:"""
         # 3. Default fallback (SmolLM)
 
         user_id = os.environ.get("MT_USER", "default")
-        active_provider = vault.get_active_provider(user_id)
 
-        log.info(f"Generating response using provider: {active_provider}")
+        # Check explicit env override first
+        env_provider = os.environ.get("MT_PROVIDER")
+        if env_provider:
+            active_provider = env_provider.lower()
+        else:
+            active_provider = vault.get_active_provider(user_id)
+
+        log.debug(f"Chat request - Provider: {active_provider}, User: {user_id}")
 
         if active_provider == "ollama":
             # Get configured model for ollama, or default
             creds = vault.get_provider("ollama", user_id)
             model = creds.get("model") if creds else "llama3"
+            log.debug(f"Calling Ollama with model: {model}")
             response = self._generate_ollama(full_prompt, model=model)
 
         elif active_provider in ["groq", "openrouter", "openai"]:
@@ -1137,6 +1144,8 @@ Assistant:"""
 
         else:
             # Fallback to SmolLM (local transformers)
+            # If active_provider was 'local' or unknown, we land here.
+            log.debug(f"Falling back to local SmolLM (provider={active_provider})")
             response = self._generate_smollm(full_prompt)
         
         # 6. Remember agent response (lower authority)
