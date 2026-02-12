@@ -116,6 +116,12 @@ def get_logger(name: str):
 
     logger.addHandler(console_handler)
     
+    # Silence noisy libraries unless debugging
+    if not os.environ.get("MT_DEBUG"):
+        logging.getLogger("httpx").setLevel(logging.WARNING)
+        logging.getLogger("httpcore").setLevel(logging.WARNING)
+        logging.getLogger("urllib3").setLevel(logging.WARNING)
+
     return logger
 
 

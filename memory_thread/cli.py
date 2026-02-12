@@ -182,7 +182,7 @@ def main(
       SSS      (godfather)  + clear, rootkey, su, sudo
     """
     if version:
-        console.print("[bold cyan]Memory Thread[/bold cyan] v1.0.0")
+        console.print("[bold cyan]Memory Thread[/bold cyan] v3.0.0")
         raise typer.Exit()
 
     if role:
@@ -604,11 +604,33 @@ def provider_set(
 
 
 @provider_app.command("use")
-def provider_use(name: str = typer.Argument(..., help="Provider to activate")):
+def provider_use(
+    name: str = typer.Argument(..., help="Provider to activate"),
+    model: str = typer.Option(None, "--model", "-m", help="Set model for this provider"),
+):
     """Switch active LLM provider. [dim]B-CLASS[/dim]"""
     _require(Grade.B_CLASS, "provider use")
     try:
         from memory_thread.nervous.vault import vault
+
+        # If model is specified, update the provider config
+        if model:
+            if name.lower() == "ollama":
+                # Special handling for Ollama since it doesn't use API keys
+                vault.set_provider("ollama", "local", "http://localhost:11434", model, _user())
+            else:
+                # For other providers, we need to preserve existing key/url
+                creds = vault.get_provider(name, _user())
+                if not creds and name.lower() != "local":
+                    console.print(f"[yellow]Provider '{name}' not configured. Use 'mt provider set {name} --key ...' first.[/yellow]")
+                    return
+
+                # Update model while keeping other fields
+                api_key = creds.get("api_key") if creds else "default"
+                base_url = creds.get("base_url") if creds else None
+                vault.set_provider(name, api_key, base_url, model, _user())
+                console.print(f"[green]✔ Updated {name} model to: {model}[/green]")
+
         vault.set_active_provider(name, _user())
         console.print(f"[green]✔ Switched to: {name}[/green]")
     except Exception as e:

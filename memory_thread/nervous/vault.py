@@ -171,14 +171,24 @@ class Vault:
     
     def get_active_provider(self, user_id: str = "default") -> str:
         """Get active provider for a user."""
+        # Try specific user preference
         user_active = self._cache.get(f"active_provider_{user_id}")
         if user_active:
             return user_active
-        return self._cache.get("active_provider", "local")
+
+        # Try global preference (legacy)
+        global_active = self._cache.get("active_provider")
+        if global_active:
+            return global_active
+
+        return "local"
     
     def set_active_provider(self, name: str, user_id: str = "default"):
         """Set active provider for a user."""
         self._cache[f"active_provider_{user_id}"] = name.lower()
+        # Also set global for backward compat if it's the default user
+        if user_id == "default":
+            self._cache["active_provider"] = name.lower()
         self._save()
 
 
