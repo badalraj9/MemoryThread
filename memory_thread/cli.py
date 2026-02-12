@@ -243,6 +243,8 @@ def ask(
     """One-shot question with memory context. No interactive mode."""
     client = _client()
     try:
+        if provider != "auto":
+            os.environ["MT_PROVIDER"] = provider
         use_local = provider == "local"
         response = client.chat(question, use_local=use_local)
 

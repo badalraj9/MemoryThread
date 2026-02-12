@@ -1,14 +1,22 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 import os
 
 class Settings(BaseSettings):
-    POSTGRES_USER: str = os.environ.get("POSTGRES_USER", "user")
+    model_config = SettingsConfigDict(env_file='.env', env_file_encoding='utf-8', extra='ignore')
+
+    POSTGRES_USER: str = os.environ.get("POSTGRES_USER", "postgres")
     POSTGRES_PASSWORD: str = os.environ.get("POSTGRES_PASSWORD", "password")
     POSTGRES_SERVER: str = os.environ.get("POSTGRES_SERVER", "localhost")
     POSTGRES_PORT: int = int(os.environ.get("POSTGRES_PORT", 5432))
     POSTGRES_DB: str = os.environ.get("POSTGRES_DB", "memory_thread_db")
+    
     QDRANT_HOST: str = os.environ.get("QDRANT_HOST", "localhost")
     QDRANT_PORT: int = int(os.environ.get("QDRANT_PORT", 6333))
+
+    # Lightweight Mode (No Docker) - Defaulting to False to support Server Mode
+    USE_SQLITE: bool = False
+    USE_LOCAL_QDRANT: bool = False
+    QDRANT_PATH: str = os.path.join(os.path.expanduser("~"), ".memory_thread", "qdrant_storage")
 
     # Graph
     MAX_EDGES_PER_NODE: int = 12

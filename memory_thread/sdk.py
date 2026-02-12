@@ -1121,7 +1121,7 @@ Assistant:"""
         # 2. Vault active provider
         # 3. Default fallback (SmolLM)
 
-        user_id = os.environ.get("MT_USER", "default")
+        user_id = os.environ.get("MT_USER", "user")
 
         # Check explicit env override first
         env_provider = os.environ.get("MT_PROVIDER")
@@ -1132,14 +1132,29 @@ Assistant:"""
 
         log.debug(f"Chat request - Provider: {active_provider}, User: {user_id}")
 
-        if active_provider == "ollama":
+        # Retrieve full configuration for the active provider
+        provider_config = vault.get_provider(active_provider, user_id)
+        
+        # Determine generation method based on config or name
+        is_ollama = active_provider == "ollama"
+        if provider_config and "localhost:11434" in (provider_config.get("base_url") or ""):
+            is_ollama = True
+
+        log.debug(f"Chat request - Provider: {active_provider}, User: {user_id}, Config: {bool(provider_config)}")
+
+        if is_ollama:
             # Get configured model for ollama, or default
-            creds = vault.get_provider("ollama", user_id)
+            creds = vault.get_provider("ollama", user_id) 
+            # If using a custom provider name pointing to Ollama, use its model
+            if active_provider != "ollama" and provider_config:
+                 creds = provider_config
+            
             model = creds.get("model") if creds else "llama3"
             log.debug(f"Calling Ollama with model: {model}")
             response = self._generate_ollama(full_prompt, model=model)
 
-        elif active_provider in ["groq", "openrouter", "openai"]:
+        elif active_provider in ["groq", "openrouter", "openai"] or (provider_config and provider_config.get("api_key")):
+            # If it has an API key, try cloud generation (generic or specific)
             response = self._generate_cloud(full_prompt, provider=active_provider)
 
         else:
@@ -1161,19 +1176,34 @@ Assistant:"""
             payload = {
                 "model": model,
                 "messages": [{"role": "user", "content": prompt}],
-                "stream": False,
-                # Keep context window reasonable
+                "stream": True,
+                # Keep context window reasonable for 4GB VRAM
                 "options": {
-                    "num_ctx": 4096
+                    "num_ctx": 2048
                 }
             }
 
-            resp = requests.post(url, json=payload, timeout=60)
+            resp = requests.post(url, json=payload, stream=True, timeout=300)
 
             if resp.status_code == 200:
-                data = resp.json()
-                # Chat API returns message content in message.content
-                return data.get("message", {}).get("content", "")
+                full_content = []
+                print("", end="", flush=True) # Start line
+                
+                for line in resp.iter_lines():
+                    if line:
+                        try:
+                            # Parse streaming JSON
+                            chunk = json.loads(line)
+                            content = chunk.get("message", {}).get("content", "")
+                            if content:
+                                print(content, end="", flush=True)
+                                full_content.append(content)
+                        except json.JSONDecodeError:
+                            pass
+                
+                print() # Newline at end
+                return "".join(full_content)
+                
             elif resp.status_code == 404:
                 # Fallback to generate if chat endpoint missing (old versions) or model not found
                 log.warning(f"Ollama chat endpoint/model failed (404). Trying /api/generate...")
