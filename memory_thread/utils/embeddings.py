@@ -38,7 +38,7 @@ def _get_local_model():
         log.warning("sentence-transformers not installed. pip install sentence-transformers")
         return None
     except Exception as e:
-        log.warning(f"Failed to load embedding model: {e}")
+        log.warning(f"Failed to load embedding model: {e}", exc_info=True)
         return None
 
 

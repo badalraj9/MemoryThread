@@ -1133,11 +1133,13 @@ Assistant:"""
 
         # Check explicit env override first
         env_provider = os.environ.get("MT_PROVIDER")
-        if env_provider:
+        if env_provider and env_provider != "auto":
             active_provider = env_provider.lower()
+            log.info(f"Using provider from ENV: {active_provider}")
         else:
             # Ensure we respect the vault's setting (which includes env vars now)
             active_provider = vault.get_active_provider(user_id)
+            log.info(f"Using provider from Vault: {active_provider}")
 
 
         log.debug(f"Chat request - Provider: {active_provider}, User: {user_id}")

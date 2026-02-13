@@ -48,8 +48,17 @@ def extract_entities(text: str):
         return ner_cache.get(text_hash)
 
     # Run all stages
-    regex_entities = regex_ner(text)
-    spacy_entities, confidence = spacy_ner(text)
+    try:
+        regex_entities = regex_ner(text)
+    except Exception as e:
+        print(f"Regex NER failed: {e}")
+        regex_entities = []
+
+    try:
+        spacy_entities, confidence = spacy_ner(text)
+    except Exception as e:
+        print(f"Spacy NER failed: {e}")
+        spacy_entities, confidence = [], 0.0
 
     final_entities = regex_entities + spacy_entities
 
