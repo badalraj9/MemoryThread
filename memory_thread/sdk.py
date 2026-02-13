@@ -121,10 +121,10 @@ class MemoryClient:
             from memory_thread.db.postgres_client import PostgresClient
             self._pg = PostgresClient()
             self._db_type = "postgres"
-            log.info("PostgreSQL connected")
+            log.debug("PostgreSQL connected")
         except Exception as e:
-            # Clean logging: only warn in file, not console (unless debug)
-            log.warning(f"PostgreSQL unavailable: {e}. Trying SQLite...")
+            # Clean logging: only warn in debug, not console spam
+            log.debug(f"PostgreSQL unavailable: {e}. Trying SQLite...")
             self._pg = None
             
             # Fallback to SQLite
@@ -134,7 +134,7 @@ class MemoryClient:
                 self._db_type = "sqlite"
                 log.info("SQLite connected (fallback mode)")
             except Exception as e2:
-                log.warning(f"SQLite also failed: {e2}. Using in-memory only.")
+                log.debug(f"SQLite also failed: {e2}. Using in-memory only.")
                 self._sqlite = None
                 self._db_type = "memory"
         
@@ -143,10 +143,10 @@ class MemoryClient:
             from memory_thread.db.qdrant_client import QdrantClientWrapper
             self._qdrant = QdrantClientWrapper()
             self._ensure_collection()
-            log.info("Qdrant connected")
+            log.debug("Qdrant connected")
         except Exception as e:
             # Clean logging
-            log.warning(f"Qdrant unavailable: {e}. Using keyword search.")
+            log.debug(f"Qdrant unavailable: {e}. Using keyword search.")
             self._qdrant = None
     
     def _ensure_collection(self):
@@ -170,8 +170,13 @@ class MemoryClient:
         try:
             from memory_thread.utils.embeddings import generate_embeddings
             return generate_embeddings(tuple([text]))[0]
-        except Exception:
+        except ImportError:
+            # sentence-transformers not installed
+            log.debug("sentence-transformers not installed, using zero vector")
+            return [0.0] * settings.EMBEDDING_DIMENSION
+        except Exception as e:
             # Return zeros if embedding fails
+            log.debug(f"Embedding generation failed: {e}")
             return [0.0] * settings.EMBEDDING_DIMENSION
     
     def _extract_entities(self, text: str) -> List[Dict]:
@@ -1128,7 +1133,9 @@ Assistant:"""
         if env_provider:
             active_provider = env_provider.lower()
         else:
+            # Ensure we respect the vault's setting (which includes env vars now)
             active_provider = vault.get_active_provider(user_id)
+
 
         log.debug(f"Chat request - Provider: {active_provider}, User: {user_id}")
 
@@ -1153,7 +1160,7 @@ Assistant:"""
             log.debug(f"Calling Ollama with model: {model}")
             response = self._generate_ollama(full_prompt, model=model)
 
-        elif active_provider in ["groq", "openrouter", "openai"] or (provider_config and provider_config.get("api_key")):
+        elif active_provider in ["groq", "openrouter", "openai"] or (provider_config and provider_config.get("api_key")) or (active_provider not in ["local", "ollama"] and vault.get_provider(active_provider, user_id)):
             # If it has an API key, try cloud generation (generic or specific)
             response = self._generate_cloud(full_prompt, provider=active_provider)
 
@@ -1334,6 +1341,41 @@ Assistant:"""
                         return response.json()["choices"][0]["message"]["content"]
                     else:
                         log.warning(f"OpenRouter error: {response.status_code}")
+
+            # Generic OpenAI-compatible (OpenAI, Anthropic via proxy, etc.)
+            # This catches "openai" or any custom provider name
+            if provider not in ["groq", "openrouter", "auto"]:
+                creds = vault.get_provider(provider, user_id)
+                key = creds.get("api_key") if creds else None
+                # Default to OpenAI if no base_url provided
+                base_url = creds.get("base_url") or "https://api.openai.com/v1"
+                model = creds.get("model") or "gpt-4o"
+                
+                # Ensure base_url doesn't end with slash
+                base_url = base_url.rstrip("/")
+                if not base_url.endswith("/chat/completions"):
+                    base_url += "/chat/completions"
+
+                if key:
+                    log.info(f"Using {provider} ({model}) at {base_url}")
+                    response = requests.post(
+                        base_url,
+                        headers={
+                            "Authorization": f"Bearer {key}",
+                            "Content-Type": "application/json"
+                        },
+                        json={
+                            "model": model,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": 500,
+                            "temperature": 0.7
+                        },
+                        timeout=60
+                    )
+                    if response.ok:
+                        return response.json()["choices"][0]["message"]["content"]
+                    else:
+                        log.warning(f"Provider {provider} error: {response.status_code} - {response.text}")
 
             # Fallback to local
             log.warning("No cloud API available/configured, falling back to local model")

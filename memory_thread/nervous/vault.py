@@ -134,6 +134,31 @@ class Vault:
         if not provider:
             global_providers = self._cache.get("providers", {})
             provider = global_providers.get(name.lower())
+            
+        # Env var fallback
+        if not provider:
+            n = name.lower()
+            if n == "groq" and os.environ.get("GROQ_API_KEY"):
+                return {
+                    "api_key": os.environ.get("GROQ_API_KEY"),
+                    "base_url": "https://api.groq.com/openai/v1",
+                    "model": os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile"),
+                    "owner": "env"
+                }
+            elif n == "openrouter" and os.environ.get("OPENROUTER_API_KEY"):
+                return {
+                    "api_key": os.environ.get("OPENROUTER_API_KEY"),
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "model": os.environ.get("OPENROUTER_MODEL", "meta-llama/llama-3.1-405b-instruct"),
+                    "owner": "env"
+                }
+            elif n == "openai" and os.environ.get("OPENAI_API_KEY"):
+                return {
+                    "api_key": os.environ.get("OPENAI_API_KEY"),
+                    "base_url": "https://api.openai.com/v1",
+                    "model": os.environ.get("OPENAI_MODEL", "gpt-4o"),
+                    "owner": "env"
+                }
         
         if not provider:
             return None
@@ -152,12 +177,21 @@ class Vault:
         }
     
     def list_providers(self, user_id: str = "default") -> list:
-        """List configured providers for a user (includes inherited from default)."""
+        """List configured providers for a user (includes inherited from default + env vars)."""
         user_providers = set(self._cache.get(f"providers_{user_id}", {}).keys())
         default_providers = set(self._cache.get("providers_default", {}).keys())
         global_providers = set(self._cache.get("providers", {}).keys())
         
-        return list(user_providers | default_providers | global_providers)
+        # Add env var providers
+        env_providers = set()
+        if os.environ.get("GROQ_API_KEY"):
+            env_providers.add("groq")
+        if os.environ.get("OPENROUTER_API_KEY"):
+            env_providers.add("openrouter")
+        if os.environ.get("OPENAI_API_KEY"):
+            env_providers.add("openai")
+        
+        return list(user_providers | default_providers | global_providers | env_providers)
     
     def delete_provider(self, name: str, user_id: str = "default") -> bool:
         """Remove a provider for a user."""

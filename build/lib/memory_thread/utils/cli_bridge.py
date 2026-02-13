@@ -135,11 +135,14 @@ class MTShell(App):
             client.remember(message, source="user", confidence=1.0)
             
             # Get context and generate response
+            # Get context and generate response
             try:
-                # Chat automatically selects Ollama via vault now
-                response = client.chat(message, use_local=True)
-            except Exception:
+                # Chat logic now handles provider selection automatically via vault
+                # We pass use_local=False to let SDK decide based on active provider
+                response = client.chat(message, use_local=False)
+            except Exception as e:
                 # Fallback if chat fails
+                log.write_line(f"[WARN] Chat failed: {e}")
                 context = client.recall(message, top_k=3)
                 if context.memories:
                     memory_text = "; ".join([m.content[:50] for m in context.memories])
