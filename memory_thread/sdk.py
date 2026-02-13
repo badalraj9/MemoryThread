@@ -170,9 +170,9 @@ class MemoryClient:
         try:
             from memory_thread.utils.embeddings import generate_embeddings
             return generate_embeddings(tuple([text]))[0]
-        except ImportError:
+        except ImportError as e:
             # sentence-transformers not installed
-            log.debug("sentence-transformers not installed, using zero vector")
+            log.warning(f"sentence-transformers failed: {e}")
             return [0.0] * settings.EMBEDDING_DIMENSION
         except Exception as e:
             # Return zeros if embedding fails
@@ -188,8 +188,8 @@ class MemoryClient:
         try:
             from memory_thread.services.hybrid_ner_service import extract_entities
             return extract_entities(text)
-        except ImportError:
-            log.warning("hybrid_ner_service not available, skipping entity extraction")
+        except ImportError as e:
+            log.warning(f"hybrid_ner_service not available (ImportError: {e}), skipping entity extraction")
             return []
         except Exception as e:
             log.warning(f"Entity extraction failed: {e}")
@@ -1300,6 +1300,8 @@ Assistant:"""
                 creds = vault.get_provider("groq", user_id)
                 key = creds.get("api_key") if creds else os.environ.get("GROQ_API_KEY")
                 model = creds.get("model") if creds else os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+                log.info(f"Groq API Key Check: Vault={'Found' if creds else 'Missing'}, Env={'Found' if os.environ.get('GROQ_API_KEY') else 'Missing'}")
 
                 if key:
                     log.info(f"Using Groq ({model})")

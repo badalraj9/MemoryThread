@@ -33,6 +33,9 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from rich import print as rprint
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WINDOWS UTF-8 FIX — no more Wakandan runes
