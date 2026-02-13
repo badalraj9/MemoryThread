@@ -439,6 +439,9 @@ class MemoryClient:
     def _persist_to_postgres(self, entity_id: uuid.UUID, content: str, 
                               memory_type: str, state: EntityState, event: Event):
         """Persist memory to PostgreSQL."""
+        # Ensure event is persisted first to satisfy foreign key constraint
+        self.tms.persist_event(event)
+
         with self._pg.get_cursor() as cur:
             # Upsert into memories table (or entity_state)
             cur.execute("""
