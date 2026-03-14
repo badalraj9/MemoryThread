@@ -10,6 +10,7 @@ REGEX_PATTERNS = {
     "IP": r"\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b",
 }
 
+
 def regex_ner(text):
     entities = []
     for label, pattern in REGEX_PATTERNS.items():
@@ -17,8 +18,10 @@ def regex_ner(text):
             entities.append({"entity": label, "value": match.group(0), "confidence": 1.0})
     return entities
 
+
 # Stage 2: SpaCy NER
 nlp = spacy.load("en_core_web_sm")
+
 
 def spacy_ner(text):
     doc = nlp(text)
@@ -34,15 +37,35 @@ def spacy_ner(text):
 
     return entities, confidence
 
-# Stage 3: Transformer NER (Fallback)
-transformer_ner_pipeline = pipeline("ner", model="dslim/bert-base-NER")
+
+# Stage 3: Transformer NER (Fallback) - lazy loaded
+_transformer_pipeline = None
+
+
+def _get_transformer_pipeline():
+    global _transformer_pipeline
+    if _transformer_pipeline is None:
+        try:
+            _transformer_pipeline = pipeline("ner", model="dslim/bert-base-NER")
+        except Exception:
+            _transformer_pipeline = False  # Mark as unavailable
+    return _transformer_pipeline
+
 
 def transformer_ner(text):
-    entities = transformer_ner_pipeline(text)
-    return [{"entity": ent["entity"], "value": ent["word"]} for ent in entities]
+    pipeline = _get_transformer_pipeline()
+    if not pipeline:
+        return []
+    try:
+        entities = pipeline(text)
+        return [{"entity": ent["entity"], "value": ent["word"]} for ent in entities]
+    except Exception:
+        return []
+
 
 def extract_entities(text: str):
     import hashlib
+
     text_hash = hashlib.sha256(text.encode()).hexdigest()
     if text_hash in ner_cache:
         return ner_cache.get(text_hash)
@@ -53,10 +76,13 @@ def extract_entities(text: str):
 
     final_entities = regex_entities + spacy_entities
 
-    # Fallback logic
-    if confidence < 0.6:
-        transformer_entities = transformer_ner(text)
-        final_entities += transformer_entities
+    # Fallback logic - only try transformer if confidence is low and pipeline available
+    if confidence < 0.6 and _get_transformer_pipeline():
+        try:
+            transformer_entities = transformer_ner(text)
+            final_entities += transformer_entities
+        except Exception:
+            pass  # Silently skip if transformer fails
 
     # Deduplicate entities
     seen = set()

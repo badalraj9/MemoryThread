@@ -314,7 +314,86 @@ if __name__ == "__main__":
     
     args = parser.parse_args()
     
+    elif model_name == "ollama":
+        print("Using standard Ollama mode (defaulting to deepseek-r1)")
+        # No model loading needed for API
+        pass
+    else:
+        demo_with_model(args.model)
+
+def demo_with_ollama():
+    """Demo using Ollama."""
+    print("="*60)
+    print("  MEMORY THREAD + OLLAMA DEMO")
+    print("="*60)
+    
+    # Initialize with mock first to set up structure, but we'll use _generate_ollama
+    assistant = SmallLLMWithMemory(model_name="mock") 
+    
+    # Teach facts
+    assistant.teach("User's name is Badal")
+    assistant.teach("User prefers dark mode")
+    assistant.teach("User is building Memory Thread with Ollama support")
+    
+    print("\nEnter messages (type 'quit' to exit):")
+    
+    while True:
+        user_input = input("\nYou: ").strip()
+        if user_input.lower() in ['quit', 'exit', 'q']:
+            break
+        
+        # Explicitly use Ollama provider
+        # Note: We need to modify SmallLLMWithMemory.chat to support provider arg first
+        # Or we can just mock it here by calling client directly for demo purpose
+        # But better to update the class wrapper
+        
+        # For this demo, we'll subclass or monkeypatch if we didn't update the class
+        # Let's assume we update the class below in the same file or just use client directly
+        
+        # Actually, let's update the class `chat` method in this file to pass kwargs?
+        # The class `SmallLLMWithMemory` wraps `self.memory`.
+        # `self.memory.chat` now supports `provider="ollama"`.
+        
+        # Let's verify `SmallLLMWithMemory.chat` implementation in this file:
+        # It calls `self.memory.get_context_for_llm` then `_generate_mock` or `_generate_llm`.
+        # It DOES NOT call `self.memory.chat`.
+        
+        # So we need to update `SmallLLMWithMemory` to support Ollama too.
+        pass
+
+if __name__ == "__main__":
+    import argparse
+    
+    parser = argparse.ArgumentParser(description="Small LLM + Memory Thread Demo")
+    parser.add_argument(
+        "--model", 
+        default="mock",
+        choices=["mock", "tinyllama", "smollm", "phi", "deepseek-1.5b", "ollama"],
+        help="Model to use (mock, local, or ollama)"
+    )
+    
+    args = parser.parse_args()
+    
     if args.model == "mock":
         demo_without_model()
+    elif args.model == "ollama":
+        # Simplified Ollama demo using the SDK's built-in chat
+        print("="*60)
+        print("  MEMORY THREAD + OLLAMA DEMO")
+        print("="*60)
+        client = MemoryClient(namespace="demo_ollama")
+        client.remember("User's name is Badal", source="user")
+        client.remember("User is testing Ollama integration", source="user")
+        
+        print("\nEnter messages (type 'quit' to exit):")
+        while True:
+            try:
+                user_input = input("\nYou: ").strip()
+                if user_input.lower() in ['quit', 'exit', 'q']:
+                    break
+                response = client.chat(user_input, provider="ollama")
+                print(f"Assistant: {response}")
+            except KeyboardInterrupt:
+                break
     else:
         demo_with_model(args.model)
