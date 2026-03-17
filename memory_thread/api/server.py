@@ -11,29 +11,183 @@ Docs:
     http://localhost:8000/redoc (ReDoc)
 """
 
+import logging
+import sys
+import os
+from collections import defaultdict
+import time
+
+# Suppress noisy third-party logs
+for _lib in ["httpx", "httpcore", "urllib3", "sqlalchemy", "psycopg2"]:
+    logging.getLogger(_lib).setLevel(logging.WARNING)
+
+# Set MT logs to INFO
+logging.getLogger("memory_thread").setLevel(logging.INFO)
+
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import uuid
 from datetime import datetime
+from contextlib import asynccontextmanager
 
 from memory_thread.sdk import MemoryClient
 from memory_thread.utils.logger import get_logger
+from memory_thread.config.settings import settings
 
 log = get_logger(__name__)
 
 # ==============================================================================
-# OpenTelemetry (Optional)
+# Request Logging Middleware
 # ==============================================================================
 
-try:
-    from memory_thread.services.observability import init_telemetry, instrument_fastapi
 
-    _otel_available = init_telemetry(service_name="memory-thread-api")
-except ImportError:
-    _otel_available = False
-    log.info("OpenTelemetry not installed, running without tracing")
+class RequestLoggingMiddleware:
+    """Middleware to log requests with timing using Rich."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        # Only log API requests, not health/docs
+        path = scope.get("path", "")
+        if (
+            path.startswith("/memory")
+            or path.startswith("/galaxy")
+            or path in ["/stats", "/health"]
+        ):
+            # Get method and start time
+            method = scope.get("method", "GET")
+            start_time = time.perf_counter()
+
+            # Get namespace from headers
+            headers = dict(scope.get("headers", []))
+            namespace = headers.get(b"x-namespace", b"default").decode()
+
+            # Process request
+            await self.app(scope, receive, send)
+
+            # Calculate duration
+            duration = (time.perf_counter() - start_time) * 1000
+
+            # Get status code
+            status_code = 200
+            for item in scope.get("extensions", {}).get("http.response.start", []):
+                if isinstance(item, tuple) and len(item) >= 2:
+                    status_code = item[1].get("status_code", 200)
+
+            # Format log message
+            status_str = f"{status_code}"
+            duration_str = f"{duration:>5.0f}ms"
+
+            if status_code >= 500:
+                status_str = f"[red]{status_code}[/red]"
+            elif status_code >= 400:
+                status_str = f"[yellow]{status_code}[/yellow]"
+            else:
+                status_str = f"[green]{status_code}[/green]"
+
+            # Pad method and path for alignment
+            method_padded = f"{method:<6}"
+            path_padded = f"{path:<30}"
+
+            # Print formatted log
+            print(
+                f"  {method_padded}  {path_padded}  {status_str}  {duration_str:<6}  [{namespace}]"
+            )
+
+        else:
+            await self.app(scope, receive, send)
+
+
+# ==============================================================================
+# Startup / Shutdown
+# ==============================================================================
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Lifespan context manager for startup/shutdown."""
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    # Startup
+    print()
+
+    # Check PostgreSQL
+    postgres_status = "unavailable"
+    postgres_latency = None
+    try:
+        from memory_thread.db.postgres_client import PostgresClient
+
+        pg = PostgresClient()
+        start = time.perf_counter()
+        with pg.get_cursor() as cur:
+            cur.execute("SELECT 1")
+        postgres_latency = int((time.perf_counter() - start) * 1000)
+        postgres_status = "healthy"
+    except Exception as e:
+        postgres_status = "unavailable"
+
+    # Check Qdrant
+    qdrant_status = "unavailable"
+    qdrant_latency = None
+    try:
+        from memory_thread.db.qdrant_client import QdrantClientWrapper
+
+        qdrant = QdrantClientWrapper()
+        start = time.perf_counter()
+        qdrant.client.get_collection("memories")
+        qdrant_latency = int((time.perf_counter() - start) * 1000)
+        qdrant_status = "healthy"
+    except Exception:
+        qdrant_status = "unavailable"
+
+    # Check embeddings
+    embeddings_status = "unavailable"
+    try:
+        from memory_thread.utils.embeddings import generate_embeddings
+
+        embeddings_status = "loaded"
+    except Exception:
+        embeddings_status = "unavailable"
+
+    # Print service status
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="green")
+    table.add_column(style="cyan")
+    table.add_column(style="dim")
+
+    if postgres_latency:
+        table.add_row("✓ PostgreSQL", "healthy", f"({postgres_latency}ms)")
+    else:
+        table.add_row("✗ PostgreSQL", postgres_status, "")
+
+    if qdrant_latency:
+        table.add_row("✓ Qdrant", "healthy", f"({qdrant_latency}ms)")
+    else:
+        table.add_row("✗ Qdrant", qdrant_status, "(using keyword search)")
+
+    if embeddings_status == "loaded":
+        table.add_row("✓ Embeddings", "loaded", "")
+    else:
+        table.add_row("✗ Embeddings", embeddings_status, "")
+
+    print(table)
+    print()
+
+    yield
+
+    # Shutdown
+    print("\n[yellow]Shutting down...[/yellow]")
+
 
 # ==============================================================================
 # FastAPI App
@@ -62,7 +216,11 @@ Use `X-Namespace` header to specify namespace (default: "default").
     license_info={
         "name": "MIT",
     },
+    lifespan=lifespan,
 )
+
+# Add request logging middleware
+app.add_middleware(RequestLoggingMiddleware)
 
 # CORS
 app.add_middleware(
@@ -73,20 +231,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Instrument FastAPI with OpenTelemetry
-if _otel_available:
-    try:
-        instrument_fastapi(app)
-    except Exception as e:
-        log.warning(f"FastAPI instrumentation failed: {e}")
-
 
 # ==============================================================================
 # Rate Limiter (Simple In-Memory)
 # ==============================================================================
 
-from collections import defaultdict
-import time
 from fastapi import Request
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.responses import JSONResponse
@@ -101,47 +250,28 @@ class RateLimiter:
         self._requests: Dict[str, list] = defaultdict(list)
 
     def is_allowed(self, client_id: str) -> tuple[bool, int]:
-        """
-        Check if request is allowed.
-
-        Returns:
-            (allowed: bool, remaining: int)
-        """
         now = time.time()
         window_start = now - self.window_seconds
-
-        # Clean old requests
         self._requests[client_id] = [t for t in self._requests[client_id] if t > window_start]
-
-        # Check limit
         current_count = len(self._requests[client_id])
         if current_count >= self.requests_per_minute:
             return False, 0
-
-        # Record request
         self._requests[client_id].append(now)
         return True, self.requests_per_minute - current_count - 1
 
     def reset(self, client_id: str):
-        """Reset rate limit for a client."""
         self._requests[client_id] = []
 
 
-# Global rate limiter instance
 rate_limiter = RateLimiter(requests_per_minute=100)
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """Middleware to enforce rate limiting."""
-
     async def dispatch(self, request: Request, call_next):
-        # Skip rate limiting for health check and stats
         if request.url.path in ["/", "/health", "/docs", "/redoc", "/openapi.json", "/stats"]:
             return await call_next(request)
 
-        # Get client ID from header or IP
         client_id = request.headers.get("X-API-Key") or request.client.host or "anonymous"
-
         allowed, remaining = rate_limiter.is_allowed(client_id)
 
         if not allowed:
@@ -161,7 +291,6 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         return response
 
 
-# Add rate limiting middleware
 app.add_middleware(RateLimitMiddleware)
 
 
@@ -171,8 +300,6 @@ app.add_middleware(RateLimitMiddleware)
 
 
 class RememberRequest(BaseModel):
-    """Request to store a memory."""
-
     content: str = Field(..., description="The content to remember")
     source: str = Field("agent", description="Source: 'user', 'agent', 'system'")
     confidence: float = Field(0.8, ge=0, le=1, description="Confidence level (0-1)")
@@ -191,15 +318,11 @@ class RememberRequest(BaseModel):
 
 
 class RememberResponse(BaseModel):
-    """Response after storing a memory."""
-
     entity_id: str
     message: str
 
 
 class RecallRequest(BaseModel):
-    """Request to recall memories."""
-
     query: str = Field(..., description="Search query")
     top_k: int = Field(5, ge=1, le=100, description="Max results to return")
     min_truth_score: float = Field(0.3, ge=0, le=1, description="Minimum truth score")
@@ -207,8 +330,6 @@ class RecallRequest(BaseModel):
 
 
 class MemoryItem(BaseModel):
-    """A single memory item."""
-
     entity_id: str
     content: str
     truth_score: float
@@ -220,16 +341,12 @@ class MemoryItem(BaseModel):
 
 
 class RecallResponse(BaseModel):
-    """Response with recalled memories."""
-
     query: str
     total_found: int
     memories: List[MemoryItem]
 
 
 class FactRequest(BaseModel):
-    """Request to ingest a fact."""
-
     content: str = Field(..., description="Raw content to store")
     source_uri: Optional[str] = Field(None, description="Origin URI")
     content_type: str = Field("text", description="Type: 'text', 'code', 'log'")
@@ -237,15 +354,11 @@ class FactRequest(BaseModel):
 
 
 class FactResponse(BaseModel):
-    """Response after ingesting a fact."""
-
     fact_id: str
     message: str
 
 
 class BeliefRequest(BaseModel):
-    """Request to derive a belief from a fact."""
-
     fact_id: str = Field(..., description="Source fact ID")
     belief: str = Field(..., description="The belief/interpretation")
     agent_id: Optional[str] = Field(None, description="Agent ID (default: namespace)")
@@ -254,15 +367,11 @@ class BeliefRequest(BaseModel):
 
 
 class BeliefResponse(BaseModel):
-    """Response after deriving a belief."""
-
     belief_id: str
     message: str
 
 
 class GalaxyQueryRequest(BaseModel):
-    """Request for galaxy OLAP query."""
-
     operation: str = Field(..., description="SLICE, DICE, DRILL_DOWN, ROLL_UP, SEARCH")
     source_uri: Optional[str] = None
     agent_id: Optional[str] = None
@@ -274,8 +383,6 @@ class GalaxyQueryRequest(BaseModel):
 
 
 class HealthResponse(BaseModel):
-    """Health check response."""
-
     status: str
     timestamp: str
     version: str
@@ -287,7 +394,6 @@ class HealthResponse(BaseModel):
 # Dependencies
 # ==============================================================================
 
-# Global client cache — shared across all requests per namespace
 _client_cache: dict = {}
 
 
@@ -295,8 +401,6 @@ def get_client(
     x_namespace: str = Header("default", alias="X-Namespace"),
     namespace_override: Optional[str] = None,
 ) -> MemoryClient:
-    """Get or create a MemoryClient for the request."""
-    # Use override from request body if provided, otherwise use header
     namespace = namespace_override or x_namespace
 
     if namespace not in _client_cache:
@@ -313,19 +417,17 @@ def get_client(
 
 @app.get("/", tags=["Health"])
 async def root():
-    """Root endpoint."""
     return {"message": "Memory Thread API", "docs": "/docs"}
 
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    """Health check endpoint."""
-    from memory_thread.db.postgres_client import PostgresClient
-
     postgres_connected = False
     qdrant_connected = False
 
     try:
+        from memory_thread.db.postgres_client import PostgresClient
+
         pg = PostgresClient()
         with pg.get_cursor() as cur:
             cur.execute("SELECT 1")
@@ -353,12 +455,6 @@ async def health_check():
 
 @app.post("/memory/remember", response_model=RememberResponse, tags=["Memory"])
 async def remember(request: RememberRequest):
-    """
-    Store a memory with truth metadata.
-
-    The memory is stored with confidence, authority, and freshness scores
-    that combine into a truth score for ranking during recall.
-    """
     try:
         namespace = request.namespace or "default"
         client = get_client(namespace_override=namespace)
@@ -377,12 +473,6 @@ async def remember(request: RememberRequest):
 
 @app.post("/memory/recall", response_model=RecallResponse, tags=["Memory"])
 async def recall(request: RecallRequest):
-    """
-    Recall memories relevant to a query.
-
-    Uses semantic search when available, falls back to keyword matching.
-    Results are ranked by truth score.
-    """
     try:
         namespace = request.namespace or "default"
         client = get_client(namespace_override=namespace)
@@ -412,9 +502,6 @@ async def recall(request: RecallRequest):
 
 @app.post("/memory/check_contradiction", tags=["Memory"])
 async def check_contradiction(request: RecallRequest):
-    """
-    Check if new content contradicts existing memories.
-    """
     try:
         namespace = request.namespace or "default"
         client = get_client(namespace_override=namespace)
@@ -428,7 +515,12 @@ async def check_contradiction(request: RecallRequest):
 @app.get("/stats")
 async def get_stats(namespace: str = "default"):
     """Get Memory Thread stats."""
-    return {"namespace": namespace, "total_memories": 999, "avg_confidence": 0.5}
+    try:
+        client = get_client(namespace_override=namespace)
+        stats = client.get_stats()
+        return stats
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.delete("/memory/{entity_id}", tags=["Memory"])
@@ -441,20 +533,27 @@ async def forget_memory(entity_id: str, client: MemoryClient = Depends(get_clien
         return {"success": result, "entity_id": entity_id}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/memory/{entity_id}/golden-thread", tags=["Memory"])
+async def get_golden_thread(entity_id: str, client: MemoryClient = Depends(get_client)):
+    """
+    Get the complete causal chain for a memory.
+    Shows every event that shaped this memory from creation to now.
+    """
+    try:
+        import uuid as _uuid
+
+        result = client.get_golden_thread(_uuid.UUID(entity_id))
+        return result
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=f"Invalid entity_id: {e}")
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.post("/galaxy/fact", response_model=FactResponse, tags=["Galaxy"])
 async def ingest_fact(request: FactRequest, client: MemoryClient = Depends(get_client)):
-    """
-    Ingest a raw fact into the Galaxy Schema.
-
-    Facts are:
-    - Immutable (stored once)
-    - Content-addressed (deduplicated by hash)
-    - The foundation for derived beliefs
-    """
     try:
         fact_id = client.ingest_fact(
             content=request.content,
@@ -469,14 +568,6 @@ async def ingest_fact(request: FactRequest, client: MemoryClient = Depends(get_c
 
 @app.post("/galaxy/belief", response_model=BeliefResponse, tags=["Galaxy"])
 async def derive_belief(request: BeliefRequest, client: MemoryClient = Depends(get_client)):
-    """
-    Derive a belief from a fact.
-
-    Beliefs are:
-    - Agent-specific interpretations
-    - Linked to source facts
-    - Subject to decay and truth scoring
-    """
     try:
         belief_id = client.derive_belief(
             fact_id=request.fact_id,
@@ -492,16 +583,6 @@ async def derive_belief(request: BeliefRequest, client: MemoryClient = Depends(g
 
 @app.post("/galaxy/query", tags=["Galaxy"])
 async def query_galaxy(request: GalaxyQueryRequest, client: MemoryClient = Depends(get_client)):
-    """
-    Execute OLAP-style query on the cognitive galaxy.
-
-    Operations:
-    - **SLICE**: Filter by source
-    - **DICE**: Multi-dimensional filter
-    - **DRILL_DOWN**: Navigate to source fact
-    - **ROLL_UP**: Aggregate beliefs
-    - **SEARCH**: Semantic search across beliefs
-    """
     try:
         kwargs = {
             k: v
@@ -519,7 +600,6 @@ async def query_galaxy(request: GalaxyQueryRequest, client: MemoryClient = Depen
 
         result = client.query_galaxy(request.operation, **kwargs)
 
-        # Convert to serializable format
         if hasattr(result, "beliefs"):
             return {
                 "operation": request.operation,
@@ -536,7 +616,6 @@ async def query_galaxy(request: GalaxyQueryRequest, client: MemoryClient = Depen
 
 @app.get("/galaxy/stats", tags=["Galaxy"])
 async def galaxy_stats(client: MemoryClient = Depends(get_client)):
-    """Get Galaxy Schema statistics."""
     try:
         return client.galaxy_stats()
     except Exception as e:
@@ -545,7 +624,6 @@ async def galaxy_stats(client: MemoryClient = Depends(get_client)):
 
 @app.get("/galaxy/conflicts", tags=["Galaxy"])
 async def galaxy_conflicts(client: MemoryClient = Depends(get_client)):
-    """Get conflicts across agent belief dimensions."""
     try:
         return {"conflicts": client.get_galaxy_conflicts()}
     except Exception as e:
@@ -559,4 +637,4 @@ async def galaxy_conflicts(client: MemoryClient = Depends(get_client)):
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="warning")

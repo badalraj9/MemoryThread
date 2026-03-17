@@ -35,6 +35,7 @@ SUPPORTED_EXTENSIONS = {
     ".yaml",
     ".yml",
     ".json",
+    ".jsonl",
     ".xml",
     ".html",
     ".css",
@@ -47,6 +48,8 @@ SUPPORTED_EXTENSIONS = {
     ".graphql",
     ".log",
     ".pdf",
+    ".csv",
+    ".tsv",
 }
 
 
@@ -177,6 +180,46 @@ class FileIngestService:
             except Exception as e:
                 log.warning(f"Document intelligence failed (non-critical): {e}")
 
+        log_facts = 0
+        if ext == ".log":
+            try:
+                from memory_thread.services.log_intelligence import log_intelligence
+
+                log_analysis = log_intelligence.analyze_file(str(file_path))
+                if log_analysis:
+                    facts = log_intelligence.to_galaxy_facts(log_analysis)
+                    for fact in facts:
+                        client.remember(
+                            content=fact["content"],
+                            source="system",
+                            confidence=1.0,
+                            memory_type="fact",
+                        )
+                        log_facts += 1
+                    log.info(f"Log intelligence: {log_facts} facts from {file_path.name}")
+            except Exception as e:
+                log.warning(f"Log intelligence failed (non-critical): {e}")
+
+        data_facts = 0
+        if ext in {".json", ".jsonl", ".csv", ".tsv"}:
+            try:
+                from memory_thread.services.data_intelligence import data_intelligence
+
+                data_analysis = data_intelligence.analyze_file(str(file_path))
+                if data_analysis:
+                    facts = data_intelligence.to_galaxy_facts(data_analysis)
+                    for fact in facts:
+                        client.remember(
+                            content=fact["content"],
+                            source="system",
+                            confidence=1.0,
+                            memory_type="fact",
+                        )
+                        data_facts += 1
+                    log.info(f"Data intelligence: {data_facts} facts from {file_path.name}")
+            except Exception as e:
+                log.warning(f"Data intelligence failed (non-critical): {e}")
+
         log.info(f"Ingested {file_path.name}: {len(chunks)} chunks")
 
         return {
@@ -186,6 +229,8 @@ class FileIngestService:
             "file_type": ext,
             "chunks_created": len(chunks),
             "doc_facts": doc_facts,
+            "log_facts": log_facts,
+            "data_facts": data_facts,
             "content_length": len(content),
         }
 

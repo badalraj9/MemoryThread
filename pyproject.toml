@@ -36,6 +36,7 @@ dependencies = [
     "networkx>=3.0",
     "sentence-transformers>=2.0",
     "python-dotenv>=1.0",
+    "httpx>=0.25",
 ]
 
 [project.optional-dependencies]
@@ -86,7 +87,8 @@ Repository = "https://github.com/badalraj/MemoryThread"
 Issues = "https://github.com/badalraj/MemoryThread/issues"
 
 [project.scripts]
-mt = "memory_thread.cli:run"
+mt = "memory_thread.cli.main:run"
+memorythread = "memory_thread.tui.control_centre:run"
 mt-api = "memory_thread.api.server:main"
 
 [tool.setuptools.packages.find]

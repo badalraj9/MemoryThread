@@ -1338,6 +1338,24 @@ class MemoryClient:
             log.warning(f"Replay failed: {e}")
             return None
 
+    def get_golden_thread(self, entity_id: uuid.UUID) -> Dict:
+        """
+        Get the complete causal chain for an entity.
+        Returns full narrative of how this memory came to be.
+        """
+        from memory_thread.services.golden_thread import GoldenThreadService
+
+        service = GoldenThreadService()
+        result = service.trace(entity_id)
+        return {
+            "entity_id": str(entity_id),
+            "narrative": result.narrative,
+            "events": [e.__dict__ for e in result.events],
+            "current_truth": result.current_truth,
+            "is_consistent": result.is_consistent,
+            "related_paths": result.related_paths,
+        }
+
     # =========================================================================
     # MAINTENANCE FEATURES
     # =========================================================================

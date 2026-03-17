@@ -190,6 +190,21 @@ MIGRATIONS = [
             );
         """,
     },
+    {
+        "id": 8,
+        "name": "ancestry_cache",
+        "description": "Ancestry cache for golden thread feature",
+        "sql": """
+            CREATE TABLE IF NOT EXISTS ancestry_cache (
+                entity_id UUID PRIMARY KEY,
+                fingerprint_hash TEXT NOT NULL,
+                event_chain JSONB NOT NULL DEFAULT '[]',
+                updated_at TIMESTAMPTZ DEFAULT NOW()
+            );
+            
+            CREATE INDEX IF NOT EXISTS idx_ancestry_cache_fingerprint ON ancestry_cache(fingerprint_hash);
+        """,
+    },
 ]
 
 

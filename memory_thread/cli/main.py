@@ -7,6 +7,7 @@ from typing import Optional
 from memory_thread.cli import identity, assimilate, prune, decay, maintenance
 from memory_thread.cli import debug
 from memory_thread.utils.logger import get_logger
+from memory_thread.db.migrations.runner import MigrationRunner
 
 log = get_logger(__name__)
 
@@ -21,42 +22,6 @@ app.add_typer(maintenance.app, name="maintenance", help="Orchestration of mainte
 app.add_typer(debug.app, name="debug", help="Debug tools")
 app.command("load-fixtures")(debug.load_fixtures)
 app.command("ingest-provenance")(debug.ingest_provenance)
-
-
-@app.command("serve")
-def serve(
-    host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),
-    port: int = typer.Option(8000, "--port", help="Port to bind to"),
-    workers: int = typer.Option(1, "--workers", help="Number of worker processes"),
-    reload: bool = typer.Option(False, "--reload", help="Enable auto-reload"),
-):
-    """
-    Start the Memory Thread REST API server.
-
-    Runs the FastAPI server at http://localhost:8000
-    """
-    try:
-        import uvicorn
-        from memory_thread.api.server import app as fastapi_app
-
-        log.info(f"Starting MT server on {host}:{port}")
-        print(f"[*] Starting Memory Thread API server at http://{host}:{port}")
-        print(f"    Docs: http://{host}:{port}/docs")
-        print(f"    Press Ctrl+C to stop")
-
-        uvicorn.run(
-            "memory_thread.api.server:app",
-            host=host,
-            port=port,
-            workers=workers,
-            reload=reload,
-        )
-    except ImportError:
-        print("[!] uvicorn not installed. Run: pip install uvicorn")
-        raise typer.Exit(1)
-    except Exception as e:
-        print(f"[!] Failed to start server: {e}")
-        raise typer.Exit(1)
 
 
 def _resolve_namespace() -> str:
@@ -129,6 +94,112 @@ def _ensure_mt_dir(path: str = ".") -> Path:
     return mt_dir
 
 
+@app.command("serve")
+def serve(
+    host: str = typer.Option("0.0.0.0", "--host", help="Host to bind to"),
+    port: int = typer.Option(8000, "--port", help="Port to bind to"),
+    workers: int = typer.Option(1, "--workers", help="Number of worker processes"),
+    reload: bool = typer.Option(False, "--reload", help="Enable auto-reload"),
+):
+    """
+    Start the Memory Thread REST API server.
+
+    Runs the FastAPI server at http://localhost:8000
+    """
+    try:
+        import uvicorn
+        from rich.console import Console
+        from rich.panel import Panel
+        from rich.table import Table
+        from rich.text import Text
+        import time
+
+        console = Console()
+
+        # Resolve namespace
+        namespace = _resolve_namespace()
+
+        # Show startup banner
+        banner = Panel(
+            Text("Memory Thread  v1.0.0", justify="center", style="bold cyan"),
+            border_style="cyan",
+            padding=(0, 0),
+        )
+        console.print(banner)
+        console.print()
+
+        # Service status table
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="green")
+        table.add_column(style="cyan")
+        table.add_column(style="dim")
+
+        # Check PostgreSQL
+        postgres_status = "connecting..."
+        try:
+            from memory_thread.db.postgres_client import PostgresClient
+
+            pg = PostgresClient()
+            with pg.get_cursor() as cur:
+                cur.execute("SELECT 1")
+            postgres_status = "connected"
+        except Exception as e:
+            postgres_status = f"unavailable ({type(e).__name__})"
+
+        # Check Qdrant
+        qdrant_status = "connecting..."
+        try:
+            from memory_thread.db.qdrant_client import QdrantClientWrapper
+
+            qdrant = QdrantClientWrapper()
+            qdrant.client.get_collection("memories")
+            qdrant_status = "connected"
+        except Exception:
+            qdrant_status = "unavailable (using keyword search)"
+
+        # Check embeddings
+        embeddings_status = "loading..."
+        try:
+            from memory_thread.utils.embeddings import generate_embeddings
+
+            embeddings_status = "loaded"
+        except Exception:
+            embeddings_status = "unavailable"
+
+        table.add_row("✓ PostgreSQL", "PostgreSQL", postgres_status)
+        table.add_row("✓ Qdrant", "Qdrant", qdrant_status)
+        table.add_row("✓ Embeddings", "Embeddings", embeddings_status)
+
+        console.print(table)
+        console.print()
+
+        # Connection info
+        console.print(
+            f"  [cyan]Connection URL:[/cyan]  [bold]mt://{host}:{port}/{namespace}[/bold]"
+        )
+        console.print(f"  [cyan]API Docs:[/cyan]        [link]http://{host}:{port}/docs[/link]")
+        console.print()
+        console.print("[dim]Press Ctrl+C to stop[/dim]")
+        console.print("─" * 50)
+
+        uvicorn.run(
+            "memory_thread.api.server:app",
+            host=host,
+            port=port,
+            workers=workers,
+            reload=reload,
+            log_level="warning",
+        )
+    except ImportError:
+        console = Console()
+        console.print("[bold red]![/bold red] uvicorn not installed. Run: pip install uvicorn")
+        raise typer.Exit(1)
+    except Exception as e:
+        console = Console()
+        console.print(f"[bold red]![/bold red] Failed to start server: {e}")
+        raise typer.Exit(1)
+
+
 @app.command("init")
 def init_command(
     shared: bool = typer.Option(
@@ -141,13 +212,13 @@ def init_command(
 
     Generates a namespace from the folder name and registers the project.
     """
-    from memory_thread.db.postgres_client import PostgresClient
+    from rich.console import Console
+
+    console = Console()
 
     project_path = Path(path).resolve()
     project_name = project_path.name
     namespace = project_name.lower().replace(" ", "_").replace("-", "_")
-
-    pg = PostgresClient()
 
     # Ensure .mt directory
     mt_dir = _ensure_mt_dir(path)
@@ -163,8 +234,11 @@ def init_command(
     with open(mt_dir / "config.json", "w") as f:
         json.dump(config, f)
 
-    # Register in projects table
+    # Try to register in projects table
     try:
+        from memory_thread.db.postgres_client import PostgresClient
+
+        pg = PostgresClient()
         with pg.get_cursor() as cur:
             cur.execute(
                 """
@@ -179,24 +253,30 @@ def init_command(
             )
 
         log.info(f"Initialized MT project: {project_name} (namespace: {namespace})")
-        print(f"✓ Initialized MT project: {project_name}")
-        print(f"  Namespace: {namespace}")
-        print(f"  Path: {project_path}")
-        if shared:
-            print(f"  Shared memories enabled (.mt/ folder will be committed to git)")
     except Exception as e:
-        log.error(f"Failed to register project: {e}")
-        print(f"✗ Failed to initialize: {e}")
+        log.warning(f"Could not register in DB: {e}")
+
+    console.print(f"[green]✓[/green] Initialized MT project: [bold]{project_name}[/bold]")
+    console.print(f"  [cyan]Namespace:[/cyan] {namespace}")
+    console.print(f"  [cyan]Path:[/cyan] {project_path}")
+    if shared:
+        console.print(
+            f"  [cyan]Shared memories enabled[/cyan] (.mt/ folder will be committed to git)"
+        )
 
 
 @app.command("list")
 def list_projects():
     """List all registered MT projects."""
-    from memory_thread.db.postgres_client import PostgresClient
+    from rich.console import Console
+    from rich.table import Table
 
-    pg = PostgresClient()
+    console = Console()
 
     try:
+        from memory_thread.db.postgres_client import PostgresClient
+
+        pg = PostgresClient()
         with pg.get_cursor() as cur:
             cur.execute("""
                 SELECT name, namespace, path, initialized_at, last_accessed
@@ -206,30 +286,38 @@ def list_projects():
             rows = cur.fetchall()
 
         if not rows:
-            print("No projects registered. Run 'mt init' to register a project.")
+            console.print("[dim]No projects registered. Run 'mt init' to register a project.[/dim]")
             return
 
-        print(f"{'Name':<20} {'Namespace':<20} {'Path':<40} {'Last Accessed'}")
-        print("-" * 100)
+        table = Table()
+        table.add_column("Name", style="cyan")
+        table.add_column("Namespace", style="green")
+        table.add_column("Path", style="dim")
+        table.add_column("Last Accessed", style="yellow")
+
         for row in rows:
-            print(
-                f"{row['name']:<20} {row['namespace']:<20} {row['path']:<40} {row['last_accessed']}"
-            )
+            table.add_row(row["name"], row["namespace"], row["path"], str(row["last_accessed"]))
+
+        console.print(table)
 
     except Exception as e:
         log.error(f"Failed to list projects: {e}")
-        print(f"[!] Error: {e}")
+        console.print(f"[red]![/red] Error: {e}")
 
 
 @app.command("reflect")
 def reflect():
     """Run MT daily reflection and print insight summary."""
+    from rich.console import Console
+
+    console = Console()
+
     from memory_thread.services.contemplator import Contemplator
 
     contemplator = Contemplator(auto_start=False)
     result = contemplator.daily_reflection()
     summary = contemplator.generate_insight_summary()
-    print(summary)
+    console.print(summary)
 
 
 @app.command("recall")
@@ -241,27 +329,82 @@ def recall_command(
     """
     Search memories from current project or specified project.
     """
-    from memory_thread.sdk import MemoryClient
+    from rich.console import Console
+
+    console = Console()
 
     namespace = project if project else _resolve_namespace()
 
     try:
+        from memory_thread.sdk import MemoryClient
+
         mt = MemoryClient(namespace=namespace)
         result = mt.recall(query, top_k=top_k)
 
-        print(f"\n=== Results from: {namespace} ===")
-        for i, mem in enumerate(result.memories, 1):
-            print(f"\n{i}. {mem.content[:100]}...")
-            print(
-                f"   Score: {mem.truth_score:.3f} | Confidence: {mem.confidence:.2f} | Authority: {mem.authority:.2f}"
-            )
-
-        if not result.memories:
-            print("No memories found.")
+        console.print(f"\n[bold]Results from:[/bold] {namespace}")
+        if result.memories:
+            for i, mem in enumerate(result.memories, 1):
+                console.print(f"\n[cyan]{i}.[/cyan] {mem.content[:100]}...")
+                console.print(
+                    f"   [yellow]Score:[/yellow] {mem.truth_score:.3f} | [yellow]Confidence:[/yellow] {mem.confidence:.2f} | [yellow]Authority:[/yellow] {mem.authority:.2f}"
+                )
+        else:
+            console.print("[dim]No memories found.[/dim]")
 
     except Exception as e:
         log.error(f"Recall failed: {e}")
-        print(f"✗ Error: {e}")
+        console.print(f"[red]✗[/red] Error: {e}")
+
+
+@app.command("ingest")
+def ingest_command(
+    path: str = typer.Argument(..., help="File or directory path to ingest"),
+):
+    """
+    Ingest a file or directory into Memory Thread.
+
+    Parses files using intelligence services (code, document, log, data)
+    and stores structured facts in the Galaxy Schema.
+    """
+    from rich.console import Console
+    from rich.table import Table
+
+    console = Console()
+
+    from memory_thread.services.file_ingest_service import ingest_path
+
+    try:
+        result = ingest_path(path)
+
+        console.print(f"\n[bold green]✓ Ingestion complete[/bold green]\n")
+
+        table = Table(show_header=False, box=None, padding=(0, 2))
+        table.add_column(style="cyan")
+        table.add_column(style="green")
+
+        if "folder_path" in result:
+            table.add_row("Files processed", str(result.get("files_processed", 0)))
+            table.add_row("Chunks created", str(result.get("chunks_created", 0)))
+            table.add_row("Code facts", str(result.get("code_facts", 0)))
+        else:
+            table.add_row("File", result.get("original_name", "unknown"))
+            table.add_row("Chunks created", str(result.get("chunks_created", 0)))
+            table.add_row("Doc facts", str(result.get("doc_facts", 0)))
+            table.add_row("Log facts", str(result.get("log_facts", 0)))
+            table.add_row("Data facts", str(result.get("data_facts", 0)))
+
+        console.print(table)
+
+        if result.get("errors"):
+            console.print(f"\n[yellow]Errors:[/yellow]")
+            for err in result["errors"]:
+                console.print(
+                    f"  [red]✗[/red] {err.get('file', 'unknown')}: {err.get('error', 'unknown error')}"
+                )
+
+    except Exception as e:
+        log.error(f"Ingest failed: {e}")
+        console.print(f"[bold red]✗[/bold red] Error: {e}")
 
 
 @app.command("migrate")
@@ -274,7 +417,9 @@ def migrate_command(
 
     Scans the migrations/ folder and applies any pending migrations.
     """
-    from memory_thread.db.migrations.runner import MigrationRunner
+    from rich.console import Console
+
+    console = Console()
 
     project_path = Path(path).resolve()
     runner = MigrationRunner(project_path)
@@ -282,15 +427,26 @@ def migrate_command(
     if status:
         pending = runner.get_pending()
         if pending:
-            print(f"Pending migrations ({len(pending)}):")
+            console.print(f"[yellow]Pending migrations ({len(pending)}):[/yellow]")
             for m in pending:
-                print(f"  - {m}")
+                console.print(f"  - {m}")
         else:
-            print("No pending migrations.")
+            console.print("[green]No pending migrations.[/green]")
         return
 
     applied = runner.run_migrations()
-    print(f"Applied {len(applied)} migration(s).")
+    console.print(f"[green]Applied {len(applied)} migration(s).[/green]")
+
+
+@app.command("chat")
+def chat_command(
+    model: str = typer.Option(None, "--model", help="Model to use e.g. ollama/llama2"),
+    namespace: str = typer.Option(None, "--namespace", help="Namespace to use"),
+):
+    """Launch interactive chat TUI with memory context."""
+    from memory_thread.tui.chat import run as chat_run
+
+    chat_run(model=model, namespace=namespace)
 
 
 def run():

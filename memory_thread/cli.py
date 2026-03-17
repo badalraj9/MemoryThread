@@ -423,6 +423,40 @@ def provenance(
         console.print(f"[red]✘ {e}[/red]")
 
 
+@app.command()
+def thread(
+    entity_id: str = typer.Argument(..., help="Entity ID to trace"),
+    raw: bool = typer.Option(False, "--raw", help="Show raw JSON instead of narrative"),
+):
+    """Show the complete causal history of a memory."""
+    client = _client()
+    import uuid as _uuid
+
+    try:
+        eid = _uuid.UUID(entity_id)
+        result = client.get_golden_thread(eid)
+
+        if raw:
+            print(json.dumps(result, indent=2, default=str))
+            return
+
+        console.print(
+            Panel(
+                result.get("narrative", "No narrative available"),
+                title=f"[cyan]Golden Thread: {entity_id[:8]}...[/cyan]",
+                border_style="cyan",
+            )
+        )
+
+        if not result.get("is_consistent", True):
+            console.print("[red]⚠ Warning: Inconsistency detected during replay[/red]")
+
+    except ValueError:
+        console.print("[red]✘ Invalid UUID[/red]")
+    except Exception as e:
+        console.print(f"[red]✘ {e}[/red]")
+
+
 # --- Galaxy sub-commands ---
 
 
