@@ -3,6 +3,7 @@ Qdrant Client Wrapper for Memory Thread.
 
 Provides a unified interface for Qdrant operations with graceful fallbacks.
 """
+
 from typing import List, Dict, Any, Optional
 from qdrant_client import QdrantClient as BaseQdrantClient
 from qdrant_client.models import Distance, VectorParams, PointStruct
@@ -16,10 +17,10 @@ def get_qdrant_client() -> BaseQdrantClient:
 
 class QdrantClientWrapper:
     """Wrapper around Qdrant client with convenience methods."""
-    
+
     def __init__(self):
         self.client = get_qdrant_client()
-    
+
     def create_collection_if_not_exists(self, collection_name: str, vector_size: int = 384):
         """Create a collection if it doesn't exist."""
         try:
@@ -27,34 +28,42 @@ class QdrantClientWrapper:
         except Exception as e:
             # Collection doesn't exist, create it
             from memory_thread.utils.logger import get_logger
+
             log = get_logger(__name__)
             log.debug(f"Creating collection {collection_name}: {e}")
             self.client.create_collection(
                 collection_name=collection_name,
-                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE)
+                vectors_config=VectorParams(size=vector_size, distance=Distance.COSINE),
             )
-    
+
     def upsert(self, collection_name: str, points: List[Dict[str, Any]]):
         """Upsert points into a collection."""
         qdrant_points = []
         for p in points:
-            qdrant_points.append(PointStruct(
-                id=p["id"],
-                vector=p["vector"],
-                payload=p.get("payload", {})
-            ))
+            qdrant_points.append(
+                PointStruct(id=p["id"], vector=p["vector"], payload=p.get("payload", {}))
+            )
         self.client.upsert(collection_name=collection_name, points=qdrant_points)
-    
-    def search(self, collection_name: str, query_vector: List[float], limit: int = 5) -> List[Any]:
+
+    def search(
+        self,
+        collection_name: str,
+        query_vector: List[float],
+        limit: int = 5,
+        query_filter: Optional[Dict] = None,
+    ) -> List[Any]:
         """Search for similar vectors."""
         try:
-            return self.client.search(
+            result = self.client.query_points(
                 collection_name=collection_name,
-                query_vector=query_vector,
-                limit=limit
+                query=query_vector,
+                limit=limit,
+                query_filter=query_filter,
             )
+            return result.points
         except Exception as e:
             from memory_thread.utils.logger import get_logger
+
             log = get_logger(__name__)
             log.warning(f"Qdrant search failed on {collection_name}: {e}")
             return []

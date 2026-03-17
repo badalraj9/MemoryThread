@@ -27,8 +27,21 @@ from memory_thread.services.tms_service import (
 )
 from memory_thread.config.settings import settings
 from memory_thread.utils.logger import get_logger
+from urllib.parse import urlparse, parse_qs
+import os
 
 log = get_logger(__name__)
+
+
+@dataclass
+class ConnectionConfig:
+    """Parsed connection configuration from MT_URL."""
+
+    host: str
+    port: int
+    namespace: str
+    api_key: Optional[str] = None
+    use_db: bool = True
 
 
 @dataclass
@@ -92,17 +105,75 @@ class MemoryClient:
     Falls back to in-memory if DB unavailable.
     """
 
+    @classmethod
+    def connect(
+        cls, url: str, use_db: bool = True, default_authority: float = 0.5
+    ) -> "MemoryClient":
+        """
+        Connect to Memory Thread using a connection string.
+
+        Args:
+            url: Connection string in format mt://host:port/namespace?api_key=xxx
+                 Examples:
+                   - mt://localhost:8000/my-project
+                   - mt://api.memorythread.io/org/project?api_key=sk-xxx
+                   - mt://localhost:8000/default
+            use_db: If True, use Postgres/Qdrant. If False, in-memory only.
+            default_authority: Default authority score for memories (0.0-1.0)
+
+        Returns:
+            Configured MemoryClient instance
+        """
+        parsed = urlparse(url)
+
+        if parsed.scheme != "mt":
+            raise ValueError(f"Invalid scheme: {parsed.scheme}. Expected 'mt'.")
+
+        host = parsed.hostname or "localhost"
+        port = parsed.port or 8000
+
+        path = parsed.path.strip("/")
+        namespace = path if path else "default"
+
+        query_params = parse_qs(parsed.query)
+        api_key = query_params.get("api_key", [None])[0]
+
+        if api_key:
+            os.environ["MT_API_KEY"] = api_key
+
+        client = cls(namespace=namespace, use_db=use_db, default_authority=default_authority)
+        log.info(f"Connected to Memory Thread at {host}:{port}/{namespace}")
+        return client
+
+    @classmethod
+    def connect_from_env(cls) -> "MemoryClient":
+        """
+        Connect using MT_URL environment variable.
+
+        Returns:
+            Configured MemoryClient instance
+        """
+        mt_url = os.environ.get("MT_URL")
+        if not mt_url:
+            raise ValueError("MT_URL environment variable not set")
+
+        return cls.connect(mt_url)
+
     def __init__(
-        self, namespace: str = "default", use_db: bool = False, default_authority: float = 0.5
+        self, namespace: Optional[str] = None, use_db: bool = False, default_authority: float = 0.5
     ):
         """
         Initialize the Memory Client.
 
         Args:
-            namespace: Logical grouping for memories
+            namespace: Logical grouping for memories. If None, auto-resolves from .mt/ config.
             use_db: If True, use Postgres/Qdrant (slower init). If False, in-memory only (faster).
             default_authority: Default authority score for memories (0.0-1.0)
         """
+        # Auto-resolve namespace if not provided
+        if namespace is None:
+            namespace = self._resolve_namespace()
+
         self.namespace = namespace
         self.tms = TMSService()
         self.use_db = use_db
@@ -110,6 +181,7 @@ class MemoryClient:
 
         # In-memory cache (always available)
         self._memories: Dict[uuid.UUID, EntityState] = {}
+        self._global_memories: Dict[uuid.UUID, EntityState] = {}
         self._event_log: List[Event] = []
 
         # DB clients (lazy init)
@@ -119,6 +191,71 @@ class MemoryClient:
 
         if use_db:
             self._init_db_clients()
+
+    def _resolve_namespace(self) -> str:
+        """Resolve namespace by checking .mt/ config, walking up directories, or falling back to global."""
+        import os
+        import json
+        from pathlib import Path
+        from memory_thread.config.settings import settings
+
+        # First check .mt/ in current directory
+        mt_config_path = Path(".") / settings.MT_PROJECT_DIR / "config.json"
+        if mt_config_path.exists():
+            try:
+                with open(mt_config_path) as f:
+                    config = json.load(f)
+                    if config.get("namespace"):
+                        return config["namespace"]
+            except Exception:
+                pass
+
+        # Walk up directories like git
+        current = Path.cwd()
+        for parent in [current] + list(current.parents):
+            mt_dir = parent / ".mt"
+            if mt_dir.exists():
+                config_path = mt_dir / "config.json"
+                if config_path.exists():
+                    try:
+                        with open(config_path) as f:
+                            config = json.load(f)
+                            if config.get("namespace"):
+                                return config["namespace"]
+                    except Exception:
+                        pass
+
+            if parent == parent.parent:
+                break
+
+        # Fall back to global namespace
+        return self._get_global_namespace()
+
+    def _get_global_namespace(self) -> str:
+        """Get or create global namespace from ~/.mt/config.json."""
+        import os
+        import json
+        from pathlib import Path
+        from memory_thread.config.settings import settings
+
+        global_dir = Path(settings.MT_GLOBAL_DIR)
+        global_dir.mkdir(parents=True, exist_ok=True)
+        config_path = global_dir / "config.json"
+
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                    return config.get("namespace", "global")
+            except Exception:
+                pass
+
+        namespace = os.environ.get("MT_USER", "global")
+        config = {"namespace": namespace, "type": "global"}
+        with open(config_path, "w") as f:
+            json.dump(config, f)
+
+        return namespace
 
     def _init_db_clients(self):
         """Initialize database clients with graceful fallback."""
@@ -459,18 +596,46 @@ class MemoryClient:
     def _persist_to_postgres(
         self, entity_id: uuid.UUID, content: str, memory_type: str, state: EntityState, event: Event
     ):
-        """Persist memory to PostgreSQL."""
+        """Persist memory to PostgreSQL - event first (for FK), then state."""
         with self._pg.get_cursor() as cur:
-            # Upsert into memories table (or entity_state)
+            # First: Persist the event (required for FK constraint)
             cur.execute(
                 """
-                INSERT INTO entity_state (entity_id, namespace, current_value, truth_vector, last_event_id, updated_at)
-                VALUES (%s, %s, %s, %s, %s, %s)
+                INSERT INTO events (id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                ON CONFLICT (id) DO NOTHING
+                """,
+                (
+                    str(event.id),
+                    event.namespace,
+                    event.timestamp,
+                    event.actor.value,
+                    event.action.value,
+                    str(event.object_id),
+                    json.dumps(event.delta),
+                    [str(uid) for uid in event.antecedents],
+                    json.dumps(
+                        {
+                            "confidence": event.truth_vector.confidence,
+                            "authority": event.truth_vector.authority,
+                            "freshness": event.truth_vector.freshness,
+                            "corroboration": event.truth_vector.corroboration,
+                        }
+                    ),
+                ),
+            )
+
+            # Second: Persist entity state (references event via last_event_id FK)
+            cur.execute(
+                """
+                INSERT INTO entity_state (entity_id, namespace, current_value, truth_vector, last_event_id, updated_at, version)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
                 ON CONFLICT (entity_id) DO UPDATE SET
                     current_value = EXCLUDED.current_value,
                     truth_vector = EXCLUDED.truth_vector,
                     last_event_id = EXCLUDED.last_event_id,
-                    updated_at = EXCLUDED.updated_at
+                    updated_at = EXCLUDED.updated_at,
+                    version = entity_state.version + 1
             """,
                 (
                     str(entity_id),
@@ -486,6 +651,7 @@ class MemoryClient:
                     ),
                     str(event.id),
                     datetime.utcnow(),
+                    state.version if hasattr(state, "version") else 1,
                 ),
             )
 
@@ -510,15 +676,17 @@ class MemoryClient:
         self, entity_id: uuid.UUID, content: str, memory_type: str, state: EntityState
     ):
         """Index memory in Qdrant for semantic search."""
+        from qdrant_client.models import PointStruct
+
         embedding = self._generate_embedding(content)
 
         self._qdrant.client.upsert(
             collection_name=self._collection_name,
             points=[
-                {
-                    "id": str(entity_id),
-                    "vector": embedding,
-                    "payload": {
+                PointStruct(
+                    id=str(entity_id),
+                    vector=embedding,
+                    payload={
                         "content": content,
                         "type": memory_type,
                         "namespace": self.namespace,
@@ -526,24 +694,60 @@ class MemoryClient:
                         "authority": state.truth_vector.authority,
                         "freshness": state.truth_vector.freshness,
                     },
-                }
+                )
             ],
         )
 
-    def recall(self, query: str, top_k: int = 5, min_truth_score: float = 0.3) -> RecallResult:
+    def recall(
+        self,
+        query: str,
+        top_k: int = 5,
+        min_truth_score: float = 0.3,
+        project: Optional[str] = None,
+    ) -> RecallResult:
         """
         Recall memories relevant to a query.
 
         Uses Qdrant semantic search if available, falls back to keyword.
+        Searches both current project namespace AND global namespace simultaneously,
+        merging results with project namespace getting higher authority weight.
 
         Args:
             query: What to search for
             top_k: Maximum memories to return
             min_truth_score: Minimum truth score threshold
+            project: Optional specific project namespace to search (isolated, no global)
 
         Returns:
             RecallResult with ranked memories
         """
+        # If specific project requested, search only that namespace
+        if project:
+            original_namespace = self.namespace
+            self.namespace = project
+            result = self._recall_impl(query, top_k, min_truth_score)
+            self.namespace = original_namespace
+            return result
+
+        # Otherwise search both project and global namespaces
+        global_namespace = self._get_global_namespace()
+
+        # Search project namespace
+        project_result = self._recall_impl(query, top_k, min_truth_score)
+
+        # Search global namespace if different
+        if global_namespace != self.namespace:
+            self.namespace = global_namespace
+            global_result = self._recall_impl(query, top_k, min_truth_score)
+            self.namespace = self.namespace  # Restore
+
+            # Merge results with project namespace getting higher authority
+            return self._merge_results(project_result, global_result, top_k)
+
+        return project_result
+
+    def _recall_impl(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
+        """Internal recall implementation."""
         # Try Qdrant semantic search first
         if self._qdrant:
             try:
@@ -554,28 +758,92 @@ class MemoryClient:
         # Fallback to keyword search
         return self._recall_keyword(query, top_k, min_truth_score)
 
+    def _merge_results(
+        self, project_result: RecallResult, global_result: RecallResult, top_k: int
+    ) -> RecallResult:
+        """Merge project and global results, with project getting higher authority."""
+        from memory_thread.config.settings import settings
+
+        global_weight = getattr(settings, "GLOBAL_AUTHORITY_WEIGHT", 0.8)
+
+        # Adjust authority for global memories
+        adjusted_global = []
+        for mem in global_result.memories:
+            adjusted_mem = Memory(
+                content=mem.content,
+                entity_id=mem.entity_id,
+                truth_score=mem.truth_score * global_weight,
+                confidence=mem.confidence,
+                authority=mem.authority * global_weight,
+                freshness=mem.freshness,
+                corroboration=mem.corroboration,
+                timestamp=mem.timestamp,
+                source=mem.source,
+                memory_type=mem.memory_type,
+            )
+            adjusted_global.append(adjusted_mem)
+
+        # Combine and sort
+        all_memories = project_result.memories + adjusted_global
+        all_memories.sort(key=lambda m: m.truth_score, reverse=True)
+
+        return RecallResult(
+            memories=all_memories[:top_k], query=project_result.query, total_found=len(all_memories)
+        )
+
+    def _include_shared_memories(self, memories: List[Memory]) -> List[Memory]:
+        """Include shared memories from .mt/ folder with adjusted authority."""
+        from memory_thread.config.settings import settings
+
+        shared_authority = 0.9
+
+        for entity_id, state in self._global_memories.items():
+            mem = Memory(
+                content=state.current_value.get("content", ""),
+                entity_id=entity_id,
+                truth_score=TruthVectorService.calculate_score(state.truth_vector),
+                confidence=state.truth_vector.confidence,
+                authority=state.truth_vector.authority * shared_authority,
+                freshness=state.truth_vector.freshness,
+                corroboration=state.truth_vector.corroboration,
+                timestamp=state.updated_at,
+                source="shared",
+                memory_type=state.current_value.get("type", "fact"),
+            )
+            memories.append(mem)
+
+        return memories
+
     def _recall_from_qdrant(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
         """Semantic search using Qdrant."""
         query_embedding = self._generate_embedding(query)
 
-        results = self._qdrant.client.search(
-            collection_name=self._collection_name,
-            query_vector=query_embedding,
-            limit=top_k * 2,  # Get extra for filtering
-            query_filter={"must": [{"key": "namespace", "match": {"value": self.namespace}}]}
-            if self.namespace != "default"
-            else None,
-        )
+        try:
+            results = self._qdrant.client.query_points(
+                collection_name=self._collection_name,
+                query=query_embedding,
+                limit=top_k * 2,
+                query_filter={"must": [{"key": "namespace", "match": {"value": self.namespace}}]}
+                if self.namespace != "default"
+                else None,
+            )
+            results = results.points
+        except Exception as e:
+            log.warning(f"Qdrant search failed: {e}")
+            return RecallResult(memories=[], query=query, total_found=0)
 
         memories = []
         for hit in results:
             payload = hit.payload
-            truth_score = (
-                payload.get("confidence", 0.5) * 0.4
-                + payload.get("authority", 0.5) * 0.3
-                + payload.get("freshness", 1.0) * 0.2
-                + hit.score * 0.1  # Semantic similarity
+
+            truth_vector = TruthVector(
+                confidence=payload.get("confidence", 0.5),
+                authority=payload.get("authority", 0.5),
+                freshness=payload.get("freshness", 1.0),
+                corroboration=hit.score,
             )
+
+            truth_score = TruthVectorService.calculate_score(truth_vector)
 
             if truth_score >= min_truth_score:
                 memories.append(
@@ -583,17 +851,16 @@ class MemoryClient:
                         content=payload.get("content", ""),
                         entity_id=uuid.UUID(hit.id) if isinstance(hit.id, str) else hit.id,
                         truth_score=truth_score,
-                        confidence=payload.get("confidence", 0.5),
-                        authority=payload.get("authority", 0.5),
-                        freshness=payload.get("freshness", 1.0),
-                        corroboration=0,
+                        confidence=truth_vector.confidence,
+                        authority=truth_vector.authority,
+                        freshness=truth_vector.freshness,
+                        corroboration=truth_vector.corroboration,
                         timestamp=datetime.utcnow(),
                         source="recall",
                         memory_type=payload.get("type", "fact"),
                     )
                 )
 
-        # Sort by truth score
         memories.sort(key=lambda m: m.truth_score, reverse=True)
 
         return RecallResult(memories=memories[:top_k], query=query, total_found=len(memories))
@@ -678,12 +945,20 @@ class MemoryClient:
             state = self._memories[entity_id]
             state.truth_vector.freshness = 0.0
 
-            # Update in Qdrant
             if self._qdrant:
                 try:
                     self._qdrant.client.delete(
                         collection_name=self._collection_name, points_selector=[str(entity_id)]
                     )
+                except Exception:
+                    pass
+
+            if self._pg:
+                try:
+                    with self._pg.get_cursor() as cur:
+                        cur.execute(
+                            "DELETE FROM entity_state WHERE entity_id = %s", (str(entity_id),)
+                        )
                 except Exception:
                     pass
 
@@ -725,6 +1000,67 @@ class MemoryClient:
         except Exception as e:
             log.warning(f"Failed to load from DB: {e}")
 
+        # Load shared project memories from .mt/ folder if it exists
+        self._load_shared_memories()
+
+        return count
+
+    def _load_shared_memories(self) -> int:
+        """Load shared project memories from .mt/ folder in git repo root."""
+        from pathlib import Path
+        from memory_thread.config.settings import settings
+
+        # Find git repo root
+        current = Path.cwd()
+        git_root = None
+        for parent in [current] + list(current.parents):
+            if (parent / ".git").exists():
+                git_root = parent
+                break
+            if parent == parent.parent:
+                break
+
+        if not git_root:
+            return 0
+
+        # Check for .mt/ folder in git root
+        mt_dir = git_root / settings.MT_PROJECT_DIR
+        shared_memories_file = mt_dir / "shared_memories.json"
+
+        if not shared_memories_file.exists():
+            return 0
+
+        count = 0
+        try:
+            with open(shared_memories_file) as f:
+                shared_data = json.load(f)
+
+            from memory_thread.config.settings import settings
+
+            for mem_data in shared_data.get("memories", []):
+                entity_id = uuid.UUID(mem_data["entity_id"])
+                current_value = mem_data.get("current_value", {})
+                tv_data = mem_data.get("truth_vector", {})
+
+                # Apply authority weight for shared memories
+                source_authority = tv_data.get("authority", 0.5)
+                tv_data["authority"] = source_authority * 0.9
+
+                state = EntityState(
+                    entity_id=entity_id,
+                    namespace="shared",
+                    current_value=current_value,
+                    truth_vector=TruthVector(**tv_data),
+                    last_event_id=uuid.uuid4(),
+                )
+                self._global_memories[entity_id] = state
+                count += 1
+
+            log.info(f"Loaded {count} shared memories from {shared_memories_file}")
+
+        except Exception as e:
+            log.warning(f"Failed to load shared memories: {e}")
+
         return count
 
     def get_stats(self) -> Dict[str, Any]:
@@ -760,6 +1096,7 @@ class MemoryClient:
     ) -> Dict[str, Any]:
         """
         Check if new content contradicts existing memories.
+        Delegates to MetaStabilityService.check_contradiction.
 
         Returns:
             Dict with 'has_contradiction', 'conflicting_memory', 'explanation'
@@ -769,10 +1106,8 @@ class MemoryClient:
 
             meta = MetaStabilityService()
 
-            # If entity_id provided, check specific entity
             if entity_id and entity_id in self._memories:
                 state = self._memories[entity_id]
-                # Extract key-value pairs from content
                 new_delta = {"content": content}
                 has_conflict = meta.check_contradiction(state, new_delta)
 
@@ -784,25 +1119,15 @@ class MemoryClient:
                         "explanation": "Direct value conflict detected",
                     }
 
-            # Check all memories for semantic contradiction
-            # Simple approach: look for opposite sentiments
-            content_lower = content.lower()
             for eid, state in self._memories.items():
-                existing = state.current_value.get("content", "").lower()
-
-                # Simple contradiction patterns
-                if "not " in content_lower or "don't" in content_lower or "hate" in content_lower:
-                    # Check if existing says opposite
-                    for neg, pos in [("hate", "like"), ("don't", ""), ("not", "")]:
-                        if neg in content_lower:
-                            positive_version = content_lower.replace(neg, pos).strip()
-                            if positive_version in existing or existing in positive_version:
-                                return {
-                                    "has_contradiction": True,
-                                    "conflicting_memory": state.current_value.get("content", ""),
-                                    "entity_id": str(eid),
-                                    "explanation": f"Sentiment conflict: '{content}' vs '{existing}'",
-                                }
+                new_delta = {"content": content}
+                if meta.check_contradiction(state, new_delta):
+                    return {
+                        "has_contradiction": True,
+                        "conflicting_memory": state.current_value.get("content", ""),
+                        "entity_id": str(eid),
+                        "explanation": "Contradiction detected via MetaStabilityService",
+                    }
 
             return {"has_contradiction": False}
 
@@ -812,20 +1137,20 @@ class MemoryClient:
 
     def apply_decay(self, decay_rate: float = 0.01) -> int:
         """
-        Apply decay to all memories (reduce freshness over time).
+        Apply decay to all memories using TruthVectorService.decay_freshness.
 
         Returns number of memories affected.
         """
         try:
-            from memory_thread.services.decay_engine import DecayEngine
-
-            engine = DecayEngine()
+            from memory_thread.services.tms_service import TruthVectorService
 
             affected = 0
             for entity_id, state in self._memories.items():
-                old_freshness = state.truth_vector.freshness
-                # Exponential decay
-                state.truth_vector.freshness *= 1 - decay_rate
+                memory_type = state.current_value.get("type", "fact")
+                event_time = state.updated_at
+                state.truth_vector.freshness = TruthVectorService.decay_freshness(
+                    state.truth_vector, event_time, memory_type
+                )
                 affected += 1
 
             log.info(f"Decay applied to {affected} memories")
@@ -833,7 +1158,6 @@ class MemoryClient:
 
         except Exception as e:
             log.warning(f"Decay failed: {e}")
-            # Fallback: simple decay
             for state in self._memories.values():
                 state.truth_vector.freshness *= 1 - decay_rate
             return len(self._memories)
@@ -964,10 +1288,12 @@ class MemoryClient:
             if entity_id and entity_id in self._memories:
                 return service.take_snapshot(self._memories[entity_id])
             elif not entity_id:
-                # Snapshot most important entity
                 if self._memories:
-                    first_entity = next(iter(self._memories.values()))
-                    return service.take_snapshot(first_entity)
+                    best_entity = max(
+                        self._memories.values(),
+                        key=lambda s: TruthVectorService.calculate_score(s.truth_vector),
+                    )
+                    return service.take_snapshot(best_entity)
             return None
 
         except Exception as e:
@@ -1124,10 +1450,7 @@ class MemoryClient:
         Returns:
             LLM response with memory context
         """
-        # 1. Auto-extract and store from user message
-        self.remember(user_message, source="user")
-
-        # 2. Check for contradictions
+        # 1. Check for contradictions first
         contradiction = self.check_contradiction(user_message)
         contradiction_note = ""
         if contradiction.get("has_contradiction"):
@@ -1135,12 +1458,16 @@ class MemoryClient:
                 f"\n[Note: User previously said: {contradiction.get('conflicting_memory', '')}]"
             )
 
-        # 3. Semantic recall from Qdrant — finds relevant code chunks, facts, etc.
+        # 2. Semantic recall from Qdrant — finds relevant code chunks, facts, etc.
         context = self.get_context_for_llm(
             query=user_message,
             max_tokens=1000,  # ~4000 chars — enough for code context
             include_scores=True,
         )
+
+        # 3. Store the message only after confirming it's worth storing
+        if not contradiction.get("has_contradiction"):
+            self.remember(user_message, source="user")
 
         # 4. Build prompt
         default_system = """You are a helpful assistant with deep memory about the user's codebase and documents.

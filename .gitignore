@@ -20,3 +20,10 @@ tests/phase5_ordeal_v2/
 vault.json
 audit_ledger.jsonl
 authority_grants.jsonl
+
+# Qdrant (external dependency)
+qdrant/
+qdrant.exe
+
+# Windows reserved names
+nul

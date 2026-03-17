@@ -1,40 +1,66 @@
 """
 Embedding utilities for Memory Thread.
 
-Uses mock embeddings by default (fast, works offline).
-For semantic search, download model once while online:
-  huggingface-cli download sentence-transformers/all-MiniLM-L6-v2
+Uses sentence-transformers for semantic embeddings.
+Falls back to mock embeddings if model unavailable.
 """
-
-import os
-
-os.environ["HF_HUB_OFFLINE"] = "1"
-os.environ["TRANSFORMERS_OFFLINE"] = "1"
 
 from typing import List, Tuple, Optional
 from functools import lru_cache
 import logging
+import concurrent.futures
 
-log = logging.getLogger(__name__)
+from memory_thread.utils.logger import get_logger
 
-# Default dimension (matches common models)
+log = get_logger(__name__)
+
 EMBEDDING_DIMENSION = 384
 
-# Cached model - set to "loaded" to use real model
-_model_loaded = False
+_model = None
+
+
+def get_model():
+    """Lazy load the sentence transformer model."""
+    global _model
+    if _model is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+
+            _model = SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
+            log.info("Loaded sentence transformer model")
+        except Exception as e:
+            log.warning(f"Could not load sentence transformer: {e}")
+            _model = False
+    return _model if _model else None
 
 
 @lru_cache(maxsize=512)
 def generate_embeddings(texts: Tuple[str, ...]) -> List[List[float]]:
     """
     Generate embeddings for texts.
-
-    Uses mock (hash-based) embeddings by default.
-    For real semantic embeddings, download the model first:
-      pip install sentence-transformers
-      # Then first run while online will cache it
+    Tries real model first, falls back to mock on failure.
     """
+    model = get_model()
+    if model:
+        try:
+            return model.encode(list(texts)).tolist()
+        except Exception as e:
+            log.warning(f"Real embedding failed: {e}")
     return _mock_embeddings(texts)
+
+
+def generate_embeddings_async(texts: Tuple[str, ...]) -> List[List[float]]:
+    """Generate embeddings in a thread pool to avoid blocking."""
+    model = get_model()
+    if model:
+        try:
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future = executor.submit(model.encode, list(texts))
+                return future.result().tolist()
+        except Exception as e:
+            log.warning(f"Real embedding failed: {e}")
+
+    return generate_embeddings(texts)
 
 
 def _mock_embeddings(texts: Tuple[str, ...]) -> List[List[float]]:

@@ -13,6 +13,7 @@ from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 log = logging.getLogger(__name__)
 
+
 class IdentityService:
     def __init__(self):
         self.pg = PostgresClient()
@@ -30,47 +31,55 @@ class IdentityService:
             self.qdrant.client.create_collection(
                 collection_name=self.collection_name,
                 vectors_config={
-                    "size": settings.EMBEDDING_DIMENSION, 
-                    "distance": settings.EMBEDDING_DISTANCE
-                }
+                    "size": settings.EMBEDDING_DIMENSION,
+                    "distance": settings.EMBEDDING_DISTANCE,
+                },
             )
 
     def create_entity(self, name: str, entity_type: str, attributes: Dict = {}) -> Entity:
         """
         Creates a new entity in Postgres and indexes it in Qdrant.
         """
-        entity = Entity(
-            name=name,
-            entity_type=entity_type,
-            attributes=attributes
-        )
+        entity = Entity(name=name, entity_type=entity_type, attributes=attributes)
 
         # 1. Postgres Insert
         with self.pg.get_cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO entities (id, namespace, entity_type, name, attributes, created_at, updated_at)
                 VALUES (%s, %s, %s, %s, %s, %s, %s)
-            """, (
-                str(entity.id), entity.namespace, entity.entity_type, entity.name,
-                json.dumps(entity.attributes), entity.created_at, entity.updated_at
-            ))
+            """,
+                (
+                    str(entity.id),
+                    entity.namespace,
+                    entity.entity_type,
+                    entity.name,
+                    json.dumps(entity.attributes),
+                    entity.created_at,
+                    entity.updated_at,
+                ),
+            )
 
         # 2. Embedding & Qdrant Upsert
         # We embed "name: type attributes" for identification
         text_representation = f"{entity.name}: {entity.entity_type} {json.dumps(entity.attributes)}"
         embedding = generate_embeddings(tuple([text_representation]))[0]
 
+        from qdrant_client.models import PointStruct
+
         self.qdrant.client.upsert(
             collection_name=self.collection_name,
-            points=[{
-                "id": str(entity.id),
-                "vector": embedding,
-                "payload": {
-                    "entity_type": entity.entity_type,
-                    "name": entity.name,
-                    "namespace": entity.namespace
-                }
-            }]
+            points=[
+                PointStruct(
+                    id=str(entity.id),
+                    vector=embedding,
+                    payload={
+                        "entity_type": entity.entity_type,
+                        "name": entity.name,
+                        "namespace": entity.namespace,
+                    },
+                )
+            ],
         )
 
         return entity
@@ -88,23 +97,38 @@ class IdentityService:
 
         return [
             Entity(
-                id=row[0], namespace=row[1], entity_type=row[2], name=row[3],
-                attributes=row[4], created_at=row[5], updated_at=row[6], merged_into=row[7]
+                id=row[0],
+                namespace=row[1],
+                entity_type=row[2],
+                name=row[3],
+                attributes=row[4],
+                created_at=row[5],
+                updated_at=row[6],
+                merged_into=row[7],
             )
             for row in rows
         ]
 
     def get_entity(self, entity_id: uuid.UUID) -> Optional[Entity]:
         with self.pg.get_cursor() as cur:
-            cur.execute("SELECT id, namespace, entity_type, name, attributes, created_at, updated_at, merged_into FROM entities WHERE id = %s", (str(entity_id),))
+            cur.execute(
+                "SELECT id, namespace, entity_type, name, attributes, created_at, updated_at, merged_into FROM entities WHERE id = %s",
+                (str(entity_id),),
+            )
             row = cur.fetchone()
 
         if not row:
             return None
 
         return Entity(
-            id=row[0], namespace=row[1], entity_type=row[2], name=row[3],
-            attributes=row[4], created_at=row[5], updated_at=row[6], merged_into=row[7]
+            id=row[0],
+            namespace=row[1],
+            entity_type=row[2],
+            name=row[3],
+            attributes=row[4],
+            created_at=row[5],
+            updated_at=row[6],
+            merged_into=row[7],
         )
 
     def scan_duplicates(self, entity_type: str, threshold: float = 0.95) -> List[MergeProposal]:
@@ -125,9 +149,7 @@ class IdentityService:
 
             try:
                 points = self.qdrant.client.retrieve(
-                    collection_name=self.collection_name,
-                    ids=[str(entity.id)],
-                    with_vectors=True
+                    collection_name=self.collection_name, ids=[str(entity.id)], with_vectors=True
                 )
                 if not points:
                     continue
@@ -137,18 +159,20 @@ class IdentityService:
                 continue
 
             # Search for similar
-            search_result = self.qdrant.client.search(
+            from qdrant_client.models import Filter, FieldCondition, MatchValue
+
+            search_result = self.qdrant.client.query_points(
                 collection_name=self.collection_name,
-                query_vector=vector,
+                query=vector,
                 query_filter=Filter(
                     must=[
                         FieldCondition(key="entity_type", match=MatchValue(value=entity_type)),
-                        # Ideally filter out self, but Qdrant returns self.
                     ]
                 ),
                 score_threshold=threshold,
-                limit=5
+                limit=5,
             )
+            search_result = search_result.points
 
             for hit in search_result:
                 target_id = uuid.UUID(hit.id)
@@ -161,7 +185,7 @@ class IdentityService:
                 # Found a potential duplicate
                 target_entity = self.get_entity(target_id)
                 if not target_entity or target_entity.merged_into:
-                    continue # Already merged or missing
+                    continue  # Already merged or missing
 
                 # Fuzzy string check as secondary signal (simple contains/Levenshtein could go here)
                 # For now, rely on vector score + string match boost
@@ -179,14 +203,13 @@ class IdentityService:
                     src, tgt = target_entity, entity
 
                 proposal = MergeProposal(
-                    source_entity=src,
-                    target_entity=tgt,
-                    confidence=hit.score,
-                    reason=reason
+                    source_entity=src, target_entity=tgt, confidence=hit.score, reason=reason
                 )
                 proposals.append(proposal)
                 processed_ids.add(src.id)
-                processed_ids.add(tgt.id) # Mark both as processed for this pass to avoid duplicate pairs
+                processed_ids.add(
+                    tgt.id
+                )  # Mark both as processed for this pass to avoid duplicate pairs
 
         return proposals
 
@@ -197,29 +220,34 @@ class IdentityService:
         """
         # 1. Update Source Entity
         with self.pg.get_cursor() as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 UPDATE entities
                 SET merged_into = %s, updated_at = NOW()
                 WHERE id = %s
-            """, (str(proposal.target_entity.id), str(proposal.source_entity.id)))
+            """,
+                (str(proposal.target_entity.id), str(proposal.source_entity.id)),
+            )
 
             # 2. Log Merge
-            cur.execute("""
+            cur.execute(
+                """
                 INSERT INTO entity_merges (source_entity_id, target_entity_id, confidence, reason)
                 VALUES (%s, %s, %s, %s)
-            """, (
-                str(proposal.source_entity.id),
-                str(proposal.target_entity.id),
-                proposal.confidence,
-                proposal.reason
-            ))
+            """,
+                (
+                    str(proposal.source_entity.id),
+                    str(proposal.target_entity.id),
+                    proposal.confidence,
+                    proposal.reason,
+                ),
+            )
 
         # 3. Update Qdrant?
         # We might want to remove the source from search results or mark it.
         # Simplest: Delete source from Qdrant 'entities' collection so it's not found in future scans.
         self.qdrant.client.delete(
-            collection_name=self.collection_name,
-            points_selector=[str(proposal.source_entity.id)]
+            collection_name=self.collection_name, points_selector=[str(proposal.source_entity.id)]
         )
 
         log.info(f"Merged {proposal.source_entity.name} into {proposal.target_entity.name}")

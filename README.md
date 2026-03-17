@@ -60,22 +60,30 @@ pip install -e .
 mt serve
 ```
 
-### Option 3: Python API
+### Option 3: Python API (Recommended)
 
 ```python
 from memory_thread.sdk import MemoryClient
 
-# Fast init (no DB connections)
-mt = MemoryClient(namespace="my_app", use_db=False)
+# Connect using connection string (connects to local server by default)
+mt = MemoryClient.connect("mt://localhost:8000/my-project")
+
+# Or use environment variable MT_URL
+# mt = MemoryClient.connect_from_env()
 
 # Store memories with truth metadata
-mt.remember("User prefers dark mode", confidence=0.9, source="observation")
+mt.remember("User prefers dark mode", confidence=0.9, source="user")
 mt.remember("Project deadline is Friday", confidence=1.0, source="user")
 
 # Chat with memory context using cloud LLM
 response = mt.chat("What are my preferences?", provider="groq")
 print(response)
 ```
+
+**Connection String Format:**
+- `mt://localhost:8000/default` - Local server, default namespace
+- `mt://localhost:8000/my-project` - Local server, custom namespace
+- `mt://api.memorythread.io/org/project?api_key=sk-xxx` - Cloud server with auth
 
 ---
 
@@ -265,6 +273,114 @@ Every memory has a truth vector:
 ```python
 # Query with truth filtering
 results = mt.recall("user preferences", min_truth_score=0.5)
+```
+
+---
+
+## Timewarp
+
+Memory Thread supports **temporal repair** through its Timewarp engine. When a late event arrives (e.g., backdated information), Timewarp:
+
+1. Inserts the late event into the event log
+2. Recomputes entity state from the nearest snapshot or from scratch
+3. Compares new state to old and flags significant deltas
+4. Updates the entity state in a single transaction
+
+```python
+from memory_thread.services.timewarp_engine import TimewarpEngine
+
+engine = TimewarpEngine()
+result = engine.insert_late_event(late_event)
+```
+
+This ensures the timeline remains consistent even with out-of-order events.
+
+---
+
+## Contemplator
+
+The **Contemplator** is MT's self-observation engine. It runs periodic reflections to:
+
+- Assess memory health (truth score distribution)
+- Detect conflicts across agent beliefs
+- Identify access anomalies
+- Find stale domains (low freshness)
+- Recommend consolidation candidates
+
+```python
+from memory_thread.services.contemplator import Contemplator
+
+contemplator = Contemplator(auto_start=True)  # Runs daily automatically
+reflection = contemplator.daily_reflection()
+summary = contemplator.generate_insight_summary()
+print(summary)
+```
+
+The Contemplator persists insights to the `insights_log` table and loads previous reflections on startup.
+
+---
+
+## Replay
+
+Memory Thread supports **event replay** for state reconstruction:
+
+1. **Snapshot Service** - Creates checkpoints of entity state
+2. **Replay Service** - Rebuilds state from snapshots + subsequent events
+3. **Timewarp Integration** - Uses nearest snapshot to optimize replay
+
+```python
+from memory_thread.services.replay_service import ReplayService
+from memory_thread.services.snapshot_service import SnapshotService
+
+replay = ReplayService()
+snapshot = SnapshotService()
+
+# Create a checkpoint
+snap_id = snapshot.take_snapshot(entity_state)
+
+# Rebuild from snapshot
+rebuilt = replay.replay_from_snapshot(entity_id, snap_id.timestamp)
+```
+
+---
+
+## Golden Thread
+
+The **Golden Thread** is Memory Thread's audit trail - a chronological record of all state changes that can reconstruct the entire history of any entity. It combines:
+
+- **Event Sourcing**: Every change is an event
+- **WAL (Write-Ahead Log)**: Crash-safe persistence
+- **Audit Ledger**: Immutable record of access and modifications
+
+```python
+from memory_thread.nervous.audit_ledger import AuditLedger
+
+ledger = AuditLedger()
+entries = ledger.query(entity_id=my_entity, limit=100)
+
+for entry in entries:
+    print(f"{entry.timestamp}: {entry.action} by {entry.actor}")
+```
+
+The Golden Thread ensures traceability and enables debugging, compliance, and state recovery.
+
+---
+
+## External Dependencies
+
+Memory Thread requires the following external services:
+
+- **PostgreSQL** - Event storage and entity state
+- **Qdrant** - Vector similarity search (optional, falls back to keyword)
+
+Qdrant can be installed separately:
+```bash
+# Download Qdrant
+curl -L https://get.qdrant.io -o qdrant.sh
+bash qdrant.sh
+
+# Or use Docker
+docker run -p 6333:6333 qdrant/qdrant
 ```
 
 ---

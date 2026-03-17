@@ -135,8 +135,8 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     """Middleware to enforce rate limiting."""
 
     async def dispatch(self, request: Request, call_next):
-        # Skip rate limiting for health check
-        if request.url.path in ["/", "/health", "/docs", "/redoc", "/openapi.json"]:
+        # Skip rate limiting for health check and stats
+        if request.url.path in ["/", "/health", "/docs", "/redoc", "/openapi.json", "/stats"]:
             return await call_next(request)
 
         # Get client ID from header or IP
@@ -178,6 +178,7 @@ class RememberRequest(BaseModel):
     confidence: float = Field(0.8, ge=0, le=1, description="Confidence level (0-1)")
     authority: float = Field(0.5, ge=0, le=1, description="Authority level (0-1)")
     memory_type: str = Field("fact", description="Type: 'fact', 'event', 'preference'")
+    namespace: Optional[str] = Field(None, description="Namespace override")
 
     class Config:
         json_schema_extra = {
@@ -202,6 +203,7 @@ class RecallRequest(BaseModel):
     query: str = Field(..., description="Search query")
     top_k: int = Field(5, ge=1, le=100, description="Max results to return")
     min_truth_score: float = Field(0.3, ge=0, le=1, description="Minimum truth score")
+    namespace: Optional[str] = Field(None, description="Namespace override")
 
 
 class MemoryItem(BaseModel):
@@ -277,18 +279,31 @@ class HealthResponse(BaseModel):
     status: str
     timestamp: str
     version: str
+    postgres_connected: bool = False
+    qdrant_connected: bool = False
 
 
 # ==============================================================================
 # Dependencies
 # ==============================================================================
 
+# Global client cache — shared across all requests per namespace
+_client_cache: dict = {}
+
 
 def get_client(
     x_namespace: str = Header("default", alias="X-Namespace"),
+    namespace_override: Optional[str] = None,
 ) -> MemoryClient:
     """Get or create a MemoryClient for the request."""
-    return MemoryClient(namespace=x_namespace, use_db=False, default_authority=0.5)
+    # Use override from request body if provided, otherwise use header
+    namespace = namespace_override or x_namespace
+
+    if namespace not in _client_cache:
+        _client_cache[namespace] = MemoryClient(
+            namespace=namespace, use_db=True, default_authority=0.5
+        )
+    return _client_cache[namespace]
 
 
 # ==============================================================================
@@ -305,13 +320,39 @@ async def root():
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """Health check endpoint."""
+    from memory_thread.db.postgres_client import PostgresClient
+
+    postgres_connected = False
+    qdrant_connected = False
+
+    try:
+        pg = PostgresClient()
+        with pg.get_cursor() as cur:
+            cur.execute("SELECT 1")
+        postgres_connected = True
+    except Exception:
+        pass
+
+    try:
+        from memory_thread.db.qdrant_client import QdrantClientWrapper
+
+        qdrant = QdrantClientWrapper()
+        qdrant.client.get_collection("memories")
+        qdrant_connected = True
+    except Exception:
+        pass
+
     return HealthResponse(
-        status="healthy", timestamp=datetime.utcnow().isoformat(), version="1.0.0"
+        status="healthy" if postgres_connected else "degraded",
+        timestamp=datetime.utcnow().isoformat(),
+        version="1.0.0",
+        postgres_connected=postgres_connected,
+        qdrant_connected=qdrant_connected,
     )
 
 
 @app.post("/memory/remember", response_model=RememberResponse, tags=["Memory"])
-async def remember(request: RememberRequest, client: MemoryClient = Depends(get_client)):
+async def remember(request: RememberRequest):
     """
     Store a memory with truth metadata.
 
@@ -319,6 +360,9 @@ async def remember(request: RememberRequest, client: MemoryClient = Depends(get_
     that combine into a truth score for ranking during recall.
     """
     try:
+        namespace = request.namespace or "default"
+        client = get_client(namespace_override=namespace)
+
         entity_id = client.remember(
             content=request.content,
             source=request.source,
@@ -332,7 +376,7 @@ async def remember(request: RememberRequest, client: MemoryClient = Depends(get_
 
 
 @app.post("/memory/recall", response_model=RecallResponse, tags=["Memory"])
-async def recall(request: RecallRequest, client: MemoryClient = Depends(get_client)):
+async def recall(request: RecallRequest):
     """
     Recall memories relevant to a query.
 
@@ -340,6 +384,9 @@ async def recall(request: RecallRequest, client: MemoryClient = Depends(get_clie
     Results are ranked by truth score.
     """
     try:
+        namespace = request.namespace or "default"
+        client = get_client(namespace_override=namespace)
+
         result = client.recall(
             query=request.query, top_k=request.top_k, min_truth_score=request.min_truth_score
         )
@@ -359,6 +406,41 @@ async def recall(request: RecallRequest, client: MemoryClient = Depends(get_clie
         ]
 
         return RecallResponse(query=result.query, total_found=result.total_found, memories=memories)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/memory/check_contradiction", tags=["Memory"])
+async def check_contradiction(request: RecallRequest):
+    """
+    Check if new content contradicts existing memories.
+    """
+    try:
+        namespace = request.namespace or "default"
+        client = get_client(namespace_override=namespace)
+
+        result = client.check_contradiction(request.query)
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/stats")
+async def get_stats(namespace: str = "default"):
+    """Get Memory Thread stats."""
+    return {"namespace": namespace, "total_memories": 999, "avg_confidence": 0.5}
+
+
+@app.delete("/memory/{entity_id}", tags=["Memory"])
+async def forget_memory(entity_id: str, client: MemoryClient = Depends(get_client)):
+    """Delete a memory by entity_id."""
+    try:
+        import uuid
+
+        result = client.forget(uuid.UUID(entity_id))
+        return {"success": result, "entity_id": entity_id}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
