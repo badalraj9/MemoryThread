@@ -176,7 +176,7 @@ class MemoryChat(App):
     }}
 
     #user-message {{
-        align: right;
+        align: right top;
         background: {COLORS["accent"]};
         color: {COLORS["bg"]};
         padding: 0 1;
@@ -184,14 +184,14 @@ class MemoryChat(App):
     }}
 
     #mt-message {{
-        align: left;
+        align: left top;
         background: {COLORS["panel"]};
         padding: 0 1;
         width: 90%;
     }}
 
     #system-message {{
-        align: center;
+        align: center top;
         color: {COLORS["warning"]};
         text-style: italic;
     }}
