@@ -170,9 +170,9 @@ class MemoryClient:
         try:
             from memory_thread.utils.embeddings import generate_embeddings
             return generate_embeddings(tuple([text]))[0]
-        except ImportError:
+        except ImportError as e:
             # sentence-transformers not installed
-            log.debug("sentence-transformers not installed, using zero vector")
+            log.warning(f"sentence-transformers failed: {e}")
             return [0.0] * settings.EMBEDDING_DIMENSION
         except Exception as e:
             # Return zeros if embedding fails
@@ -188,8 +188,8 @@ class MemoryClient:
         try:
             from memory_thread.services.hybrid_ner_service import extract_entities
             return extract_entities(text)
-        except ImportError:
-            log.warning("hybrid_ner_service not available, skipping entity extraction")
+        except ImportError as e:
+            log.warning(f"hybrid_ner_service not available (ImportError: {e}), skipping entity extraction")
             return []
         except Exception as e:
             log.warning(f"Entity extraction failed: {e}")
@@ -439,6 +439,9 @@ class MemoryClient:
     def _persist_to_postgres(self, entity_id: uuid.UUID, content: str, 
                               memory_type: str, state: EntityState, event: Event):
         """Persist memory to PostgreSQL."""
+        # Ensure event is persisted first to satisfy foreign key constraint
+        self.tms.persist_event(event)
+
         with self._pg.get_cursor() as cur:
             # Upsert into memories table (or entity_state)
             cur.execute("""
@@ -1130,11 +1133,13 @@ Assistant:"""
 
         # Check explicit env override first
         env_provider = os.environ.get("MT_PROVIDER")
-        if env_provider:
+        if env_provider and env_provider != "auto":
             active_provider = env_provider.lower()
+            log.info(f"Using provider from ENV: {active_provider}")
         else:
             # Ensure we respect the vault's setting (which includes env vars now)
             active_provider = vault.get_active_provider(user_id)
+            log.info(f"Using provider from Vault: {active_provider}")
 
 
         log.debug(f"Chat request - Provider: {active_provider}, User: {user_id}")
@@ -1295,6 +1300,8 @@ Assistant:"""
                 creds = vault.get_provider("groq", user_id)
                 key = creds.get("api_key") if creds else os.environ.get("GROQ_API_KEY")
                 model = creds.get("model") if creds else os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+                log.info(f"Groq API Key Check: Vault={'Found' if creds else 'Missing'}, Env={'Found' if os.environ.get('GROQ_API_KEY') else 'Missing'}")
 
                 if key:
                     log.info(f"Using Groq ({model})")

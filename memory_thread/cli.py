@@ -33,6 +33,9 @@ from rich.table import Table
 from rich.panel import Panel
 from rich.text import Text
 from rich import print as rprint
+from dotenv import load_dotenv
+
+load_dotenv()
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # WINDOWS UTF-8 FIX — no more Wakandan runes
@@ -215,6 +218,26 @@ def _enter_chat():
         if raw.lower() in ("/quit", "/exit", "quit", "exit"):
             console.print("[dim]Goodbye.[/dim]")
             break
+
+        # Slash commands (e.g., /provider use groq)
+        if raw.startswith("/"):
+            import shlex
+            import subprocess
+            try:
+                args = shlex.split(raw[1:])
+                if not args:
+                    continue
+
+                # Construct command to invoke same entry point
+                cmd_args = [sys.executable, sys.argv[0]] if sys.argv[0].endswith(".py") else [sys.argv[0]]
+                cmd_args.extend(args)
+
+                subprocess.run(cmd_args)
+                console.print()
+                continue
+            except Exception as e:
+                console.print(f"[red]Command failed: {e}[/red]")
+                continue
 
         # Chat handles EVERYTHING: remember, extract, contradict, respond
         try:

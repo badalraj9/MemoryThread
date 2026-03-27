@@ -48,11 +48,21 @@ class QdrantClientWrapper:
     def search(self, collection_name: str, query_vector: List[float], limit: int = 5) -> List[Any]:
         """Search for similar vectors."""
         try:
-            return self.client.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                limit=limit
-            )
+            # Fallback for deprecated 'search' if needed, or use 'query_points' for future compat
+            if hasattr(self.client, "search"):
+                return self.client.search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    limit=limit
+                )
+            elif hasattr(self.client, "query_points"):
+                return self.client.query_points(
+                    collection_name=collection_name,
+                    query=query_vector,
+                    limit=limit
+                ).points
+            else:
+                raise AttributeError("QdrantClient has no search method")
         except Exception as e:
             from memory_thread.utils.logger import get_logger
             log = get_logger(__name__)
