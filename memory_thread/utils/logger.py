@@ -4,11 +4,8 @@ Structured Logging for Memory Thread.
 Provides JSON-formatted logs with context binding for observability.
 Supports both structlog and stdlib logging for compatibility.
 
-Usage:
-    from memory_thread.utils.logger import get_logger
-    
-    log = get_logger(__name__)
-    log.info("Processing memory", memory_id=uuid, namespace="default")
+By default, logs to 'memory_thread.log' to keep the terminal clean.
+Console output is restricted to warnings/errors unless MT_DEBUG is set.
 """
 import logging
 import sys
@@ -16,6 +13,7 @@ import os
 from typing import Any, Dict, Optional
 from contextvars import ContextVar
 from datetime import datetime
+from logging.handlers import RotatingFileHandler
 
 # Try to use structlog if available, fallback to json logger
 try:
@@ -24,7 +22,10 @@ try:
 except ImportError:
     STRUCTLOG_AVAILABLE = False
 
-from pythonjsonlogger import jsonlogger
+try:
+    from pythonjsonlogger import jsonlogger
+except ImportError:
+    jsonlogger = None
 
 # Context variables for request-scoped data
 _request_id: ContextVar[Optional[str]] = ContextVar("request_id", default=None)
@@ -53,7 +54,7 @@ def clear_context():
     _user_id.set(None)
 
 
-class ContextAwareFormatter(jsonlogger.JsonFormatter):
+class ContextAwareFormatter(jsonlogger.JsonFormatter if jsonlogger else logging.Formatter):
     """JSON formatter that includes context variables."""
     
     def add_fields(self, log_record: Dict[str, Any], record: logging.LogRecord, message_dict: Dict[str, Any]):
@@ -72,70 +73,52 @@ class ContextAwareFormatter(jsonlogger.JsonFormatter):
         log_record["timestamp"] = datetime.utcnow().isoformat() + "Z"
 
 
-def _configure_structlog():
-    """Configure structlog with appropriate processors."""
-    if not STRUCTLOG_AVAILABLE:
-        return
-    
-    structlog.configure(
-        processors=[
-            structlog.contextvars.merge_contextvars,
-            structlog.processors.add_log_level,
-            structlog.processors.TimeStamper(fmt="iso", utc=True),
-            structlog.processors.StackInfoRenderer(),
-            structlog.processors.format_exc_info,
-            structlog.processors.JSONRenderer()
-        ],
-        wrapper_class=structlog.make_filtering_bound_logger(logging.INFO),
-        context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(),
-        cache_logger_on_first_use=True
-    )
-
-
-# Configure on module load
-_configured = False
-
-
-def get_logger(name: str, use_structlog: bool = False):
+def get_logger(name: str):
     """
     Get a configured logger instance.
     
-    Args:
-        name: Logger name (typically __name__)
-        use_structlog: If True and available, return structlog logger
-        
-    Returns:
-        Configured logger with JSON formatting and context awareness
+    Logs to 'memory_thread.log' (JSON) and Console (Human-readable WARNING+).
     """
-    global _configured
-    
-    if use_structlog and STRUCTLOG_AVAILABLE:
-        if not _configured:
-            _configure_structlog()
-            _configured = True
-        return structlog.get_logger(name)
-    
-    # Standard library logger with JSON formatting
     logger = logging.getLogger(name)
     
-    if not logger.handlers:
-        handler = logging.StreamHandler(sys.stdout)
+    # If already configured, return it
+    if logger.handlers:
+        return logger
+    
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+
+    # 1. File Handler (JSON, Debug info) - Always active
+    file_handler = RotatingFileHandler("memory_thread.log", maxBytes=5*1024*1024, backupCount=3)
+    file_handler.setLevel(logging.INFO)
+    
+    if jsonlogger:
         formatter = ContextAwareFormatter(
             "%(asctime)s %(name)s %(levelname)s %(message)s"
         )
-        handler.setFormatter(formatter)
-        logger.addHandler(handler)
+        file_handler.setFormatter(formatter)
+    else:
+        file_handler.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+        ))
     
-    # Set level from env var or default
-    level = os.environ.get("LOG_LEVEL", "INFO").upper()
-    logger.setLevel(getattr(logging, level, logging.INFO))
-    logger.propagate = False
+    logger.addHandler(file_handler)
+
+    # 2. Console Handler (Human-readable, Warnings only) - For user visibility
+    # If MT_DEBUG is set, show INFO logs to console too
+    console_level = logging.INFO if os.environ.get("MT_DEBUG") else logging.WARNING
+
+    console_handler = logging.StreamHandler(sys.stderr)
+    console_handler.setLevel(console_level)
+    console_handler.setFormatter(logging.Formatter(
+        "[%(levelname)s] %(message)s"  # Simple format for terminal
+    ))
+
+    logger.addHandler(console_handler)
     
     return logger
 
 
-# Convenience function for operation logging
 def log_operation(
     logger,
     operation: str,
@@ -145,13 +128,6 @@ def log_operation(
 ):
     """
     Log an operation with standardized fields.
-    
-    Args:
-        logger: Logger instance
-        operation: Operation name (e.g., "remember", "recall")
-        status: Status (e.g., "started", "completed", "failed")
-        duration_ms: Optional duration in milliseconds
-        **kwargs: Additional context
     """
     extra = {
         "operation": operation,
@@ -165,4 +141,3 @@ def log_operation(
         logger.error(f"{operation} {status}", extra=extra)
     else:
         logger.info(f"{operation} {status}", extra=extra)
-

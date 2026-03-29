@@ -11,6 +11,7 @@ from textual.containers import Vertical
 from textual.binding import Binding
 import shlex
 import os
+import requests
 
 
 class MTShell(App):
@@ -135,6 +136,7 @@ class MTShell(App):
             
             # Get context and generate response
             try:
+                # Chat automatically selects Ollama via vault now
                 response = client.chat(message, use_local=True)
             except Exception:
                 # Fallback if chat fails
@@ -192,6 +194,7 @@ class MTShell(App):
             "stream": self._cmd_stream,
             "galaxy": self._cmd_galaxy,
             "provider": self._cmd_provider,
+            "ollama": self._cmd_ollama,
             "secure": self._cmd_secure,
             "quit": self._cmd_quit,
             "exit": self._cmd_quit,
@@ -263,6 +266,10 @@ GALAXY:
   /agent list                     List agents
   /agent use <name>               Switch agent
   /conflicts                      Show conflicts
+
+OLLAMA:
+  /ollama scan        List local models
+  /ollama use <model> Switch to model
 
 /quit                Exit shell"""
 
@@ -673,6 +680,47 @@ GALAXY:
             
             return "Usage: /provider [list|use|add|remove]"
             
+        except Exception as e:
+            return f"[ERR] {e}"
+
+    async def _cmd_ollama(self, args) -> str:
+        """Handle Ollama commands."""
+        if not args:
+            return "Usage: /ollama <scan|use> [args]"
+
+        subcmd = args[0].lower()
+
+        try:
+            if subcmd == "scan":
+                url = "http://localhost:11434/api/tags"
+                try:
+                    resp = requests.get(url, timeout=5)
+                    if resp.status_code == 200:
+                        models = resp.json().get("models", [])
+                        if not models:
+                            return "No models found in Ollama."
+                        lines = ["Local Ollama Models:"]
+                        for m in models:
+                            size_gb = m.get("size", 0) / (1024**3)
+                            lines.append(f"  {m['name']} ({size_gb:.1f} GB)")
+                        return "\n".join(lines)
+                    else:
+                        return f"[ERR] Ollama API error: {resp.status_code}"
+                except requests.exceptions.ConnectionError:
+                    return "[ERR] Could not connect to Ollama (localhost:11434). Is it running?"
+
+            elif subcmd == "use":
+                if len(args) < 2:
+                    return "Usage: /ollama use <model>"
+                model = args[1]
+                from memory_thread.nervous.vault import vault
+                vault.set_provider("ollama", "local", "http://localhost:11434", model, self._user_id)
+                vault.set_active_provider("ollama", self._user_id)
+                return f"[OK] Switched to Ollama (model: {model})"
+
+            else:
+                return "Usage: /ollama [scan|use]"
+
         except Exception as e:
             return f"[ERR] {e}"
 

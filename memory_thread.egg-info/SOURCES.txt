@@ -61,9 +61,11 @@ memory_thread/services/assimilator.py
 memory_thread/services/async_wal.py
 memory_thread/services/belief_store.py
 memory_thread/services/classify_service.py
+memory_thread/services/code_intelligence.py
 memory_thread/services/contemplator.py
 memory_thread/services/decay_engine.py
 memory_thread/services/decay_service.py
+memory_thread/services/document_intelligence.py
 memory_thread/services/extract_service.py
 memory_thread/services/fact_store.py
 memory_thread/services/file_ingest_service.py
