@@ -1,53 +1,81 @@
-"""
-Test configuration and fixtures for Memory Thread.
-"""
-import pytest
-import tempfile
 import os
 import sys
+from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from memory_thread.sdk import MemoryClient
+
+
+def pytest_configure(config):
+    config.addinivalue_line("markers", "slow: long-running performance test")
+    config.addinivalue_line("markers", "integration: uses optional services or subprocesses")
+    config.addinivalue_line("markers", "benchmark: performance-oriented benchmark-style check")
 
 
 @pytest.fixture
-def temp_dir():
-    """Provide a temporary directory for tests."""
-    with tempfile.TemporaryDirectory() as tmpdir:
-        yield tmpdir
+def isolated_namespace(monkeypatch):
+    monkeypatch.setattr(MemoryClient, "_get_global_namespace", lambda self: self.namespace)
+    return f"test_ns_{os.getpid()}"
 
 
 @pytest.fixture
-def mock_env(monkeypatch, temp_dir):
-    """Set up mock environment variables for testing."""
-    monkeypatch.setenv("MT_DATA_DIR", temp_dir)
-    monkeypatch.setenv("MT_TEST_MODE", "1")
+def memory_client_factory(monkeypatch, isolated_namespace):
+    monkeypatch.setattr(MemoryClient, "_get_global_namespace", lambda self: self.namespace)
+
+    def factory(suffix: str = "default", **kwargs):
+        namespace = kwargs.pop("namespace", f"{isolated_namespace}_{suffix}")
+        return MemoryClient(namespace=namespace, **kwargs)
+
+    return factory
+
+
+@pytest.fixture
+def wal_dir(tmp_path, monkeypatch):
+    import memory_thread.services.wal as wal_module
+
+    target = tmp_path / "wal"
+    wal_module.close_all_wals()
+    monkeypatch.setattr(wal_module, "WAL_DIR", target)
+    wal_module._wal_instances.clear()
+    yield target
+    wal_module.close_all_wals()
+    wal_module._wal_instances.clear()
+
+
+@pytest.fixture(autouse=True)
+def _isolated_wal(tmp_path, monkeypatch):
+    import memory_thread.services.wal as wal_module
+
+    target = tmp_path / "autouse_wal"
+    wal_module.close_all_wals()
+    monkeypatch.setattr(wal_module, "WAL_DIR", target)
+    wal_module._wal_instances.clear()
     yield
+    wal_module.close_all_wals()
+    wal_module._wal_instances.clear()
 
 
 @pytest.fixture
-def memory_client(mock_env):
-    """Create an in-memory MemoryClient for testing."""
-    from memory_thread.sdk import MemoryClient
-    return MemoryClient(namespace="test", use_db=False)
+def sqlite_db_path(tmp_path, monkeypatch):
+    import memory_thread.db.sqlite_client as sqlite_module
+
+    db_path = tmp_path / "mt.sqlite3"
+    monkeypatch.setattr(sqlite_module, "DEFAULT_DB_PATH", str(db_path))
+    sqlite_module._client = None
+    yield db_path
+    sqlite_module._client = None
 
 
 @pytest.fixture
-def galaxy_client(mock_env, temp_dir, monkeypatch):
-    """Create a MemoryClient with Galaxy Schema enabled."""
-    # Redirect fact/belief storage to temp
-    monkeypatch.setenv("MT_FACTS_DIR", os.path.join(temp_dir, "facts"))
-    monkeypatch.setenv("MT_BELIEFS_DIR", os.path.join(temp_dir, "beliefs"))
-    
-    from memory_thread.sdk import MemoryClient
-    return MemoryClient(namespace="galaxy_test", use_db=False)
+def perf_enabled():
+    return os.environ.get("MT_RUN_PERF") == "1"
 
 
 @pytest.fixture
-def vault(mock_env, temp_dir, monkeypatch):
-    """Create a test vault with isolated storage."""
-    vault_path = os.path.join(temp_dir, "vault.json")
-    monkeypatch.setattr("memory_thread.nervous.vault.VAULT_PATH", vault_path)
-    
-    from memory_thread.nervous.vault import Vault
-    return Vault()
+def repo_root():
+    return ROOT

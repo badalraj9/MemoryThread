@@ -15,6 +15,9 @@ Usage:
 
 import uuid
 import json
+import struct
+import threading
+import time
 from datetime import datetime
 from typing import Optional, List, Dict, Any, Tuple
 from dataclasses import dataclass, field
@@ -31,6 +34,80 @@ from urllib.parse import urlparse, parse_qs
 import os
 
 log = get_logger(__name__)
+
+
+class _SlabIngestPipeline:
+    """Single-process slab-backed ingest path with background draining."""
+
+    def __init__(self, owner: "MemoryClient", num_slabs: int = 512, slab_size: int = 65536):
+        from memory_thread.utils.shared_memory import SlabAllocator
+
+        self.owner = owner
+        self.allocator = SlabAllocator(num_slabs=num_slabs, slab_size=slab_size)
+        self._stop_event = threading.Event()
+        self._thread = threading.Thread(
+            target=self._drain_loop,
+            name=f"mt-slab-ingest-{owner.namespace}",
+            daemon=True,
+        )
+        self._accepted_count = 0
+        self._processed_count = 0
+        self._lock = threading.Lock()
+        self._thread.start()
+
+    def enqueue(self, payload: Dict[str, Any]) -> None:
+        encoded = json.dumps(payload, default=str).encode("utf-8")
+        msg_len = len(encoded)
+        if msg_len + 4 > self.allocator.slab_size:
+            raise ValueError("Slab payload exceeds slab size")
+
+        slab = self.allocator.reserve_slab(timeout=1.0)
+        slab.memory[:4] = struct.pack("!I", msg_len)
+        slab.memory[4 : 4 + msg_len] = encoded
+        self.allocator.mark_as_written(slab.slab_id)
+
+        with self._lock:
+            self._accepted_count += 1
+
+    def stats(self) -> Dict[str, int]:
+        with self._lock:
+            return {
+                "accepted_count": self._accepted_count,
+                "processed_count": self._processed_count,
+            }
+
+    def close(self) -> None:
+        self._stop_event.set()
+        if self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+        self.allocator.close()
+        self.allocator.unlink()
+
+    def _drain_loop(self) -> None:
+        while not self._stop_event.is_set():
+            slab = self.allocator.get_written_slab()
+            if not slab:
+                time.sleep(0.001)
+                continue
+
+            try:
+                msg_len = struct.unpack("!I", slab.memory[:4].tobytes())[0]
+                payload = json.loads(slab.memory[4 : 4 + msg_len].tobytes())
+                process_hook = getattr(self.owner, "_slab_process_hook", None)
+                if process_hook:
+                    process_hook(payload["content"])
+                self.owner._remember_direct(
+                    content=payload["content"],
+                    source=payload["source"],
+                    confidence=payload["confidence"],
+                    authority=payload["authority"],
+                    memory_type=payload["memory_type"],
+                    entity_id=uuid.UUID(payload["entity_id"]),
+                )
+                with self._lock:
+                    self._processed_count += 1
+            finally:
+                self.allocator.release_slab(slab.slab_id)
 
 
 @dataclass
@@ -160,7 +237,11 @@ class MemoryClient:
         return cls.connect(mt_url)
 
     def __init__(
-        self, namespace: Optional[str] = None, use_db: bool = False, default_authority: float = 0.5
+        self,
+        namespace: Optional[str] = None,
+        use_db: bool = False,
+        default_authority: float = 0.5,
+        use_slab_ingest: bool = False,
     ):
         """
         Initialize the Memory Client.
@@ -178,6 +259,7 @@ class MemoryClient:
         self.tms = TMSService()
         self.use_db = use_db
         self.default_authority = min(1.0, max(0.0, default_authority))
+        self.use_slab_ingest = use_slab_ingest
 
         # In-memory cache (always available)
         self._memories: Dict[uuid.UUID, EntityState] = {}
@@ -191,6 +273,9 @@ class MemoryClient:
 
         if use_db:
             self._init_db_clients()
+
+        self._slab_ingest = _SlabIngestPipeline(self) if use_slab_ingest else None
+        self._slab_process_hook = None
 
     def _resolve_namespace(self) -> str:
         """Resolve namespace by checking .mt/ config, walking up directories, or falling back to global."""
@@ -408,6 +493,39 @@ class MemoryClient:
         return relations
 
     def remember(
+        self,
+        content: str,
+        source: str = "agent",
+        confidence: float = 0.8,
+        authority: float = 0.5,
+        memory_type: str = "fact",
+        entity_id: Optional[uuid.UUID] = None,
+    ) -> uuid.UUID:
+        if self._slab_ingest is not None:
+            if entity_id is None:
+                entity_id = uuid.uuid4()
+            self._slab_ingest.enqueue(
+                {
+                    "entity_id": str(entity_id),
+                    "content": content,
+                    "source": source,
+                    "confidence": confidence,
+                    "authority": authority,
+                    "memory_type": memory_type,
+                }
+            )
+            return entity_id
+
+        return self._remember_direct(
+            content=content,
+            source=source,
+            confidence=confidence,
+            authority=authority,
+            memory_type=memory_type,
+            entity_id=entity_id,
+        )
+
+    def _remember_direct(
         self,
         content: str,
         source: str = "agent",
@@ -1067,13 +1185,19 @@ class MemoryClient:
         """Get memory statistics."""
         total = len(self._memories)
         if total == 0:
-            return {"total_memories": 0, "avg_truth_score": 0}
+            stats = {"total_memories": 0, "avg_truth_score": 0}
+            if hasattr(self, "_db_type"):
+                stats["db_type"] = self._db_type
+            stats["qdrant_connected"] = self._qdrant is not None
+            if self._slab_ingest is not None:
+                stats.update(self._slab_ingest.stats())
+            return stats
 
         scores = [
             TruthVectorService.calculate_score(s.truth_vector) for s in self._memories.values()
         ]
 
-        return {
+        stats = {
             "total_memories": total,
             "total_events": len(self._event_log),
             "avg_truth_score": sum(scores) / len(scores),
@@ -1081,6 +1205,15 @@ class MemoryClient:
             "db_type": getattr(self, "_db_type", "memory"),
             "qdrant_connected": self._qdrant is not None,
         }
+        if self._slab_ingest is not None:
+            stats.update(self._slab_ingest.stats())
+        return stats
+
+    def close(self) -> None:
+        """Release background resources owned by this client."""
+        if self._slab_ingest is not None:
+            self._slab_ingest.close()
+            self._slab_ingest = None
 
     def clear(self):
         """Clear all memories."""

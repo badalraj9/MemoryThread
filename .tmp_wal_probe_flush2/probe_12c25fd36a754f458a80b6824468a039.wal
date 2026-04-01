@@ -1,0 +1,2 @@
+{"sequence": 1, "timestamp": "2026-04-01T06:03:49.090103", "operation": "remember", "data": {"x": 1}, "checksum": "613fe5aa65343dbb", "committed": false}
+{"type": "commit", "sequence": 1, "timestamp": "2026-04-01T06:03:49.096632"}

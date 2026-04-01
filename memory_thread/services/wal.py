@@ -18,6 +18,7 @@ import json
 import os
 import time
 import threading
+import atexit
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, Optional, List
@@ -66,15 +67,39 @@ class WriteAheadLog:
         wal.commit(seq)
     """
     
-    def __init__(self, namespace: str = "default"):
+    def __init__(
+        self,
+        namespace: str = "default",
+        flush_batch_size: int = 10,
+        flush_interval_ms: int = 5,
+        async_flush: bool = False,
+    ):
         self.namespace = namespace
         self.wal_file = WAL_DIR / f"{namespace}.wal"
         self.lock = threading.Lock()
+        self._io_lock = threading.Lock()
         self._sequence = 0
         self._uncommitted: Dict[int, WALEntry] = {}
+        self._active_buffer: List[str] = []
+        self._flush_buffer: List[str] = []
+        self._flush_batch_size = max(1, flush_batch_size)
+        self._flush_interval_sec = max(0.001, flush_interval_ms / 1000.0)
+        self._last_flush_at = time.perf_counter()
+        self._stop_event = threading.Event()
+        self._flush_event = threading.Event()
+        self._async_flush = async_flush
+        self._durable_append_count = 0
+        self._durable_commit_count = 0
         
         self._ensure_dir()
         self._recover()
+        if self._async_flush:
+            self._flusher = threading.Thread(
+                target=self._flush_loop,
+                name=f"mt-wal-flusher-{namespace}",
+                daemon=True,
+            )
+            self._flusher.start()
     
     def _ensure_dir(self):
         """Create WAL directory if needed."""
@@ -84,6 +109,72 @@ class WriteAheadLog:
         """Simple checksum for integrity."""
         import hashlib
         return hashlib.sha256(data.encode()).hexdigest()[:16]
+
+    def _enqueue_line(self, line: str):
+        with self.lock:
+            self._active_buffer.append(line)
+            buffered = len(self._active_buffer)
+            last_flush_age = time.perf_counter() - self._last_flush_at
+
+        if not self._async_flush:
+            self.flush()
+        elif buffered >= self._flush_batch_size or last_flush_age >= self._flush_interval_sec:
+            self.flush()
+        else:
+            self._flush_event.set()
+
+    def _write_batch(self, lines: List[str]):
+        if not lines:
+            return
+
+        try:
+            with open(self.wal_file, "a", encoding="utf-8") as f:
+                for line in lines:
+                    f.write(line)
+                    f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+        except Exception as e:
+            log.error(f"WAL batch write failed: {e}")
+            raise RuntimeError(f"WAL batch write failed: {e}")
+
+    def _flush_loop(self):
+        while not self._stop_event.is_set():
+            self._flush_event.wait(self._flush_interval_sec)
+            self._flush_event.clear()
+            try:
+                self.flush()
+            except Exception:
+                # Keep the flusher alive; foreground callers will surface errors.
+                pass
+
+    def flush(self):
+        """Synchronously flush buffered WAL lines to disk as a single batch."""
+        with self.lock:
+            if not self._active_buffer and not self._flush_buffer:
+                self._last_flush_at = time.perf_counter()
+                return
+
+            if self._active_buffer:
+                self._active_buffer, self._flush_buffer = self._flush_buffer, self._active_buffer
+            lines = self._flush_buffer
+            self._flush_buffer = []
+
+            append_lines = 0
+            commit_lines = 0
+            for line in lines:
+                if '"type": "commit"' in line:
+                    commit_lines += 1
+                else:
+                    append_lines += 1
+
+        with self._io_lock:
+            self._write_batch(lines)
+
+        with self.lock:
+            self._durable_append_count += append_lines
+            self._durable_commit_count += commit_lines
+            self._last_flush_at = time.perf_counter()
     
     def append(self, operation: str, data: Dict[str, Any]) -> int:
         """
@@ -105,20 +196,11 @@ class WriteAheadLog:
                 committed=False
             )
             
-            # Write to disk with fsync (crash-safe)
-            try:
-                with open(self.wal_file, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(entry.to_dict(), default=str) + "\n")
-                    f.flush()
-                    os.fsync(f.fileno())  # Force to disk
-            except Exception as e:
-                log.error(f"WAL write failed: {e}")
-                raise RuntimeError(f"WAL write failed: {e}")
-            
             self._uncommitted[seq] = entry
             log.debug(f"WAL append: seq={seq} op={operation}")
-            
-            return seq
+
+        self._enqueue_line(json.dumps(entry.to_dict(), default=str))
+        return seq
     
     def commit(self, sequence: int):
         """
@@ -127,25 +209,22 @@ class WriteAheadLog:
         Args:
             sequence: The sequence number from append()
         """
+        commit_line = None
         with self.lock:
             if sequence in self._uncommitted:
                 entry = self._uncommitted.pop(sequence)
                 entry.committed = True
                 
-                # Append commit marker
-                try:
-                    with open(self.wal_file, "a", encoding="utf-8") as f:
-                        f.write(json.dumps({
-                            "type": "commit",
-                            "sequence": sequence,
-                            "timestamp": datetime.utcnow().isoformat()
-                        }) + "\n")
-                        f.flush()
-                        os.fsync(f.fileno())
-                except Exception as e:
-                    log.error(f"WAL commit write failed: {e}")
-                
                 log.debug(f"WAL commit: seq={sequence}")
+                commit_line = json.dumps(
+                    {
+                        "type": "commit",
+                        "sequence": sequence,
+                        "timestamp": datetime.utcnow().isoformat(),
+                    }
+                )
+        if commit_line is not None:
+            self._enqueue_line(commit_line)
     
     def rollback(self, sequence: int):
         """Mark entry as rolled back (failed processing)."""
@@ -235,23 +314,57 @@ class WriteAheadLog:
     def stats(self) -> dict:
         """Get WAL statistics."""
         size = self.wal_file.stat().st_size if self.wal_file.exists() else 0
+        with self.lock:
+            buffered_records = len(self._active_buffer) + len(self._flush_buffer)
+            durable_append_count = self._durable_append_count
+            durable_commit_count = self._durable_commit_count
         return {
             "namespace": self.namespace,
             "sequence": self._sequence,
             "uncommitted_count": len(self._uncommitted),
+            "buffered_record_count": buffered_records,
+            "durable_append_count": durable_append_count,
+            "durable_commit_count": durable_commit_count,
             "file_size_bytes": size,
             "file_path": str(self.wal_file),
         }
 
+    def close(self):
+        """Stop background flushing and durably flush remaining buffered records."""
+        self._stop_event.set()
+        self._flush_event.set()
+        if hasattr(self, "_flusher") and self._flusher.is_alive():
+            self._flusher.join(timeout=1.0)
+        self.flush()
+
 
 # Singleton per namespace
 _wal_instances: Dict[str, WriteAheadLog] = {}
+_wal_namespace_locks: Dict[str, threading.Lock] = {}
 _wal_lock = threading.Lock()
 
 
 def get_wal(namespace: str = "default") -> WriteAheadLog:
     """Get or create WAL for namespace."""
     with _wal_lock:
+        if namespace not in _wal_namespace_locks:
+            _wal_namespace_locks[namespace] = threading.Lock()
+        namespace_lock = _wal_namespace_locks[namespace]
+
+    with namespace_lock:
         if namespace not in _wal_instances:
             _wal_instances[namespace] = WriteAheadLog(namespace)
         return _wal_instances[namespace]
+
+
+def close_all_wals():
+    with _wal_lock:
+        instances = list(_wal_instances.values())
+    for wal in instances:
+        try:
+            wal.close()
+        except Exception:
+            pass
+
+
+atexit.register(close_all_wals)

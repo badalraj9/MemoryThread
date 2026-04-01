@@ -1,0 +1,68 @@
+[
+  {
+    "name": "mt_1_False",
+    "producers": 1,
+    "with_cognitive_work": false,
+    "system": "memory_thread",
+    "accepted_events": 42307,
+    "processed_events": 42288,
+    "accepted_eps": 8461.4,
+    "processed_eps": 8457.6,
+    "duration_sec": 5.0
+  },
+  {
+    "name": "baseline_1_False",
+    "producers": 1,
+    "with_cognitive_work": false,
+    "system": "baseline",
+    "accepted_events": 59175,
+    "processed_events": 59175,
+    "accepted_eps": 11835.0,
+    "processed_eps": 11835.0,
+    "duration_sec": 5.0
+  },
+  {
+    "name": "mt_4_False",
+    "producers": 4,
+    "with_cognitive_work": false,
+    "system": "memory_thread",
+    "accepted_events": 21577,
+    "processed_events": 21577,
+    "accepted_eps": 4315.4,
+    "processed_eps": 4315.4,
+    "duration_sec": 5.0
+  },
+  {
+    "name": "baseline_4_False",
+    "producers": 4,
+    "with_cognitive_work": false,
+    "system": "baseline",
+    "accepted_events": 52074,
+    "processed_events": 52074,
+    "accepted_eps": 10414.8,
+    "processed_eps": 10414.8,
+    "duration_sec": 5.0
+  },
+  {
+    "name": "mt_4_True",
+    "producers": 4,
+    "with_cognitive_work": true,
+    "system": "memory_thread",
+    "accepted_events": 26788,
+    "processed_events": 26788,
+    "accepted_eps": 5357.6,
+    "processed_eps": 5357.6,
+    "duration_sec": 5.0
+  },
+  {
+    "name": "baseline_4_True",
+    "producers": 4,
+    "with_cognitive_work": true,
+    "system": "baseline",
+    "accepted_events": 43949,
+    "processed_events": 43949,
+    "accepted_eps": 8789.8,
+    "processed_eps": 8789.8,
+    "duration_sec": 5.0
+  }
+]

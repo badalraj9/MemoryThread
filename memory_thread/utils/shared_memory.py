@@ -36,6 +36,10 @@ class AlignedSharedMemory:
         return self._shm.name
 
     def close(self):
+        try:
+            self.memory.release()
+        except Exception:
+            pass
         self._shm.close()
 
     def unlink(self):
@@ -225,6 +229,12 @@ class SlabAllocator:
         return True
 
     def close(self):
+        for attr in ("metadata", "free_stack"):
+            if hasattr(self, attr):
+                try:
+                    delattr(self, attr)
+                except Exception:
+                    pass
         self.data_shm.close()
         self.metadata_shm.close()
         self.stack_shm.close()
