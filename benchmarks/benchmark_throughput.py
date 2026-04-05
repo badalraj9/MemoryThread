@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import queue
 import re
 import sys
@@ -23,10 +24,14 @@ if str(ROOT) not in sys.path:
 
 import memory_thread.services.wal as wal_module
 from memory_thread.services.wal import WriteAheadLog
+from memory_thread.sdk import MemoryClient
 
 
 ENTITY_PATTERN = re.compile(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b")
 NUMBER_PATTERN = re.compile(r"\b\d+\b")
+
+logging.getLogger("memory_thread").setLevel(logging.WARNING)
+logging.getLogger("memory_thread.services.tms_service").setLevel(logging.WARNING)
 
 
 @dataclass
@@ -215,6 +220,76 @@ def run_mt(duration_sec: float, producers: int, with_work: bool, wal_dir: Path) 
     )
 
 
+def run_slab(duration_sec: float, producers: int, with_work: bool, wal_dir: Path) -> Result:
+    admitted = 0
+    processed = 0
+    stop_at = time.perf_counter() + duration_sec
+    grace_deadline = stop_at + min(2.0, max(0.5, duration_sec * 0.2))
+    lock = threading.Lock()
+    pregenerated_ids = cycle(_pregenerate_event_ids(_estimate_id_count(duration_sec, producers)))
+
+    wal_module.close_all_wals()
+    wal_module.WAL_DIR = wal_dir
+    client = MemoryClient(
+        namespace=f"bench_slab_{producers}_{int(with_work)}_{time.time_ns()}",
+        use_db=False,
+        use_slab_ingest=True,
+        slab_num_slabs=2048,
+        slab_size=65536,
+        slab_drain_threads=4,
+        slab_drain_batch_size=32,
+    )
+    if with_work:
+        client._slab_process_hook = cognitive_work
+
+    def producer(offset: int):
+        nonlocal admitted
+        index = offset
+        while time.perf_counter() < stop_at:
+            item = _payload(index)
+            event_id = next(pregenerated_ids)
+            client.remember(
+                item,
+                source="benchmark",
+                confidence=0.8,
+                authority=0.5,
+                memory_type="fact",
+                entity_id=uuid.UUID(event_id),
+            )
+            with lock:
+                admitted += 1
+            index += producers
+
+    prod_threads = [threading.Thread(target=producer, args=(i,), daemon=True) for i in range(producers)]
+    for thread in prod_threads:
+        thread.start()
+    for thread in prod_threads:
+        thread.join()
+
+    while time.perf_counter() < grace_deadline:
+        stats = client._slab_ingest.stats() if client._slab_ingest is not None else {}
+        processed = stats.get("processed_count", 0)
+        if processed >= admitted:
+            break
+        time.sleep(0.01)
+
+    close_stats = client.close() or {}
+    processed = close_stats.get("processed_count", processed)
+    wal_module.close_all_wals()
+
+    return Result(
+        name=f"slab_{producers}_{with_work}",
+        producers=producers,
+        with_cognitive_work=with_work,
+        system="slab_ingest",
+        accepted_events=admitted,
+        processed_events=processed,
+        accepted_eps=admitted / duration_sec,
+        processed_eps=processed / duration_sec,
+        duration_sec=duration_sec,
+    )
+
+
 def print_table(results: list[Result]) -> None:
     headers = (
         "Scenario",
@@ -263,6 +338,7 @@ def main():
     results: list[Result] = []
     for scenario in scenarios:
         results.append(run_mt(args.duration, scenario.producers, scenario.with_cognitive_work, wal_dir))
+        results.append(run_slab(args.duration, scenario.producers, scenario.with_cognitive_work, wal_dir))
         results.append(run_baseline(args.duration, scenario.producers, scenario.with_cognitive_work))
 
     args.output.parent.mkdir(parents=True, exist_ok=True)

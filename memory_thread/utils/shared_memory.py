@@ -78,11 +78,10 @@ class SlabAllocator:
 
         # 4. Synchronization
         self.free_list_semaphore = mp.Semaphore(num_slabs)
+        self.written_semaphore = mp.Semaphore(0)
         self.lock = mp.Lock() # Protects stack_top and free_stack operations
 
         # 5. Reader Optimization
-        # A simple FIFO queue for WRITTEN slabs would be ideal, but requires complex shared queue.
-        # We stick to a cursor scan for written items, but optimize it.
         self.next_read_slab = mp.Value(ctypes.c_int, 0)
 
     def reserve_slab(self, timeout: float = None) -> SlabHandle:
@@ -132,6 +131,7 @@ class SlabAllocator:
 
     def mark_as_written(self, slab_id: int):
         self.metadata[slab_id] = WRITTEN
+        self.written_semaphore.release()
 
     def release_slab(self, slab_id: int):
         with self.lock:
@@ -163,11 +163,17 @@ class SlabAllocator:
             self.free_list_semaphore.release()
 
     def get_written_slab(self) -> Optional[SlabHandle]:
-        # Reader still scans, but we can make it smarter or just fast-scan
-        # No change here for now, scanning 'WRITTEN' state is decoupled from free-list stack
+        return self.get_written_slab_blocking(timeout=0.0)
+
+    def wait_for_written_slab(self, timeout: float = None) -> bool:
+        return self.written_semaphore.acquire(timeout=timeout)
+
+    def get_written_slab_blocking(self, timeout: float = None) -> Optional[SlabHandle]:
+        if not self.wait_for_written_slab(timeout=timeout):
+            return None
+
         with self.lock:
             start_idx = self.next_read_slab.value
-            # Limit scan to avoid infinite loop if logic buggy
             for i in range(self.num_slabs):
                 slab_id = (start_idx + i) % self.num_slabs
                 if self.metadata[slab_id] == WRITTEN:
@@ -177,17 +183,34 @@ class SlabAllocator:
                     offset = slab_id * self.slab_size
                     slab_memory = self.data_shm.memory[offset:offset + self.slab_size]
                     return SlabHandle(slab_id, slab_memory)
-        return None
+
+        raise RuntimeError("Written semaphore signaled but no written slab found")
 
     def get_written_slabs_batch(self, max_count: int) -> List[SlabHandle]:
+        return self.get_written_slabs_batch_blocking(max_count=max_count, timeout=0.0)
+
+    def get_written_slabs_batch_blocking(
+        self,
+        max_count: int,
+        timeout: float = None,
+    ) -> List[SlabHandle]:
+        if max_count <= 0:
+            return []
+
+        if not self.wait_for_written_slab(timeout=timeout):
+            return []
+
         handles = []
         with self.lock:
             start_idx = self.next_read_slab.value
             for i in range(self.num_slabs):
-                if len(handles) >= max_count: break
+                if len(handles) >= max_count:
+                    break
                 slab_id = (start_idx + i) % self.num_slabs
 
                 if self.metadata[slab_id] == WRITTEN:
+                    if handles and not self.wait_for_written_slab(timeout=0.0):
+                        break
                     self.metadata[slab_id] = READ
                     offset = slab_id * self.slab_size
                     slab_memory = self.data_shm.memory[offset:offset + self.slab_size]
@@ -195,6 +218,8 @@ class SlabAllocator:
 
             if handles:
                 self.next_read_slab.value = (handles[-1].slab_id + 1) % self.num_slabs
+            else:
+                raise RuntimeError("Written semaphore signaled but no written slab found")
 
         return handles
 
@@ -202,6 +227,7 @@ class SlabAllocator:
         stats = {
             "FREE": 0, "RESERVED": 0, "WRITTEN": 0, "READ": 0, "RELEASED": 0,
             "semaphore_value": self.free_list_semaphore.get_value(),
+            "written_semaphore_value": self.written_semaphore.get_value(),
             "stack_top": self.stack_top.value
         }
         with self.lock:

@@ -111,8 +111,14 @@ class WriteAheadLog:
         return hashlib.sha256(data.encode()).hexdigest()[:16]
 
     def _enqueue_line(self, line: str):
+        self._enqueue_lines([line])
+
+    def _enqueue_lines(self, lines: List[str]):
+        if not lines:
+            return
+
         with self.lock:
-            self._active_buffer.append(line)
+            self._active_buffer.extend(lines)
             buffered = len(self._active_buffer)
             last_flush_age = time.perf_counter() - self._last_flush_at
 
@@ -201,6 +207,37 @@ class WriteAheadLog:
 
         self._enqueue_line(json.dumps(entry.to_dict(), default=str))
         return seq
+
+    def append_many(self, operation: str, payloads: List[Dict[str, Any]]) -> List[int]:
+        """
+        Append multiple entries and durably flush them as a single batch.
+
+        Returns:
+            Sequence numbers in the same order as payloads
+        """
+        if not payloads:
+            return []
+
+        sequences: List[int] = []
+        lines: List[str] = []
+        with self.lock:
+            for data in payloads:
+                self._sequence += 1
+                seq = self._sequence
+                entry = WALEntry(
+                    sequence=seq,
+                    timestamp=datetime.utcnow().isoformat(),
+                    operation=operation,
+                    data=data,
+                    checksum=self._checksum(json.dumps(data, default=str)),
+                    committed=False,
+                )
+                self._uncommitted[seq] = entry
+                sequences.append(seq)
+                lines.append(json.dumps(entry.to_dict(), default=str))
+
+        self._enqueue_lines(lines)
+        return sequences
     
     def commit(self, sequence: int):
         """
@@ -225,6 +262,31 @@ class WriteAheadLog:
                 )
         if commit_line is not None:
             self._enqueue_line(commit_line)
+
+    def commit_many(self, sequences: List[int]):
+        """Mark multiple entries as committed as a single durable batch."""
+        if not sequences:
+            return
+
+        timestamp = datetime.utcnow().isoformat()
+        commit_lines: List[str] = []
+        with self.lock:
+            for sequence in sequences:
+                if sequence in self._uncommitted:
+                    entry = self._uncommitted.pop(sequence)
+                    entry.committed = True
+                    log.debug(f"WAL commit: seq={sequence}")
+                    commit_lines.append(
+                        json.dumps(
+                            {
+                                "type": "commit",
+                                "sequence": sequence,
+                                "timestamp": timestamp,
+                            }
+                        )
+                    )
+        if commit_lines:
+            self._enqueue_lines(commit_lines)
     
     def rollback(self, sequence: int):
         """Mark entry as rolled back (failed processing)."""

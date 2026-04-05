@@ -14,6 +14,13 @@ venv/
 server.log
 tests/phase5_ordeal/mock_db.json
 tests/phase5_ordeal_v2/
+.bench_wal/
+.bench_wal_inline/
+.tmp_bench_wal/
+.tmp_bench_wal_fresh/
+.tmp_bench_wal_fresh2/
+.tmp_wal_probe_flush2/
+reports/throughput_benchmark_smoke.json
 
 # Memory Thread Enterprise Data
 .mt/
