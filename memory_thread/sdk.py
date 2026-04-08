@@ -720,69 +720,6 @@ class MemoryClient:
         state.current_value["type"] = memory_type
         self._memories[entity_id] = state
 
-        # Extract entities and relationships (Smart MT!)
-        extracted_entities = []
-        extracted_relations = []
-        if source == "user":  # Only parse user input for entities
-            try:
-                extracted_entities = self._extract_entities(content)
-                extracted_relations = self._infer_user_relations(content, extracted_entities)
-
-                # Store extracted entities as separate memories
-                for ent in extracted_entities:
-                    ent_type = ent.get("entity", "UNKNOWN")
-                    ent_value = ent.get("value", "")
-                    if ent_value and ent_type in ["PERSON", "ORG", "GPE", "PRODUCT"]:
-                        ent_id = uuid.uuid4()
-                        self._memories[ent_id] = EntityState(
-                            entity_id=ent_id,
-                            namespace=self.namespace,
-                            current_value={
-                                "content": ent_value,
-                                "type": "entity",
-                                "entity_type": ent_type,
-                                "source_memory_id": str(entity_id),
-                            },
-                            truth_vector=TruthVector(
-                                confidence=ent.get("confidence", 0.9),
-                                authority=0.9,
-                                freshness=1.0,
-                                corroboration=0,
-                            ),
-                            last_event_id=event.id,
-                        )
-
-                # Store extracted relations
-                for rel in extracted_relations:
-                    rel_id = uuid.uuid4()
-                    self._memories[rel_id] = EntityState(
-                        entity_id=rel_id,
-                        namespace=self.namespace,
-                        current_value={
-                            "content": f"USER {rel['type']} {rel['target']}",
-                            "type": "relation",
-                            "relation_type": rel["type"],
-                            "target": rel["target"],
-                            "target_type": rel["target_type"],
-                            "source_memory_id": str(entity_id),
-                        },
-                        truth_vector=TruthVector(
-                            confidence=rel.get("confidence", 0.9),
-                            authority=0.9,
-                            freshness=1.0,
-                            corroboration=0,
-                        ),
-                        last_event_id=event.id,
-                    )
-
-                if extracted_entities or extracted_relations:
-                    log.info(
-                        f"Extracted {len(extracted_entities)} entities, {len(extracted_relations)} relations"
-                    )
-
-            except Exception as e:
-                log.debug(f"Entity extraction skipped: {e}")
-
         # Persist to Postgres
         if self._pg:
             try:
@@ -814,7 +751,79 @@ class MemoryClient:
                 log.warning(f"WAL commit failed: {e}")
         # =====================================================
 
+        if source == "user":
+            threading.Thread(
+                target=self._run_entity_extraction_async,
+                args=(content, entity_id, event.id),
+                name=f"mt-entity-extract-{entity_id}",
+                daemon=True,
+            ).start()
+
         return entity_id
+
+    def _run_entity_extraction_async(
+        self,
+        content: str,
+        entity_id: uuid.UUID,
+        event_id: uuid.UUID,
+    ) -> None:
+        try:
+            extracted_entities = self._extract_entities(content)
+            extracted_relations = self._infer_user_relations(content, extracted_entities)
+
+            # Store extracted entities as separate memories
+            for ent in extracted_entities:
+                ent_type = ent.get("entity", "UNKNOWN")
+                ent_value = ent.get("value", "")
+                if ent_value and ent_type in ["PERSON", "ORG", "GPE", "PRODUCT"]:
+                    ent_id = uuid.uuid4()
+                    self._memories[ent_id] = EntityState(
+                        entity_id=ent_id,
+                        namespace=self.namespace,
+                        current_value={
+                            "content": ent_value,
+                            "type": "entity",
+                            "entity_type": ent_type,
+                            "source_memory_id": str(entity_id),
+                        },
+                        truth_vector=TruthVector(
+                            confidence=ent.get("confidence", 0.9),
+                            authority=0.9,
+                            freshness=1.0,
+                            corroboration=0,
+                        ),
+                        last_event_id=event_id,
+                    )
+
+            # Store extracted relations
+            for rel in extracted_relations:
+                rel_id = uuid.uuid4()
+                self._memories[rel_id] = EntityState(
+                    entity_id=rel_id,
+                    namespace=self.namespace,
+                    current_value={
+                        "content": f"USER {rel['type']} {rel['target']}",
+                        "type": "relation",
+                        "relation_type": rel["type"],
+                        "target": rel["target"],
+                        "target_type": rel["target_type"],
+                        "source_memory_id": str(entity_id),
+                    },
+                    truth_vector=TruthVector(
+                        confidence=rel.get("confidence", 0.9),
+                        authority=0.9,
+                        freshness=1.0,
+                        corroboration=0,
+                    ),
+                    last_event_id=event_id,
+                )
+
+            if extracted_entities or extracted_relations:
+                log.info(
+                    f"Extracted {len(extracted_entities)} entities, {len(extracted_relations)} relations"
+                )
+        except Exception as e:
+            log.debug(f"Entity extraction skipped: {e}")
 
     def _persist_to_postgres(
         self, entity_id: uuid.UUID, content: str, memory_type: str, state: EntityState, event: Event
