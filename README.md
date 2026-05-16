@@ -12,7 +12,7 @@
 <p align="center">
   <a href="#"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" /></a>
   <a href="#"><img src="https://img.shields.io/badge/License-MIT-9370DB?logo=opensourceinitiative&logoColor=white" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tests-20%2F20-brightgreen?logo=pytest&logoColor=white" /></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tests-22%2F22-brightgreen?logo=pytest&logoColor=white" /></a>
   <a href="#"><img src="https://img.shields.io/badge/Security-Audited-CC2936?logo=trustpilot&logoColor=white" /></a>
   <a href="#"><img src="https://img.shields.io/badge/Status-Active-00ADD8?logo=quantum&logoColor=white" /></a>
 </p>
@@ -90,7 +90,7 @@ mt-serve
 ```python
 from memory_thread.sdk import MemoryClient
 
-client = MemoryClient(namespace="demo", use_db=False)
+client = MemoryClient(namespace="demo", use_db=True)
 
 eid = client.remember(
     "User prefers dark mode",
@@ -295,6 +295,7 @@ freshness(t) = freshness₀ × e^(-λ × days_elapsed)
 <tr><td><b>Proxy Guardrails</b></td><td>Auto-redaction of API keys, private keys, SSNs, email, GitHub tokens, AWS keys.</td></tr>
 <tr><td><b>Secure SDK</b></td><td><code>SecureMemoryClient</code> restricts passthrough to an explicit allowlist — no reflection bypass.</td></tr>
 <tr><td><b>RBAC</b></td><td>Role-based access with clearance grades. Zero-auth <code>/su</code> escalation removed.</td></tr>
+<tr><td><b>Client Provisioning</b></td><td><code>mt client-admin create/list/revoke</code> — API key management with hashed secrets. One-time key reveal on creation.</td></tr>
 </table>
 
 <br>
@@ -340,7 +341,7 @@ memory_thread/
 <h2>🧪 Tests</h2>
 
 <pre>
-pytest tests/ -q       # 20 tests, 2 skipped (perf benchmarks)
+pytest tests/ -q       # 22 tests, 2 skipped (perf benchmarks)
 </pre>
 
 <table>
@@ -349,7 +350,7 @@ pytest tests/ -q       # 20 tests, 2 skipped (perf benchmarks)
 <tr><td><code>test_truth_retrieval_quality.py</code></td><td>Truth-weighted recall ranks high-truth memories higher</td></tr>
 <tr><td><code>test_memory_client_durability_modes.py</code></td><td>Sync/batched durability boundaries, WAL flush, compaction</td></tr>
 <tr><td><code>test_wal_recovery.py</code></td><td>Crash recovery at 5 sizes (10, 30, 50, 70, 90 entries)</td></tr>
-<tr><td><code>test_postgres_fts_search.py</code></td><td>Postgres full-text search correctness</td></tr>
+<tr><td><code>test_qdrant_dimension_guard.py</code></td><td>Qdrant-free init + keyword recall fallback after removal</td></tr>
 <tr><td><code>test_namespace_isolation.py</code></td><td>Cross-namespace reads blocked. Truth scores isolated.</td></tr>
 <tr><td><code>test_contradiction_accuracy.py</code></td><td>Precision and recall of contradiction detection</td></tr>
 <tr><td><code>test_decay_curves.py</code></td><td>Freshness decay matches mathematical specification</td></tr>
