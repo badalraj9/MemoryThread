@@ -2,7 +2,7 @@
 Galaxy Core - Multi-Agent Cognitive Architecture.
 
 Orchestrates agent universes, fact/belief management, and conflict resolution.
-Accepts injected dependencies (PostgresClient, QdrantClientWrapper, GraphEngine)
+Accepts injected dependencies (PostgresClient, GraphEngine)
 for testability. Will use GraphEngine for unified graph operations in Phase 5.
 """
 
@@ -11,7 +11,6 @@ import time
 from typing import Dict, Any, List, Optional, Tuple
 
 from memory_thread.db.postgres_client import PostgresClient
-from memory_thread.utils.embeddings import get_embedding
 from memory_thread.nervous.conflict_resolution import ConflictResolver
 
 
@@ -21,14 +20,8 @@ class AgentMemorySpace:
     Each agent has their own collection namespace in Qdrant.
     """
 
-    def __init__(self, agent_id: str, qdrant_client: Optional["QdrantClientWrapper"], embedding_fn):
+    def __init__(self, agent_id: str):
         self.agent_id = agent_id
-        self.qdrant = qdrant_client
-        self.embedding_fn = embedding_fn
-        self.fact_collection = f"facts_{agent_id}"
-        self.belief_collection = f"beliefs_{agent_id}"
-        if self.qdrant:
-            self._init_collections()
 
     def _init_collections(self):
         """Create Qdrant collections for this agent."""
@@ -39,57 +32,16 @@ class AgentMemorySpace:
             print(f"Warning: Could not init collections for {self.agent_id}: {e}")
 
     def store_fact(self, fact: Dict[str, Any]):
-        """Store a fact in this agent's fact collection. No-op if Qdrant unavailable."""
-        if not self.qdrant:
-            return
-        if not fact.get("embedding"):
-            content = fact.get("content", "")
-            fact["embedding"] = self.embedding_fn(content)
-
-        point = {
-            "id": str(fact.get("id", uuid.uuid4())),
-            "vector": fact["embedding"],
-            "payload": {
-                "content": fact.get("content", ""),
-                "metadata": fact.get("metadata", {}),
-                "agent_id": self.agent_id,
-                "timestamp": fact.get("timestamp", time.time()),
-                "type": "fact",
-            },
-        }
-        self.qdrant.upsert(collection_name=self.fact_collection, points=[point])
+        """Store a fact (Qdrant storage removed, kept for interface compatibility)."""
+        pass  # Vector storage removed
 
     def store_belief(self, belief: Dict[str, Any]):
-        """Store a belief in this agent's belief collection. No-op if Qdrant unavailable."""
-        if not self.qdrant:
-            return
-        if not belief.get("embedding"):
-            content = belief.get("content", "")
-            belief["embedding"] = self.embedding_fn(content)
-
-        point = {
-            "id": str(belief.get("id", uuid.uuid4())),
-            "vector": belief["embedding"],
-            "payload": {
-                "fact_id": str(belief.get("fact_id")),
-                "content": belief.get("content"),
-                "confidence": belief.get("confidence", 0.5),
-                "authority": belief.get("authority", 0.5),
-                "agent_id": self.agent_id,
-                "timestamp": belief.get("timestamp", time.time()),
-                "type": "belief",
-            },
-        }
-        self.qdrant.upsert(collection_name=self.belief_collection, points=[point])
+        """Store a belief (Qdrant storage removed, kept for interface compatibility)."""
+        pass  # Vector storage removed
 
     def query(self, query_text: str, top_k: int = 5):
-        """Query this agent's beliefs. Returns empty list if Qdrant unavailable."""
-        if not self.qdrant:
-            return []
-        query_vector = self.embedding_fn(query_text)
-        return self.qdrant.search(
-            collection_name=self.belief_collection, query_vector=query_vector, limit=top_k
-        )
+        """Query this agent's beliefs (vector search removed, returns empty list)."""
+        return []
 
 
 class GalaxyBridge:
@@ -245,15 +197,12 @@ class GalaxyCore:
     def __init__(
         self,
         pg_client: Optional[PostgresClient] = None,
-        qdrant_client: Optional["QdrantClientWrapper"] = None,
         graph_engine: Optional["GraphEngine"] = None,
     ):
         from memory_thread.services.graph_engine import GraphEngine
 
         self.pg = pg_client or PostgresClient()
-        self.qdrant = qdrant_client
         self.graph_engine = graph_engine or GraphEngine()
-        self.embedding_fn = get_embedding
         self.universes: Dict[str, AgentMemorySpace] = {}
         self.agent_registry: Dict[str, float] = {}
         self.bridge = GalaxyBridge(self.pg)
@@ -278,7 +227,7 @@ class GalaxyCore:
     def register_agent(self, agent_id: str, authority: float = 0.5):
         """Register an agent with authority score."""
         if agent_id not in self.universes:
-            self.universes[agent_id] = AgentMemorySpace(agent_id, self.qdrant, self.embedding_fn)
+            self.universes[agent_id] = AgentMemorySpace(agent_id)
             self.agent_registry[agent_id] = authority
 
             query = """
@@ -310,7 +259,6 @@ class GalaxyCore:
             "content": raw_observation.get("content", ""),
             "metadata": raw_observation.get("metadata", {}),
             "timestamp": raw_observation.get("timestamp", time.time()),
-            "embedding": raw_observation.get("embedding"),
         }
         universe.store_fact(fact)
 
@@ -324,7 +272,6 @@ class GalaxyCore:
             "content": raw_observation.get("interpretation", raw_observation.get("content", "")),
             "confidence": raw_observation.get("confidence", 0.8),
             "timestamp": time.time(),
-            "embedding": raw_observation.get("embedding"),
         }
         universe.store_belief(belief)
 

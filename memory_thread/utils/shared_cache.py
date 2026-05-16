@@ -15,5 +15,4 @@ class SharedCache:
 
 manager = mp.Manager()
 result_cache = SharedCache(manager)
-embedding_cache = SharedCache(manager)
 ner_cache = SharedCache(manager)

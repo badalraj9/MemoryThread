@@ -215,6 +215,19 @@ MIGRATIONS = [
                 CHECK (action IN ('PLANT', 'ADD', 'REMOVE', 'UPDATE', 'OBSERVE', 'INFER', 'LINK', 'UNLINK', 'MERGE'));
         """,
     },
+    {
+        "id": 10,
+        "name": "fts_search_vector",
+        "description": "Add tsvector column and GIN index for full-text search on event content",
+        "sql": """
+            ALTER TABLE events ADD COLUMN IF NOT EXISTS search_vector tsvector
+                GENERATED ALWAYS AS (
+                    to_tsvector('english', coalesce(jsonb_extract_path_text(delta, 'content'), ''))
+                ) STORED;
+
+            CREATE INDEX IF NOT EXISTS events_search_idx ON events USING GIN(search_vector);
+        """,
+    },
 ]
 
 

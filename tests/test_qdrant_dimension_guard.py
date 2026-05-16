@@ -1,61 +1,23 @@
-from contextlib import contextmanager
+"""Qdrant has been removed — replaced by Postgres FTS + spaCy for seed resolution."""
 
-from memory_thread.config.settings import settings
-from memory_thread.sdk import MemoryClient
-
-
-class _WorkingCursor:
-    def execute(self, query, params=None):
-        return None
+import pytest
 
 
-class _WorkingPostgresClient:
-    @contextmanager
-    def get_cursor(self):
-        yield _WorkingCursor()
+def test_memory_client_initializes_without_qdrant():
+    from memory_thread.sdk.client import MemoryClient
+
+    client = MemoryClient(namespace="test_no_qdrant", use_db=False)
+    assert client is not None
+    assert not hasattr(client, "_qdrant")
+    client.close()
 
 
-class _DimensionMismatchQdrantWrapper:
-    def __init__(self):
-        self.client = self
-        self.deleted = []
-        self.created = []
+def test_memory_client_recall_fallback_to_keyword():
+    from memory_thread.sdk.client import MemoryClient
 
-    def get_collection(self, collection_name):
-        return {"config": {"params": {"vectors": {"size": 1536}}}}
-
-    def create_collection(self, collection_name, vectors_config):
-        self.created.append((collection_name, vectors_config))
-
-    def delete_collection(self, collection_name):
-        self.deleted.append(collection_name)
-
-
-def test_qdrant_dimension_mismatch_disables_qdrant_by_default(monkeypatch):
-    import memory_thread.db.postgres_client as postgres_module
-    import memory_thread.db.qdrant_client as qdrant_module
-
-    monkeypatch.setattr(postgres_module, "PostgresClient", _WorkingPostgresClient)
-    monkeypatch.setattr(qdrant_module, "QdrantClientWrapper", _DimensionMismatchQdrantWrapper)
-    monkeypatch.setattr(
-        settings, "QDRANT_AUTO_RECREATE_COLLECTION_ON_DIMENSION_MISMATCH", False
-    )
-
-    client = MemoryClient(namespace="qdrant-dimension-disable", use_db=True)
-
-    assert client._qdrant is None
-
-
-def test_qdrant_dimension_mismatch_can_recreate_collection(monkeypatch):
-    import memory_thread.db.postgres_client as postgres_module
-    import memory_thread.db.qdrant_client as qdrant_module
-
-    monkeypatch.setattr(postgres_module, "PostgresClient", _WorkingPostgresClient)
-    monkeypatch.setattr(qdrant_module, "QdrantClientWrapper", _DimensionMismatchQdrantWrapper)
-    monkeypatch.setattr(settings, "QDRANT_AUTO_RECREATE_COLLECTION_ON_DIMENSION_MISMATCH", True)
-
-    client = MemoryClient(namespace="qdrant-dimension-recreate", use_db=True)
-
-    assert client._qdrant is not None
-    assert client._qdrant.deleted == ["memories"]
-    assert client._qdrant.created
+    client = MemoryClient(namespace="test_no_qdrant_fallback", use_db=False)
+    client.remember("test memory for recall fallback", source="agent", confidence=0.8)
+    result = client.recall("test memory", top_k=5)
+    assert result is not None
+    assert result.query == "test memory"
+    client.close()

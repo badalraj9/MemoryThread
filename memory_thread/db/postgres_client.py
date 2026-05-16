@@ -10,6 +10,7 @@ This module provides a production-ready PostgreSQL client with:
 
 import atexit
 import uuid as _uuid
+from typing import List, Dict
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
 from psycopg2.extras import RealDictCursor, register_uuid
@@ -288,6 +289,30 @@ class PostgresClient:
         """
         with self.get_cursor() as cur:
             cur.execute(query, params)
+            return cur.fetchall()
+
+    def search_events_fts(self, query_text: str, limit: int = 20) -> List[Dict]:
+        """
+        Full-text search on events table using tsvector.
+
+        Returns event rows matching the query text, ranked by relevance.
+        Used as the graph seed resolution fallback (replaces Qdrant vector search).
+        """
+        if not query_text or not query_text.strip():
+            return []
+        with self.get_cursor() as cur:
+            cur.execute(
+                """
+                SELECT e.id, e.object_id, e.delta->>'content' AS content,
+                       e.namespace, e.action, e.timestamp,
+                       ts_rank(e.search_vector, plainto_tsquery('english', %s)) AS rank
+                FROM events e
+                WHERE e.search_vector @@ plainto_tsquery('english', %s)
+                ORDER BY rank DESC, e.timestamp DESC
+                LIMIT %s
+                """,
+                (query_text, query_text, limit),
+            )
             return cur.fetchall()
 
 

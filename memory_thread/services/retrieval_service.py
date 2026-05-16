@@ -24,12 +24,7 @@ def retrieve_memories(query: str, top_k: int = 10) -> list:
         "Phase 3 of graph-core will replace this with graph-primary activation. "
         "See docs/GRAPH_CORE_ARCHITECTURE.md"
     )
-    from memory_thread.utils.embeddings import generate_embeddings_async
-    from memory_thread.services.vector_service import search_vectors
-
-    query_embedding = generate_embeddings_async((query,))[0]
-    vector_candidates = search_vectors(query_embedding, top_k=top_k)
-    return [{"id": str(c.id), "score": c.score, "source": "vector"} for c in vector_candidates]
+    return []
 
 
 def retrieve_by_activation(

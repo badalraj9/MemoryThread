@@ -152,28 +152,6 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         postgres_status = "unavailable"
 
-    # Check Qdrant
-    qdrant_status = "unavailable"
-    qdrant_latency = None
-    try:
-        from memory_thread.db.qdrant_client import QdrantClientWrapper
-
-        qdrant = QdrantClientWrapper()
-        start = time.perf_counter()
-        qdrant.client.get_collection("memories")
-        qdrant_latency = int((time.perf_counter() - start) * 1000)
-        qdrant_status = "healthy"
-    except Exception:
-        qdrant_status = "unavailable"
-
-    # Check embeddings
-    embeddings_status = "unavailable"
-    try:
-        from memory_thread.utils.embeddings import generate_embeddings
-
-        embeddings_status = "loaded"
-    except Exception:
-        embeddings_status = "unavailable"
 
     # Print service status
     table = Table(show_header=False, box=None, padding=(0, 2))
@@ -185,16 +163,6 @@ async def lifespan(app: FastAPI):
         table.add_row("✓ PostgreSQL", "healthy", f"({postgres_latency}ms)")
     else:
         table.add_row("✗ PostgreSQL", postgres_status, "")
-
-    if qdrant_latency:
-        table.add_row("✓ Qdrant", "healthy", f"({qdrant_latency}ms)")
-    else:
-        table.add_row("✗ Qdrant", qdrant_status, "(using keyword search)")
-
-    if embeddings_status == "loaded":
-        table.add_row("✓ Embeddings", "loaded", "")
-    else:
-        table.add_row("✗ Embeddings", embeddings_status, "")
 
     print(table)
     print()
@@ -405,7 +373,7 @@ class HealthResponse(BaseModel):
     timestamp: str
     version: str
     postgres_connected: bool = False
-    qdrant_connected: bool = False
+
 
 
 # ==============================================================================
@@ -453,21 +421,11 @@ async def health_check():
     except Exception:
         pass
 
-    try:
-        from memory_thread.db.qdrant_client import QdrantClientWrapper
-
-        qdrant = QdrantClientWrapper()
-        qdrant.client.get_collection("memories")
-        qdrant_connected = True
-    except Exception:
-        pass
-
     return HealthResponse(
         status="healthy" if postgres_connected else "degraded",
         timestamp=datetime.utcnow().isoformat(),
         version="1.0.0",
         postgres_connected=postgres_connected,
-        qdrant_connected=qdrant_connected,
     )
 
 

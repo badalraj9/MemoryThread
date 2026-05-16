@@ -27,4 +27,3 @@ class MemoryObject(BaseModel):
     domain: Optional[str] = None
     current_value: Optional[str] = None
     history: Optional[List[dict]] = None
-    embedding: Optional[List[float]] = None

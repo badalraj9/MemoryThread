@@ -1,6 +1,5 @@
 import re
 import spacy
-from transformers import pipeline
 from memory_thread.utils.caching import ner_cache
 
 # Stage 1: Regex NER
@@ -38,29 +37,7 @@ def spacy_ner(text):
     return entities, confidence
 
 
-# Stage 3: Transformer NER (Fallback) - lazy loaded
-_transformer_pipeline = None
 
-
-def _get_transformer_pipeline():
-    global _transformer_pipeline
-    if _transformer_pipeline is None:
-        try:
-            _transformer_pipeline = pipeline("ner", model="dslim/bert-base-NER")
-        except Exception:
-            _transformer_pipeline = False  # Mark as unavailable
-    return _transformer_pipeline
-
-
-def transformer_ner(text):
-    pipeline = _get_transformer_pipeline()
-    if not pipeline:
-        return []
-    try:
-        entities = pipeline(text)
-        return [{"entity": ent["entity"], "value": ent["word"]} for ent in entities]
-    except Exception:
-        return []
 
 
 def extract_entities(text: str):
@@ -76,13 +53,7 @@ def extract_entities(text: str):
 
     final_entities = regex_entities + spacy_entities
 
-    # Fallback logic - only try transformer if confidence is low and pipeline available
-    if confidence < 0.6 and _get_transformer_pipeline():
-        try:
-            transformer_entities = transformer_ner(text)
-            final_entities += transformer_entities
-        except Exception:
-            pass  # Silently skip if transformer fails
+
 
     # Deduplicate entities
     seen = set()

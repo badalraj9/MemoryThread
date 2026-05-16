@@ -22,7 +22,6 @@ class HealthChecker:
     
     def __init__(self):
         self._pg = None
-        self._qdrant = None
     
     @property
     def postgres_client(self):
@@ -36,16 +35,6 @@ class HealthChecker:
         return self._pg
     
     @property
-    def qdrant_client(self):
-        """Lazy-load Qdrant client."""
-        if self._qdrant is None:
-            try:
-                from memory_thread.db.qdrant_client import QdrantClientWrapper
-                self._qdrant = QdrantClientWrapper()
-            except Exception as e:
-                log.error(f"Failed to initialize QdrantClient: {e}")
-        return self._qdrant
-    
     def check_postgres(self) -> Dict[str, Any]:
         """
         Check PostgreSQL connectivity and response time.
@@ -60,44 +49,6 @@ class HealthChecker:
             }
         return self.postgres_client.health_check()
     
-    def check_qdrant(self) -> Dict[str, Any]:
-        """
-        Check Qdrant connectivity.
-        
-        Returns:
-            Dict with status, latency_ms, and optional error
-        """
-        result = {
-            "status": "unknown",
-            "latency_ms": None,
-            "error": None
-        }
-        
-        if self.qdrant_client is None:
-            result.update({
-                "status": "unhealthy",
-                "error": "QdrantClient not initialized"
-            })
-            return result
-        
-        try:
-            start = time.perf_counter()
-            # Get collections as a health check
-            self.qdrant_client.client.get_collections()
-            latency_ms = (time.perf_counter() - start) * 1000
-            
-            result.update({
-                "status": "healthy",
-                "latency_ms": round(latency_ms, 2)
-            })
-        except Exception as e:
-            result.update({
-                "status": "unhealthy",
-                "error": str(e)
-            })
-            
-        return result
-    
     def full_check(self) -> Dict[str, Any]:
         """
         Perform full health check across all services.
@@ -106,33 +57,17 @@ class HealthChecker:
             Dict with overall status and individual service statuses
         """
         postgres_status = self.check_postgres()
-        qdrant_status = self.check_qdrant()
         
-        # Overall status is healthy only if all services are healthy
-        all_healthy = (
-            postgres_status.get("status") == "healthy" and
-            qdrant_status.get("status") == "healthy"
-        )
-        
-        # Degraded if some services are down but not all
-        any_healthy = (
-            postgres_status.get("status") == "healthy" or
-            qdrant_status.get("status") == "healthy"
-        )
-        
-        if all_healthy:
+        if postgres_status.get("status") == "healthy":
             overall_status = "healthy"
-        elif any_healthy:
-            overall_status = "degraded"
         else:
-            overall_status = "unhealthy"
+            overall_status = "degraded"
         
         return {
             "status": overall_status,
             "version": "0.4.0",
             "services": {
-                "postgres": postgres_status,
-                "qdrant": qdrant_status
+                "postgres": postgres_status
             }
         }
 

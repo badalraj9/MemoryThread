@@ -7,5 +7,4 @@ from cachetools import LRUCache, TTLCache
 result_cache = TTLCache(maxsize=1000, ttl=1800)
 
 # Caches for NLP artifacts with a longer TTL, e.g., 1 day (86400 seconds)
-embedding_cache = TTLCache(maxsize=5000, ttl=86400)
 ner_cache = TTLCache(maxsize=5000, ttl=86400)

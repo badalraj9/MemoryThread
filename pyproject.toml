@@ -35,7 +35,6 @@ dependencies = [
     "pydantic>=2.0",
     "networkx>=3.0",
     "python-igraph>=1.0",
-    "sentence-transformers>=2.0",
     "python-dotenv>=1.0",
     "httpx>=0.25",
 ]
@@ -47,7 +46,6 @@ api = [
 ]
 db = [
     "psycopg2-binary>=2.9",
-    "qdrant-client>=1.5",
 ]
 streaming = [
     "pyzmq>=25.0",

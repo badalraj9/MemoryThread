@@ -33,7 +33,6 @@ class FactStore:
     
     def __init__(self):
         self._pg = None
-        self._qdrant = None
         self._use_db = True
         self._ensure_fallback_dir()
     

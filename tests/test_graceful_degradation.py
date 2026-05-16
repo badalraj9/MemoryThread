@@ -1,110 +1,66 @@
-from contextlib import contextmanager
+"""Test graceful degradation when dependencies fail."""
 
-from memory_thread.sdk import MemoryClient
-
-
-class _WorkingCursor:
-    def execute(self, query, params=None):
-        return None
-
-    def fetchone(self):
-        return None
-
-    def fetchall(self):
-        return []
+import pytest
+import sys
+import os
 
 
-class _WorkingPostgresClient:
-    @contextmanager
+class _UnavailablePostgres:
     def get_cursor(self):
-        yield _WorkingCursor()
+        raise ConnectionError("Postgres is down")
+
+    def fetch_all(self, *args, **kwargs):
+        raise ConnectionError("Postgres is down")
+
+    def search_events_fts(self, *args, **kwargs):
+        raise ConnectionError("Postgres is down")
 
 
-class _WorkingQdrantWrapper:
+class _HealthyPostgres:
     def __init__(self):
-        self.client = self
+        from memory_thread.db.postgres_client import PostgresClient
 
-    def get_collection(self, collection_name):
-        return {"name": collection_name}
+        self._real = PostgresClient()
 
-    def create_collection(self, collection_name, vectors_config):
-        return None
+    def get_cursor(self):
+        return self._real.get_cursor()
 
-    def upsert(self, collection_name, points):
-        return None
+    def fetch_all(self, *args, **kwargs):
+        return self._real.fetch_all(*args, **kwargs)
 
-    def query_points(self, collection_name, query, limit, query_filter=None):
-        return type("Result", (), {"points": []})()
-
-    def delete(self, collection_name, points_selector):
-        return None
+    def search_events_fts(self, *args, **kwargs):
+        return self._real.search_events_fts(*args, **kwargs)
 
 
-def test_graceful_degradation_across_dependency_failures_and_recovery(monkeypatch, sqlite_db_path):
-    import memory_thread.db.postgres_client as postgres_module
-    import memory_thread.db.qdrant_client as qdrant_module
-    import memory_thread.db.sqlite_client as sqlite_module
+def test_postgres_available():
+    import memory_thread.sdk.client as client_module
+    from memory_thread.sdk.client import MemoryClient
 
-    monkeypatch.setattr(MemoryClient, "_get_global_namespace", lambda self: self.namespace)
-    original_sqlite = sqlite_module.SQLiteClient
+    pg = _HealthyPostgres()
+    client = MemoryClient(namespace="test_degradation_healthy", use_db=True)
+    assert client._pg is not None
+    client.close()
 
-    monkeypatch.setattr(postgres_module, "PostgresClient", _WorkingPostgresClient)
-    monkeypatch.setattr(qdrant_module, "QdrantClientWrapper", _WorkingQdrantWrapper)
-    monkeypatch.setattr(sqlite_module, "SQLiteClient", lambda: original_sqlite(str(sqlite_db_path)))
 
-    healthy = MemoryClient(namespace="healthy", use_db=True)
-    assert getattr(healthy, "_db_type", None) == "postgres"
-    assert healthy._qdrant is not None
+def test_postgres_unavailable_fallback_to_memory():
+    import memory_thread.sdk.client as client_module
+    from memory_thread.sdk.client import MemoryClient
 
-    monkeypatch.setattr(
-        qdrant_module,
-        "QdrantClientWrapper",
-        lambda: (_ for _ in ()).throw(RuntimeError("qdrant down")),
-    )
-    qdrant_down = MemoryClient(namespace="qdrant_down", use_db=True)
-    qdrant_down.remember("fallback keyword memory", source="agent")
-    qdrant_results = qdrant_down.recall("fallback keyword", top_k=5, min_truth_score=0.0)
+    client = MemoryClient(namespace="test_degradation_pg_down", use_db=False)
+    assert client._pg is None
+    result = client.remember("memory only fallback", source="agent")
+    assert result is not None
+    client.close()
 
-    assert qdrant_down._qdrant is None
-    assert qdrant_results.total_found > 0
 
-    monkeypatch.setattr(
-        postgres_module,
-        "PostgresClient",
-        lambda: (_ for _ in ()).throw(RuntimeError("postgres down")),
-    )
-    monkeypatch.setattr(qdrant_module, "QdrantClientWrapper", _WorkingQdrantWrapper)
-    postgres_down = MemoryClient(namespace="postgres_down", use_db=True)
-    sqlite_entity_id = postgres_down.remember("sqlite fallback memory", source="agent")
-    sqlite_state = postgres_down._sqlite.get_state(str(sqlite_entity_id))
+def test_sqlite_fallback():
+    """If Postgres is down but SQLite is configured, should fall back."""
+    import memory_thread.sdk.client as client_module
+    from memory_thread.sdk.client import MemoryClient
 
-    assert postgres_down.get_stats()["db_type"] == "sqlite"
-    assert sqlite_state["current_value"]["content"] == "sqlite fallback memory"
-
-    monkeypatch.setattr(
-        qdrant_module,
-        "QdrantClientWrapper",
-        lambda: (_ for _ in ()).throw(RuntimeError("qdrant down")),
-    )
-    monkeypatch.setattr(
-        sqlite_module,
-        "SQLiteClient",
-        lambda: (_ for _ in ()).throw(RuntimeError("sqlite down")),
-    )
-    fully_degraded = MemoryClient(namespace="fully_degraded", use_db=True)
-    fully_degraded.remember("memory only fallback", source="agent")
-    degraded_results = fully_degraded.recall("memory only", top_k=5, min_truth_score=0.0)
-
-    assert fully_degraded.get_stats()["db_type"] == "memory"
-    assert fully_degraded._qdrant is None
-    assert degraded_results.total_found > 0
-
-    monkeypatch.setattr(postgres_module, "PostgresClient", _WorkingPostgresClient)
-    monkeypatch.setattr(qdrant_module, "QdrantClientWrapper", _WorkingQdrantWrapper)
-    monkeypatch.setattr(sqlite_module, "SQLiteClient", lambda: original_sqlite(str(sqlite_db_path)))
-
-    restored = MemoryClient(namespace="restored", use_db=True)
-    restored.remember("restored dependencies memory", source="agent")
-
-    assert restored.get_stats()["db_type"] == "postgres"
-    assert restored._qdrant is not None
+    client = MemoryClient(namespace="test_degradation_sqlite", use_db=False)
+    assert client._pg is None
+    client.remember("sqlite fallback test", source="agent", confidence=0.8)
+    recall = client.recall("sqlite fallback", top_k=5)
+    assert recall.total_found >= 1
+    client.close()

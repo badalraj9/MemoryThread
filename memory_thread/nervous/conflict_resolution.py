@@ -117,7 +117,6 @@ class ConflictResolver:
             log.debug(f"GraphEngine conflict detection unavailable: {e}")
 
         try:
-            from memory_thread.utils.embeddings import embed_text
 
             if not self.pg:
                 log.warning("No DB connection for conflict detection")

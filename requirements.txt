@@ -8,12 +8,9 @@ pydantic
 pydantic-settings
 python-dotenv
 python-json-logger
-qdrant-client
 requests
 spacy
 tenacity
-torch
-transformers
 typer
 rich
 prometheus-client

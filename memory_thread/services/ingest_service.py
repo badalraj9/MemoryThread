@@ -7,7 +7,6 @@ import datetime
 from typing import List, Union, Dict, Any
 from memory_thread.utils.shared_memory import SlabAllocator
 from memory_thread.services.hybrid_ner_service import extract_entities
-from memory_thread.utils.embeddings import generate_embeddings
 from memory_thread.models.events import Event, EntityState, ActorEnum, ActionEnum
 from memory_thread.services.classify_service import classify_memory, get_decay_rate
 from memory_thread.services.tms_service import TMSService, StateDerivationService

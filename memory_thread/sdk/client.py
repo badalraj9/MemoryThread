@@ -146,8 +146,6 @@ class MemoryClient:
             worker.start()
 
         self._pg = None
-        self._qdrant = None
-        self._collection_name = "memories"
 
         if use_db:
             self._init_db_clients()
@@ -258,88 +256,6 @@ class MemoryClient:
                 log.warning(f"SQLite also failed: {e2}. Using in-memory only.")
                 self._sqlite = None
                 self._db_type = "memory"
-
-        try:
-            from memory_thread.db.qdrant_client import QdrantClientWrapper
-
-            self._qdrant = QdrantClientWrapper()
-            self._ensure_collection()
-            log.info("Qdrant connected")
-        except Exception as e:
-            log.warning(f"Qdrant unavailable: {e}. Using keyword search.")
-            self._qdrant = None
-
-    def _ensure_collection(self):
-        if not self._qdrant:
-            return
-        try:
-            collection = self._qdrant.client.get_collection(self._collection_name)
-            actual_dimension = self._extract_qdrant_vector_dimension(collection)
-            expected_dimension = settings.EMBEDDING_DIMENSION
-            if actual_dimension is not None and actual_dimension != expected_dimension:
-                self._handle_qdrant_dimension_mismatch(actual_dimension, expected_dimension)
-        except Exception:
-            log.info(f"Creating Qdrant collection: {self._collection_name}")
-            self._qdrant.client.create_collection(
-                collection_name=self._collection_name,
-                vectors_config={
-                    "size": settings.EMBEDDING_DIMENSION,
-                    "distance": settings.EMBEDDING_DISTANCE,
-                },
-            )
-
-    def _extract_qdrant_vector_dimension(self, collection: Any) -> Optional[int]:
-        vectors = getattr(
-            getattr(getattr(collection, "config", None), "params", None), "vectors", None
-        )
-        if vectors is None and isinstance(collection, dict):
-            vectors = collection.get("config", {}).get("params", {}).get("vectors")
-
-        if vectors is None:
-            return None
-
-        size = getattr(vectors, "size", None)
-        if size is not None:
-            return int(size)
-
-        if isinstance(vectors, dict):
-            default_vector = vectors.get("")
-            if isinstance(default_vector, dict) and "size" in default_vector:
-                return int(default_vector["size"])
-            if "size" in vectors:
-                return int(vectors["size"])
-
-        return None
-
-    def _handle_qdrant_dimension_mismatch(
-        self, actual_dimension: int, expected_dimension: int
-    ) -> None:
-        message = (
-            f"Qdrant collection '{self._collection_name}' dimension mismatch: "
-            f"expected {expected_dimension}, found {actual_dimension}"
-        )
-        if settings.QDRANT_AUTO_RECREATE_COLLECTION_ON_DIMENSION_MISMATCH:
-            log.warning(f"{message}. Recreating collection because auto-recreate is enabled.")
-            self._qdrant.client.delete_collection(self._collection_name)
-            self._qdrant.client.create_collection(
-                collection_name=self._collection_name,
-                vectors_config={
-                    "size": expected_dimension,
-                    "distance": settings.EMBEDDING_DISTANCE,
-                },
-            )
-            return
-
-        log.error(f"{message}. Disabling Qdrant for this client.")
-        self._qdrant = None
-
-    def _generate_embedding(self, text: str) -> List[float]:
-        try:
-            from memory_thread.utils.embeddings import generate_embeddings
-
-            return generate_embeddings(tuple([text]))[0]
-        except Exception:
-            return [0.0] * settings.EMBEDDING_DIMENSION
 
     def _extract_entities(self, text: str) -> List[Dict]:
         try:
@@ -736,17 +652,6 @@ class MemoryClient:
 
     def _schedule_async_enrichment(self, source, content, entity_id, event_id, memory_type, state):
         started = time.perf_counter()
-        if self._qdrant:
-            self._enrichment_queue.put(
-                {
-                    "kind": "qdrant_index",
-                    "entity_id": entity_id,
-                    "content": content,
-                    "memory_type": memory_type,
-                    "state": state,
-                }
-            )
-
         if source == "user":
             self._enrichment_queue.put(
                 {
@@ -765,14 +670,7 @@ class MemoryClient:
                 self._enrichment_queue.task_done()
                 break
             try:
-                if task["kind"] == "qdrant_index":
-                    self._run_qdrant_index_async(
-                        entity_id=task["entity_id"],
-                        content=task["content"],
-                        memory_type=task["memory_type"],
-                        state=task["state"],
-                    )
-                elif task["kind"] == "entity_extraction":
+                if task["kind"] == "entity_extraction":
                     self._run_entity_extraction_async(
                         content=task["content"],
                         entity_id=task["entity_id"],
@@ -780,15 +678,6 @@ class MemoryClient:
                     )
             finally:
                 self._enrichment_queue.task_done()
-
-    def _run_qdrant_index_async(self, entity_id, content, memory_type, state):
-        started = time.perf_counter()
-        try:
-            self._index_in_qdrant(entity_id, content, memory_type, state)
-        except Exception as e:
-            log.warning(f"Qdrant index failed: {e}")
-        finally:
-            self._record_write_path_metric("remember.async_qdrant_index", started)
 
     def _run_entity_extraction_async(self, content, entity_id, event_id):
         try:
@@ -926,28 +815,6 @@ class MemoryClient:
                 "corroboration": state.truth_vector.corroboration,
             },
             last_event_id=str(event.id),
-        )
-
-    def _index_in_qdrant(self, entity_id, content, memory_type, state):
-        from qdrant_client.models import PointStruct
-
-        embedding = self._generate_embedding(content)
-        self._qdrant.client.upsert(
-            collection_name=self._collection_name,
-            points=[
-                PointStruct(
-                    id=str(entity_id),
-                    vector=embedding,
-                    payload={
-                        "content": content,
-                        "type": memory_type,
-                        "namespace": self.namespace,
-                        "confidence": state.truth_vector.confidence,
-                        "authority": state.truth_vector.authority,
-                        "freshness": state.truth_vector.freshness,
-                    },
-                )
-            ],
         )
 
     def recall(
@@ -1121,16 +988,11 @@ class MemoryClient:
         name_matches = graph_engine.search_nodes(query, attr="name")[:3]
         seeds.extend(n for n in name_matches if n not in seeds)
 
-        if not seeds and self._qdrant:
+        if not seeds and self._pg:
             try:
-                embedding = self._generate_embedding(query)
-                vector_results = self._qdrant.client.query_points(
-                    collection_name=self._collection_name,
-                    query=embedding,
-                    limit=3,
-                )
-                for hit in vector_results.points:
-                    node = str(hit.id)
+                rows = self._pg.search_events_fts(query, limit=5)
+                for row in rows:
+                    node = str(row["object_id"])
                     if graph_engine._vertex_exists(node):
                         seeds.append(node)
             except Exception:
@@ -1139,11 +1001,6 @@ class MemoryClient:
         return list(set(seeds))[: settings.RECALL_GRAPH_MIN_SEEDS]
 
     def _recall_impl(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
-        if self._qdrant:
-            try:
-                return self._recall_from_qdrant(query, top_k, min_truth_score)
-            except Exception as e:
-                log.warning(f"Qdrant search failed: {e}, falling back to keyword")
         return self._recall_keyword(query, top_k, min_truth_score)
 
     def _merge_results(self, project_result, global_result, top_k):
@@ -1196,53 +1053,6 @@ class MemoryClient:
             )
             memories.append(mem)
         return memories
-
-    def _recall_from_qdrant(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
-        query_embedding = self._generate_embedding(query)
-
-        try:
-            results = self._qdrant.client.query_points(
-                collection_name=self._collection_name,
-                query=query_embedding,
-                limit=top_k * 2,
-                query_filter={"must": [{"key": "namespace", "match": {"value": self.namespace}}]}
-                if self.namespace != "default"
-                else None,
-            )
-            results = results.points
-        except Exception as e:
-            log.warning(f"Qdrant search failed: {e}")
-            return RecallResult(memories=[], query=query, total_found=0)
-
-        memories = []
-        for hit in results:
-            payload = hit.payload
-            truth_vector = TruthVector(
-                confidence=payload.get("confidence", 0.5),
-                authority=payload.get("authority", 0.5),
-                freshness=payload.get("freshness", 1.0),
-                corroboration=max(0.0, float(hit.score)),
-            )
-            truth_score = TruthVectorService.calculate_score(truth_vector)
-
-            if truth_score >= min_truth_score:
-                memories.append(
-                    Memory(
-                        content=payload.get("content", ""),
-                        entity_id=uuid.UUID(hit.id) if isinstance(hit.id, str) else hit.id,
-                        truth_score=truth_score,
-                        confidence=truth_vector.confidence,
-                        authority=truth_vector.authority,
-                        freshness=truth_vector.freshness,
-                        corroboration=truth_vector.corroboration,
-                        timestamp=datetime.utcnow(),
-                        source="recall",
-                        memory_type=payload.get("type", "fact"),
-                    )
-                )
-
-        memories.sort(key=lambda m: (m.truth_score, m.authority), reverse=True)
-        return RecallResult(memories=memories[:top_k], query=query, total_found=len(memories))
 
     def _recall_keyword(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
         query_words = set(query.lower().split())
@@ -1309,14 +1119,6 @@ class MemoryClient:
         if entity_id in self._memories:
             state = self._memories[entity_id]
             state.truth_vector.freshness = 0.0
-
-            if self._qdrant:
-                try:
-                    self._qdrant.client.delete(
-                        collection_name=self._collection_name, points_selector=[str(entity_id)]
-                    )
-                except Exception:
-                    pass
 
             if self._pg:
                 try:
@@ -1415,7 +1217,6 @@ class MemoryClient:
             stats = {"total_memories": 0, "avg_truth_score": 0}
             if hasattr(self, "_db_type"):
                 stats["db_type"] = self._db_type
-            stats["qdrant_connected"] = self._qdrant is not None
             if self._slab_ingest is not None:
                 stats.update(self._slab_ingest.stats())
             return stats
@@ -1429,7 +1230,6 @@ class MemoryClient:
             "avg_truth_score": sum(scores) / len(scores),
             "namespace": self.namespace,
             "db_type": getattr(self, "_db_type", "memory"),
-            "qdrant_connected": self._qdrant is not None,
         }
         if self._slab_ingest is not None:
             stats.update(self._slab_ingest.stats())

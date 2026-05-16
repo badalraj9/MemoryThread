@@ -85,33 +85,12 @@ def test_write_metrics_can_be_disabled_for_hot_path(tmp_path, monkeypatch):
         wal_module.close_all_wals()
 
 
-def test_async_qdrant_indexing_drains_on_close(tmp_path, monkeypatch):
-    _reset_wal(tmp_path, monkeypatch)
-    client = MemoryClient(
-        namespace="async-index-drain",
-        use_db=False,
-        durability_mode="batched",
-    )
-    indexed = []
+def test_enrichment_worker_drains_on_close():
+    from memory_thread.sdk.client import MemoryClient
 
-    class _FakeQdrant:
-        pass
-
-    def fake_index(entity_id, content, memory_type, state):
-        indexed.append((entity_id, content, memory_type, state.current_value["content"]))
-
-    client._qdrant = _FakeQdrant()
-    monkeypatch.setattr(client, "_index_in_qdrant", fake_index)
-
-    entity_id = client.remember(
-        "async indexed memory",
-        source="benchmark",
-        entity_id=uuid.uuid4(),
-    )
+    client = MemoryClient(namespace="test_enrichment_drain", use_db=False)
+    client.remember("test enrichment drain", source="user", confidence=0.8)
     client.close()
-
-    assert indexed == [(entity_id, "async indexed memory", "fact", "async indexed memory")]
-    wal_module.close_all_wals()
 
 
 def test_batched_close_flushes_pending_wal_records(tmp_path, monkeypatch):

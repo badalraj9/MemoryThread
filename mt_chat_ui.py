@@ -35,12 +35,7 @@ print("[MT] Initialising MemoryThread (Postgres + Qdrant)...")
 _mt = MemoryClient(namespace="mt_chat", use_db=True)
 print(f"[MT] Ready — DB:{getattr(_mt, '_db_type', '?')}  Qdrant:{_mt._qdrant is not None}")
 
-# Pre-warm the embedding model NOW so first query is instant
-print("[MT] Pre-warming embedding model...")
-from memory_thread.utils.embeddings import generate_embeddings
 
-generate_embeddings(("warmup",))
-print("[MT] Embedding model ready.")
 
 
 # ── OpenRouter client ────────────────────────────────────────────────────────
@@ -217,7 +212,7 @@ Always be honest. If you're using a memory to answer, say so naturally."""
                 "avg_truth_score": round(stats.get("avg_truth_score", 0), 3),
                 "namespace": stats.get("namespace", "?"),
                 "db_type": stats.get("db_type", "?"),
-                "qdrant_connected": stats.get("qdrant_connected", False),
+
             },
             "entity_id": str(eid),
         }

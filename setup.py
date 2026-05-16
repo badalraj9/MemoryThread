@@ -8,6 +8,7 @@ For modern installation, use pyproject.toml:
 
 This file is for backward compatibility with older pip versions.
 """
+
 from setuptools import setup, find_packages
 
 setup(
@@ -18,12 +19,11 @@ setup(
     install_requires=[
         "pydantic>=2.0",
         "networkx>=3.0",
-        "sentence-transformers>=2.0",
         "python-dotenv>=1.0",
     ],
     extras_require={
         "api": ["fastapi>=0.100", "uvicorn>=0.20"],
-        "db": ["psycopg2-binary>=2.9", "qdrant-client>=1.5"],
+        "db": ["psycopg2-binary>=2.9"],
         "streaming": ["pyzmq>=25.0", "aiokafka>=0.8"],
         "tui": ["textual>=0.40"],
         "nlp": ["spacy>=3.5"],

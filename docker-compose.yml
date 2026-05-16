@@ -13,10 +13,8 @@ services:
       - MT_POSTGRES_USER=memory
       - MT_POSTGRES_PASSWORD=memory123
       - MT_POSTGRES_DB=memorythread
-      - MT_QDRANT_HOST=qdrant
     depends_on:
       - postgres
-      - qdrant
     command: uvicorn memory_thread.api.server:app --host 0.0.0.0 --port 8000
 
   postgres:
@@ -30,13 +28,5 @@ services:
     ports:
       - "5432:5432"
 
-  qdrant:
-    image: qdrant/qdrant:latest
-    volumes:
-      - qdrant_data:/qdrant/storage
-    ports:
-      - "6333:6333"
-
 volumes:
   postgres_data:
-  qdrant_data:

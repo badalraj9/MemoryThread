@@ -47,34 +47,10 @@ class AutoBridgeBuilder:
 
     async def _find_bridge_candidates(self, belief: Dict) -> List[Dict]:
         """
-        Find beliefs from other agents about similar facts (Semantic Search).
+        Find beliefs from other agents about similar facts.
+        Note: Vector search has been removed. Returns empty list.
         """
-        candidates = []
-        source_agent = belief.get('agent_id')
-        embedding = belief.get('vector', [])
-
-        if not embedding: return []
-
-        for agent_id, universe in self.galaxy.universes.items():
-            if agent_id == source_agent:
-                continue
-
-            # Search other agent's belief space
-            if hasattr(universe.qdrant, 'search'):
-                results = universe.qdrant.search(
-                    collection=universe.belief_collection,
-                    query_vector=embedding,
-                    limit=5
-                )
-                # Convert ScoredPoint to dict
-                for res in results:
-                    candidates.append({
-                        "id": res.id,
-                        "content": res.payload.get('content'),
-                        "agent_id": agent_id,
-                        "confidence": res.payload.get('confidence', 0.5)
-                    })
-        return candidates
+        return []
 
     async def _analyze_relationship(self, belief_a: Dict, belief_b: Dict) -> Optional[Dict]:
         """

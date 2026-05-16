@@ -45,8 +45,6 @@ class Settings(BaseSettings):
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "memory_thread_db"
-    QDRANT_HOST: str = "localhost"
-    QDRANT_PORT: int = 6333
 
     # API Key (from MT_URL query param or env)
     MT_API_KEY: str = ""
@@ -64,7 +62,6 @@ class Settings(BaseSettings):
 
                 # Also set legacy vars from MT_URL for compatibility
                 self.POSTGRES_SERVER = host
-                self.QDRANT_HOST = host
 
         # Get API key from MT_URL query or env
         if self.MT_URL:
@@ -85,7 +82,6 @@ class Settings(BaseSettings):
     # Retrieval Scoring Weights
     # Controls how different signals contribute to memory retrieval scores
     # Valid range: 0.0 to 1.0 for each
-    SCORE_WEIGHT_VECTOR: float = 0.5  # Semantic similarity from Qdrant
     SCORE_WEIGHT_KEYWORD: float = 0.2  # Keyword matching
     SCORE_WEIGHT_GRAPH: float = 0.15  # Graph relationship strength
     SCORE_WEIGHT_IMPORTANCE: float = 0.1  # User-specified importance
@@ -113,10 +109,7 @@ class Settings(BaseSettings):
         "confidence": {"min": 0.0, "max": 1.0},
     }
 
-    # Embedding Configuration
-    EMBEDDING_DIMENSION: int = 384
-    EMBEDDING_DISTANCE: str = "Cosine"
-    QDRANT_AUTO_RECREATE_COLLECTION_ON_DIMENSION_MISMATCH: bool = False
+    # (Embedding model and Qdrant removed — replaced by Postgres FTS + spaCy)
 
     # ZMQ Configuration
     ZMQ_FABRIC_ADDRESS: str = "ipc://fabric_router"

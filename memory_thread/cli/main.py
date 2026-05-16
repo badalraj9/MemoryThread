@@ -146,29 +146,14 @@ def serve(
         except Exception as e:
             postgres_status = f"unavailable ({type(e).__name__})"
 
-        # Check Qdrant
-        qdrant_status = "connecting..."
-        try:
-            from memory_thread.db.qdrant_client import QdrantClientWrapper
-
-            qdrant = QdrantClientWrapper()
-            qdrant.client.get_collection("memories")
-            qdrant_status = "connected"
-        except Exception:
-            qdrant_status = "unavailable (using keyword search)"
-
-        # Check embeddings
         embeddings_status = "loading..."
         try:
-            from memory_thread.utils.embeddings import generate_embeddings
 
             embeddings_status = "loaded"
         except Exception:
             embeddings_status = "unavailable"
 
         table.add_row("✓ PostgreSQL", "PostgreSQL", postgres_status)
-        table.add_row("✓ Qdrant", "Qdrant", qdrant_status)
-        table.add_row("✓ Embeddings", "Embeddings", embeddings_status)
 
         console.print(table)
         console.print()

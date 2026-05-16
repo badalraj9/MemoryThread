@@ -12,7 +12,6 @@ import uuid
 import re
 
 from memory_thread.services.vault_service import vault_service
-from memory_thread.utils.embeddings import get_embedding
 from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)

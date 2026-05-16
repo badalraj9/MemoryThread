@@ -14,7 +14,6 @@ from datetime import datetime
 from dataclasses import dataclass, asdict
 
 from memory_thread.utils.logger import get_logger
-from memory_thread.utils.embeddings import get_embedding
 
 log = get_logger(__name__)
 
@@ -70,7 +69,6 @@ class BeliefStore:
     
     def __init__(self):
         self._pg = None
-        self._qdrant = None
         self._use_db = True
         self._ensure_fallback_dir()
     
@@ -87,16 +85,6 @@ class BeliefStore:
                 log.warning(f"Postgres unavailable for beliefs: {e}")
                 self._use_db = False
         return self._pg
-    
-    @property
-    def qdrant(self):
-        if self._qdrant is None:
-            try:
-                from memory_thread.db.qdrant_client import QdrantClientWrapper
-                self._qdrant = QdrantClientWrapper()
-            except Exception as e:
-                log.warning(f"Qdrant unavailable for beliefs: {e}")
-        return self._qdrant
     
     def derive(
         self,
@@ -147,9 +135,6 @@ class BeliefStore:
         else:
             self._store_file(belief)
         
-        # Index in Qdrant for semantic search
-        self._index_belief(belief)
-        
         log.info(f"Derived belief: {belief_id} from fact:{fact_id} by {agent_id}")
         return belief_id
     
@@ -179,24 +164,6 @@ class BeliefStore:
         path = agent_dir / f"{belief.belief_id}.json"
         with open(path, 'w', encoding='utf-8') as f:
             json.dump(belief.to_dict(), f, indent=2)
-    
-    def _index_belief(self, belief: Belief):
-        """Index belief in Qdrant for semantic search."""
-        if not self.qdrant:
-            return
-        
-        try:
-            embedding = get_embedding(belief.content)
-            self.qdrant.upsert(
-                collection="beliefs",
-                points=[{
-                    "id": belief.belief_id,
-                    "vector": embedding,
-                    "payload": belief.to_dict()
-                }]
-            )
-        except Exception as e:
-            log.debug(f"Belief indexing failed: {e}")
     
     def get_beliefs(
         self,
@@ -283,29 +250,8 @@ class BeliefStore:
         agent_id: str = None,
         top_k: int = 10
     ) -> List[Belief]:
-        """Semantic search across beliefs."""
-        if not self.qdrant:
-            # Fallback to simple text search
-            return self._text_search(query, agent_id, top_k)
-        
-        try:
-            embedding = get_embedding(query)
-            results = self.qdrant.search(
-                collection="beliefs",
-                query_vector=embedding,
-                limit=top_k
-            )
-            
-            beliefs = []
-            for r in results:
-                if agent_id and r.payload.get("agent_id") != agent_id:
-                    continue
-                beliefs.append(Belief(**r.payload))
-            
-            return beliefs
-        except Exception as e:
-            log.warning(f"Belief search failed: {e}")
-            return self._text_search(query, agent_id, top_k)
+        """Search across beliefs using text matching."""
+        return self._text_search(query, agent_id, top_k)
     
     def _text_search(self, query: str, agent_id: str, top_k: int) -> List[Belief]:
         """Simple text-based fallback search."""

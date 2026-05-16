@@ -59,7 +59,6 @@ class MetaStabilityService:
         Uses rolling average (0.9 * old + 0.1 * new) to update centroid.
         Returns True when cosine similarity below 0.7 (distance above 0.3).
         """
-        from memory_thread.utils.embeddings import embed_text
 
         embedding = embed_text(content)
 
