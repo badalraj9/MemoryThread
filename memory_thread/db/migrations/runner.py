@@ -205,6 +205,16 @@ MIGRATIONS = [
             CREATE INDEX IF NOT EXISTS idx_ancestry_cache_fingerprint ON ancestry_cache(fingerprint_hash);
         """,
     },
+    {
+        "id": 9,
+        "name": "update_action_check_constraint",
+        "description": "Add LINK, UNLINK, MERGE to events action CHECK constraint",
+        "sql": """
+            ALTER TABLE events DROP CONSTRAINT IF EXISTS events_action_check;
+            ALTER TABLE events ADD CONSTRAINT events_action_check
+                CHECK (action IN ('PLANT', 'ADD', 'REMOVE', 'UPDATE', 'OBSERVE', 'INFER', 'LINK', 'UNLINK', 'MERGE'));
+        """,
+    },
 ]
 
 

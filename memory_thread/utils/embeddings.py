@@ -34,19 +34,28 @@ def get_model():
     return _model if _model else None
 
 
+def normalize_text(text: str) -> str:
+    """Normalize text for consistent embedding generation."""
+    import unicodedata
+
+    return unicodedata.normalize("NFKC", text.lower().strip())
+
+
 @lru_cache(maxsize=512)
 def generate_embeddings(texts: Tuple[str, ...]) -> List[List[float]]:
     """
     Generate embeddings for texts.
     Tries real model first, falls back to mock on failure.
+    Normalizes text before encoding.
     """
     model = get_model()
+    normalized = tuple(normalize_text(t) for t in texts)
     if model:
         try:
-            return model.encode(list(texts)).tolist()
+            return model.encode(list(normalized)).tolist()
         except Exception as e:
             log.warning(f"Real embedding failed: {e}")
-    return _mock_embeddings(texts)
+    return _mock_embeddings(normalized)
 
 
 def generate_embeddings_async(texts: Tuple[str, ...]) -> List[List[float]]:

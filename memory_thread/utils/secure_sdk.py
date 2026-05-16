@@ -1,4 +1,3 @@
-
 """
 Secure Memory Client Wrapper.
 
@@ -7,6 +6,7 @@ transparently around the core SDK MemoryClient.
 
 UPDATED: Enforces Provenance Envelope on every write.
 """
+
 from typing import Optional, List, Dict, Any, Union
 import uuid
 import json
@@ -16,6 +16,7 @@ from memory_thread.sdk import MemoryClient, RecallResult, Memory
 from memory_thread.nervous.access_control import AccessControlService, UserContext
 from memory_thread.models.provenance import ProvenanceEnvelope, Actor, Origin, Scope
 from memory_thread.nervous.audit_ledger import ledger, AuditEvent
+
 
 class SecureMemoryClient:
     """
@@ -36,7 +37,9 @@ class SecureMemoryClient:
     def clearance(self):
         return self.user.grade.name
 
-    def ingest_fact(self, content: str, source_uri: str = "manual", namespace: str = "public") -> Optional[uuid.UUID]:
+    def ingest_fact(
+        self, content: str, source_uri: str = "manual", namespace: str = "public"
+    ) -> Optional[uuid.UUID]:
         """
         Class A Ingestion: Canonical Truth.
         - Must be raw content (no embeddings, no opinions).
@@ -48,34 +51,44 @@ class SecureMemoryClient:
         if not content or not isinstance(content, str):
             raise ValueError("PRIME RULE VIOLATION: Fact content must be a non-empty string.")
         if len(content) > 100000:
-             # Just a sanity check, large files are okay but memory limits exist
-             pass
+            # Just a sanity check, large files are okay but memory limits exist
+            pass
 
         # Check for Forbidden Patterns (Heuristic)
         if content.strip().startswith("[") and content.strip().endswith("]") and "," in content:
-             # Rough check for vector/embedding dump
-             # If it looks like a list of floats, reject.
-             try:
-                 possible_vec = json.loads(content)
-                 if isinstance(possible_vec, list) and len(possible_vec) > 0 and isinstance(possible_vec[0], (float, int)):
-                     raise ValueError("PRIME RULE VIOLATION: Embeddings cannot be stored as Truth.")
-             except json.JSONDecodeError:
-                 pass
-             except ValueError as e:
-                 raise e # Re-raise our own violation
-             except Exception:
-                 pass
+            # Rough check for vector/embedding dump
+            # If it looks like a list of floats, reject.
+            try:
+                possible_vec = json.loads(content)
+                if (
+                    isinstance(possible_vec, list)
+                    and len(possible_vec) > 0
+                    and isinstance(possible_vec[0], (float, int))
+                ):
+                    raise ValueError("PRIME RULE VIOLATION: Embeddings cannot be stored as Truth.")
+            except json.JSONDecodeError:
+                pass
+            except ValueError as e:
+                raise e  # Re-raise our own violation
+            except Exception:
+                pass
 
         return self._internal_remember(
             content=content,
             namespace=namespace,
             memory_type="fact",
-            confidence=1.0, # Facts are absolute
+            confidence=1.0,  # Facts are absolute
             source_uri=source_uri,
-            provenance_extras={}
+            provenance_extras={},
         )
 
-    def record_belief(self, content: str, derived_from: List[uuid.UUID], confidence: float, namespace: str = "public") -> Optional[uuid.UUID]:
+    def record_belief(
+        self,
+        content: str,
+        derived_from: List[uuid.UUID],
+        confidence: float,
+        namespace: str = "public",
+    ) -> Optional[uuid.UUID]:
         """
         Class B Ingestion: Epistemic Artifact.
         - Must have provenance (derived_from).
@@ -83,10 +96,14 @@ class SecureMemoryClient:
         """
         # Prime Rule Checks
         if not derived_from or not isinstance(derived_from, list):
-             raise ValueError("PRIME RULE VIOLATION: Beliefs must have explicit 'derived_from' provenance.")
+            raise ValueError(
+                "PRIME RULE VIOLATION: Beliefs must have explicit 'derived_from' provenance."
+            )
 
         if confidence is None or not (0.0 <= confidence <= 1.0):
-             raise ValueError("PRIME RULE VIOLATION: Beliefs must have a valid confidence score (0.0-1.0).")
+            raise ValueError(
+                "PRIME RULE VIOLATION: Beliefs must have a valid confidence score (0.0-1.0)."
+            )
 
         return self._internal_remember(
             content=content,
@@ -94,11 +111,12 @@ class SecureMemoryClient:
             memory_type="belief",
             confidence=confidence,
             source_uri=f"agent:{self.user.role}",
-            provenance_extras={"derived_from": [str(uid) for uid in derived_from]}
+            provenance_extras={"derived_from": [str(uid) for uid in derived_from]},
         )
 
-    def remember(self, content: str, namespace: str = "public",
-                 memory_type: str = "fact", **kwargs) -> Optional[uuid.UUID]:
+    def remember(
+        self, content: str, namespace: str = "public", memory_type: str = "fact", **kwargs
+    ) -> Optional[uuid.UUID]:
         """
         [DEPRECATED] Generic wrapper.
         Routes to specific methods or warns.
@@ -108,20 +126,29 @@ class SecureMemoryClient:
         if memory_type == "fact":
             return self.ingest_fact(content, namespace=namespace)
         elif memory_type == "belief":
-            derived = kwargs.get('derived_from', [])
-            conf = kwargs.get('confidence', 0.5)
+            derived = kwargs.get("derived_from", [])
+            conf = kwargs.get("confidence", 0.5)
             if not derived:
-                 # Soft violation for backward compat during migration?
-                 # NO. Prime Rule is law.
-                 raise ValueError("PRIME RULE VIOLATION: Cannot store belief without 'derived_from' via generic remember().")
+                # Soft violation for backward compat during migration?
+                # NO. Prime Rule is law.
+                raise ValueError(
+                    "PRIME RULE VIOLATION: Cannot store belief without 'derived_from' via generic remember()."
+                )
             return self.record_belief(content, derived, conf, namespace)
         else:
             # Default to Fact if ambiguous but warn?
             # Safer to fail.
-             raise ValueError(f"Unknown memory_type: {memory_type}")
+            raise ValueError(f"Unknown memory_type: {memory_type}")
 
-    def _internal_remember(self, content: str, namespace: str, memory_type: str,
-                           confidence: float, source_uri: str, provenance_extras: Dict) -> Optional[uuid.UUID]:
+    def _internal_remember(
+        self,
+        content: str,
+        namespace: str,
+        memory_type: str,
+        confidence: float,
+        source_uri: str,
+        provenance_extras: Dict,
+    ) -> Optional[uuid.UUID]:
         """
         Internal Secure Persist Logic.
         """
@@ -129,13 +156,15 @@ class SecureMemoryClient:
         authority_score = AccessControlService.calculate_write_authority(self.user, namespace)
 
         if authority_score == 0.0:
-            return None # Audit log handled in AccessControlService
+            return None  # Audit log handled in AccessControlService
 
         # 2. Construct Provenance Envelope
         envelope = ProvenanceEnvelope(
             actor=Actor(user_id=self.user.user_id, role=self.user.role),
             origin=self.origin,
-            scope=Scope(namespace=namespace, domain=namespace) # Domain mapped to namespace for now
+            scope=Scope(
+                namespace=namespace, domain=namespace
+            ),  # Domain mapped to namespace for now
         )
 
         # Merge extras (like derived_from)
@@ -143,10 +172,7 @@ class SecureMemoryClient:
         env_dict.update(provenance_extras)
 
         # 3. Payload Injection
-        secure_payload = {
-            "text": content,
-            "_provenance": env_dict
-        }
+        secure_payload = {"text": content, "_provenance": env_dict}
 
         serialized_content = json.dumps(secure_payload)
 
@@ -156,12 +182,14 @@ class SecureMemoryClient:
             source=source_uri,
             confidence=confidence,
             authority=authority_score,
-            memory_type=memory_type
+            memory_type=memory_type,
         )
 
         return event_id
 
-    def recall(self, query: str, top_k: int = 5, target_namespaces: List[str] = None) -> RecallResult:
+    def recall(
+        self, query: str, top_k: int = 5, target_namespaces: List[str] = None
+    ) -> RecallResult:
         """
         Secure Recall with Firewall Filtering.
         """
@@ -177,7 +205,7 @@ class SecureMemoryClient:
         for ns in target_namespaces:
             # Firewall Check: Can user read this namespace?
             # We create a dummy envelope for this high-level check
-            dummy_env = {'_provenance': {'scope': {'namespace': ns}}}
+            dummy_env = {"_provenance": {"scope": {"namespace": ns}}}
             if not AccessControlService.can_read(self.user, dummy_env):
                 continue
 
@@ -211,7 +239,7 @@ class SecureMemoryClient:
 
                     # Tag source
                     if provenance:
-                        actor = provenance.get('actor', {})
+                        actor = provenance.get("actor", {})
                         mem.source = f"{actor.get('role', 'unknown')} (Auth: {mem.authority:.2f})"
                     else:
                         mem.source = f"{ns} (Legacy)"
@@ -225,9 +253,7 @@ class SecureMemoryClient:
         all_memories.sort(key=lambda m: m.truth_score, reverse=True)
 
         return RecallResult(
-            memories=all_memories[:top_k],
-            query=query,
-            total_found=len(all_memories)
+            memories=all_memories[:top_k], query=query, total_found=len(all_memories)
         )
 
     def get_related(self, entity_id: uuid.UUID, depth: int = 1) -> List[Dict]:
@@ -241,11 +267,20 @@ class SecureMemoryClient:
         # We'll delegate to core client.
         return self._core_client.get_related(entity_id, depth)
 
+    _ALLOWED = {"recall", "remember", "flush", "close", "get_stats", "get_health"}
+
     def __getattr__(self, name):
-        """Delegate unknown methods to core client (e.g. get_stats, get_health)."""
+        if name not in self._ALLOWED:
+            raise AttributeError(f"{name} not permitted on SecureMemoryClient")
         return getattr(self._core_client, name)
 
-    def chat(self, user_message: str, system_prompt: Optional[str] = None, use_local: bool = True, smart_loop: bool = False) -> str:
+    def chat(
+        self,
+        user_message: str,
+        system_prompt: Optional[str] = None,
+        use_local: bool = True,
+        smart_loop: bool = False,
+    ) -> str:
         """
         Secure Chat with optional Smart Loop (Layer VI).
         """
@@ -265,7 +300,7 @@ Task: Identify one specific search query to find missing info. Return ONLY the q
                 next_query = self._core_client._generate_cloud(reflection_prompt)
 
             # Clean up query
-            next_query = next_query.strip().replace('"', '')
+            next_query = next_query.strip().replace('"', "")
 
             # Secondary Recall
             extra_res = self.recall(next_query, top_k=3)
@@ -276,7 +311,7 @@ Task: Identify one specific search query to find missing info. Return ONLY the q
         context_str = recall_res.to_context(max_chars=3000)
 
         # 3. Construct Prompt
-        full_prompt = f"""{system_prompt or 'You are a helpful assistant.'}
+        full_prompt = f"""{system_prompt or "You are a helpful assistant."}
 
 SECURITY CONTEXT:
 User Role: {self.user.role}
@@ -297,11 +332,17 @@ Assistant:"""
     def _get_namespace_clearance(self, namespace: str) -> int:
         """Helper to map namespace to required Grade."""
         from memory_thread.nervous.access_control import Grade
-        if "public" in namespace: return Grade.E_CLASS
-        if "team" in namespace: return Grade.C_CLASS
-        if "tech" in namespace: return Grade.B_CLASS
-        if "research" in namespace: return Grade.A_CLASS
-        if "secret" in namespace: return Grade.S_CLASS
+
+        if "public" in namespace:
+            return Grade.E_CLASS
+        if "team" in namespace:
+            return Grade.C_CLASS
+        if "tech" in namespace:
+            return Grade.B_CLASS
+        if "research" in namespace:
+            return Grade.A_CLASS
+        if "secret" in namespace:
+            return Grade.S_CLASS
         return Grade.C_CLASS
 
     # --- ADMIN CAPABILITY ---
@@ -310,13 +351,15 @@ Assistant:"""
         Root capability to view audit logs.
         """
         if self.user.role != "root":
-            ledger.log(AuditEvent(
-                action_type="ACCESS_DENIED",
-                actor_id=self.user.user_id,
-                role=self.user.role,
-                target="audit_log",
-                details={"reason": "requires_root"}
-            ))
+            ledger.log(
+                AuditEvent(
+                    action_type="ACCESS_DENIED",
+                    actor_id=self.user.user_id,
+                    role=self.user.role,
+                    target="audit_log",
+                    details={"reason": "requires_root"},
+                )
+            )
             return []
 
         return ledger.query(limit=limit)

@@ -1,76 +1,75 @@
+"""Retrieval service — graph-primary and vector fallback paths."""
+
 import logging
-from datetime import datetime
-from uuid import UUID
-from memory_thread.services.vector_service import search_vectors
-from memory_thread.services.graph_service import (
-    get_neighbors,
-    get_memories_by_ids,
-    keyword_search_memories,
-)
-from memory_thread.utils.embeddings import generate_embeddings_async
+from typing import List, Dict, Optional
+
 from memory_thread.config.settings import settings
-from memory_thread.services.tms_service import TruthVectorService
-from memory_thread.models.events import TruthVector
+from memory_thread.services.content_resolver import resolve_content as _resolve_content
 
 log = logging.getLogger(__name__)
 
 
+def _safe_float(val, default: float = 0.5) -> float:
+    if val is None:
+        return default
+    try:
+        return float(val)
+    except (TypeError, ValueError):
+        return default
+
+
 def retrieve_memories(query: str, top_k: int = 10) -> list:
+    log.warning(
+        "retrieve_memories() is deprecated and uses vector-only scoring. "
+        "Phase 3 of graph-core will replace this with graph-primary activation. "
+        "See docs/GRAPH_CORE_ARCHITECTURE.md"
+    )
+    from memory_thread.utils.embeddings import generate_embeddings_async
+    from memory_thread.services.vector_service import search_vectors
+
     query_embedding = generate_embeddings_async((query,))[0]
-    vector_candidates = search_vectors(query_embedding, top_k=40)
-    keyword_candidates = keyword_search_memories(q=query, k=20)
+    vector_candidates = search_vectors(query_embedding, top_k=top_k)
+    return [{"id": str(c.id), "score": c.score, "source": "vector"} for c in vector_candidates]
 
-    candidate_ids = {UUID(c.id) for c in vector_candidates} | {
-        res["id"] for res in keyword_candidates
-    }
-    if not candidate_ids:
-        return []
 
-    memories_data = get_memories_by_ids(list(candidate_ids))
-    if not memories_data:
-        return []
+def retrieve_by_activation(
+    seeds: List[str],
+    top_k: int = 10,
+    max_depth: int = 3,
+    decay: float = 0.5,
+    truth_threshold: float = 0.0,
+) -> List[Dict]:
+    """Graph-primary retrieval via spreading activation."""
+    from memory_thread.services.graph_engine import graph_engine
 
-    scored_memories = []
-    now = datetime.utcnow()
-    vector_scores = {UUID(c.id): c.score for c in vector_candidates}
-    keyword_scores = {res["id"]: res.get("keyword_score", 0.0) for res in keyword_candidates}
+    activated = graph_engine.activation(
+        seeds=seeds,
+        max_depth=max_depth,
+        decay_per_hop=decay,
+        truth_threshold=truth_threshold,
+    )
+    scored = []
+    for node_id, activation_score in activated.items():
+        if node_id not in {v["name"] for v in graph_engine.graph.vs}:
+            continue
+        node = graph_engine.graph.vs.find(name=node_id)
+        vattrs = node.attributes()
+        if vattrs.get("type") not in ("entity",):
+            continue
 
-    for memory_data in memories_data:
-        memory_id = memory_data["id"]
-        neighbors = get_neighbors(memory_id)
-
-        vector_similarity = vector_scores.get(memory_id, 0.0)
-        keyword_score = keyword_scores.get(memory_id, 0.0)
-        edge_weight_sum = sum(n.get("weight", 0.0) for n in neighbors)
-
-        graph_score = 0.0
-        if neighbors:
-            graph_score = min(edge_weight_sum / settings.MAX_EDGES_PER_NODE, 1.0)
-
-        importance = memory_data.get("importance", 0.5)
-
-        created_at = memory_data.get("created_at")
-        if created_at:
-            tv = TruthVector(
-                confidence=memory_data.get("confidence", 0.5),
-                authority=memory_data.get("authority", 0.5),
-                freshness=memory_data.get("freshness", 1.0),
-                corroboration=0.0,
-            )
-            memory_type = memory_data.get("type", "fact")
-            recency = TruthVectorService.decay_freshness(tv, created_at, memory_type)
-        else:
-            recency = 0.5
-
-        final_score = (
-            (settings.SCORE_WEIGHT_VECTOR * vector_similarity)
-            + (settings.SCORE_WEIGHT_KEYWORD * keyword_score)
-            + (settings.SCORE_WEIGHT_GRAPH * graph_score)
-            + (settings.SCORE_WEIGHT_IMPORTANCE * importance)
-            + (settings.SCORE_WEIGHT_RECENCY * recency)
+        truth_confidence = _safe_float(vattrs.get("truth_confidence"), 0.5)
+        truth_authority = _safe_float(vattrs.get("truth_authority"), 0.5)
+        truth_freshness = _safe_float(vattrs.get("truth_freshness"), 1.0)
+        truth_score = (truth_confidence * 0.4) + (truth_authority * 0.35) + (truth_freshness * 0.25)
+        final_score = (activation_score * truth_score) ** 0.5
+        scored.append(
+            {
+                "id": node_id,
+                "content": _resolve_content(node_id),
+                "score": final_score,
+                "activation": activation_score,
+                "truth_score": truth_score,
+                "source": "graph",
+            }
         )
-
-        memory_data["score"] = final_score
-        scored_memories.append(memory_data)
-
-    return sorted(scored_memories, key=lambda x: x["score"], reverse=True)[:top_k]
+    return sorted(scored, key=lambda x: -x["score"])[:top_k]

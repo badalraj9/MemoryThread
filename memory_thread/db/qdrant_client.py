@@ -21,7 +21,9 @@ class QdrantClientWrapper:
     def __init__(self):
         self.client = get_qdrant_client()
 
-    def create_collection_if_not_exists(self, collection_name: str, vector_size: int = 384):
+    def create_collection_if_not_exists(
+        self, collection_name: str, vector_size: int = settings.EMBEDDING_DIMENSION
+    ):
         """Create a collection if it doesn't exist."""
         try:
             self.client.get_collection(collection_name)

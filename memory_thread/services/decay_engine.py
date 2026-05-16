@@ -2,31 +2,62 @@ import logging
 import math
 import json
 from datetime import datetime, timedelta
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
+from memory_thread.config.settings import settings
 from memory_thread.db.postgres_client import PostgresClient
 from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)
 
+
+def _get_topology_factor(entity_id: str) -> float:
+    """Hub/bridge nodes get slower decay rates."""
+    try:
+        from memory_thread.services.graph_engine import graph_engine
+
+        if not graph_engine.is_built:
+            return 0.0
+        centrality = graph_engine.centrality(entity_id)
+        bridge = graph_engine.bridge_score(entity_id)
+        return min(1.0, (centrality * 2 + bridge * 3) / 5)
+    except Exception:
+        return 0.0
+
+
 # Decay Rates (Lambda) per type
 RATES = {
-    'fact': 0.001,      # Very slow
-    'preference': 0.01, # Medium
-    'event': 0.1,       # Fast
-    'prediction': 0.5,  # Very fast
-    'identity': 0.0     # Never decay
+    "fact": 0.001,  # Very slow
+    "preference": 0.01,  # Medium
+    "event": 0.1,  # Fast
+    "prediction": 0.5,  # Very fast
+    "identity": 0.0,  # Never decay
 }
+
 
 class DecayEngine:
     def __init__(self):
         self.pg = PostgresClient()
 
-    def calculate_freshness(self, current_freshness: float, days_elapsed: float, memory_type: str) -> float:
+    def calculate_freshness(
+        self,
+        current_freshness: float,
+        days_elapsed: float,
+        memory_type: str,
+        entity_id: Optional[str] = None,
+    ) -> float:
         """
         freshness(t) = freshness_0 * e^(-lambda * t)
+        When DECAY_USE_TOPOLOGY=True, hub/bridge nodes decay slower
+        (lambda reduced by up to DECAY_TOPOLOGY_SLOW_FACTOR).
         """
-        rate = RATES.get(memory_type, 0.02) # Default to 0.02
+        rate = RATES.get(memory_type, 0.02)
+
+        if settings.DECAY_USE_TOPOLOGY and entity_id and rate > 0:
+            topology_factor = _get_topology_factor(entity_id)
+            rate = rate * (1 - topology_factor * settings.DECAY_TOPOLOGY_SLOW_FACTOR)
+            rate = max(rate, 0.0001)
+
         if rate == 0:
             return 1.0
 
@@ -65,8 +96,8 @@ class DecayEngine:
             for row in rows:
                 entity_id = row[0]
                 tv = row[1]
-                m_type = row[2] or 'other'
-                last_update = row[3] # This is when state was updated.
+                m_type = row[2] or "other"
+                last_update = row[3]  # This is when state was updated.
                 # Ideally decay is based on time since last 'reinforcement'.
                 # Let's use last_update as proxy for now.
 
@@ -78,15 +109,15 @@ class DecayEngine:
                 days_elapsed = (now - last_update).total_seconds() / 86400.0
 
                 if days_elapsed < 1.0:
-                    continue # Skip if less than a day
+                    continue  # Skip if less than a day
 
-                current_freshness = tv.get('freshness', 1.0)
+                current_freshness = tv.get("freshness", 1.0)
                 new_freshness = self.calculate_freshness(current_freshness, days_elapsed, m_type)
 
                 if abs(new_freshness - current_freshness) < 0.01:
-                    continue # Optimization: skip negligible changes
+                    continue  # Optimization: skip negligible changes
 
-                tv['freshness'] = round(new_freshness, 4)
+                tv["freshness"] = round(new_freshness, 4)
 
                 # Recalculate generic score if needed, but TV is the source.
 
@@ -97,10 +128,15 @@ class DecayEngine:
 
             if not simulate and updates:
                 from psycopg2.extras import execute_batch
-                execute_batch(cur, """
+
+                execute_batch(
+                    cur,
+                    """
                     UPDATE entity_state
                     SET truth_vector = %s::jsonb
                     WHERE entity_id = %s
-                """, updates)
+                """,
+                    updates,
+                )
 
         return stats

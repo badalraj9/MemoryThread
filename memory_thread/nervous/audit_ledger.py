@@ -13,6 +13,7 @@ import os
 
 DEFAULT_AUDIT_PATH = os.path.expanduser("~/.mt/audit_ledger.jsonl")
 
+
 @dataclass
 class AuditEvent:
     id: str = field(default_factory=lambda: str(uuid.uuid4()))
@@ -24,17 +25,17 @@ class AuditEvent:
     details: Dict[str, Any] = field(default_factory=dict)
 
     def to_json(self) -> str:
-        return json.dumps({
-            "id": self.id,
-            "timestamp": self.timestamp,
-            "type": self.action_type,
-            "actor": {
-                "id": self.actor_id,
-                "role": self.role
-            },
-            "target": self.target,
-            "details": self.details
-        })
+        return json.dumps(
+            {
+                "id": self.id,
+                "timestamp": self.timestamp,
+                "type": self.action_type,
+                "actor": {"id": self.actor_id, "role": self.role},
+                "target": self.target,
+                "details": self.details,
+            }
+        )
+
 
 class AuditLedger:
     def __init__(self, file_path: str = DEFAULT_AUDIT_PATH):
@@ -53,7 +54,7 @@ class AuditLedger:
     def log(self, event: AuditEvent):
         """Append an event to the ledger."""
         try:
-            with open(self.file_path, 'a', encoding='utf-8') as f:
+            with open(self.file_path, "a", encoding="utf-8") as f:
                 f.write(event.to_json() + "\n")
         except Exception as e:
             # Fallback logging if file write fails - Audit must never fail silently
@@ -70,7 +71,7 @@ class AuditLedger:
                 return []
 
             # Read from end (efficient for tail) would be better, but for now scan whole
-            with open(self.file_path, 'r', encoding='utf-8') as f:
+            with open(self.file_path, "r", encoding="utf-8") as f:
                 lines = f.readlines()
 
             for line in reversed(lines):
@@ -79,15 +80,16 @@ class AuditLedger:
                 try:
                     data = json.loads(line)
                     if actor_id:
-                        if data['actor']['id'] != actor_id:
+                        if data["actor"]["id"] != actor_id:
                             continue
                     results.append(data)
-                except:
+                except Exception:
                     continue
         except Exception:
             return []
 
         return results
+
 
 # Singleton instance
 ledger = AuditLedger()

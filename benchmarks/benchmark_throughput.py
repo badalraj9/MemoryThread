@@ -17,6 +17,7 @@ import uuid
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from itertools import cycle
+from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -52,6 +53,8 @@ class Result:
     accepted_eps: float
     processed_eps: float
     duration_sec: float
+    write_path_metrics: Optional[dict[str, dict[str, float]]] = None
+    write_stats: Optional[dict[str, object]] = None
 
 
 def cognitive_work(payload: str) -> None:
@@ -290,6 +293,79 @@ def run_slab(duration_sec: float, producers: int, with_work: bool, wal_dir: Path
     )
 
 
+def run_sdk_direct(
+    duration_sec: float,
+    producers: int,
+    with_work: bool,
+    wal_dir: Path,
+    durability_mode: str,
+) -> Result:
+    admitted = 0
+    stop_at = time.perf_counter() + duration_sec
+    lock = threading.Lock()
+    pregenerated_ids = cycle(_pregenerate_event_ids(_estimate_id_count(duration_sec, producers)))
+
+    wal_module.close_all_wals()
+    wal_module.WAL_DIR = wal_dir
+    client = MemoryClient(
+        namespace=f"bench_sdk_{durability_mode}_{producers}_{int(with_work)}_{time.time_ns()}",
+        use_db=False,
+        use_slab_ingest=False,
+        durability_mode=durability_mode,
+        wal_flush_batch_size=100,
+        wal_flush_interval_ms=10,
+        enable_write_metrics=False,
+    )
+    client.reset_write_path_metrics()
+
+    def producer(offset: int):
+        nonlocal admitted
+        index = offset
+        while time.perf_counter() < stop_at:
+            item = _payload(index)
+            if with_work:
+                cognitive_work(item)
+            event_id = next(pregenerated_ids)
+            client.remember(
+                item,
+                source="benchmark",
+                confidence=0.8,
+                authority=0.5,
+                memory_type="fact",
+                entity_id=uuid.UUID(event_id),
+            )
+            with lock:
+                admitted += 1
+            index += producers
+
+    prod_threads = [threading.Thread(target=producer, args=(i,), daemon=True) for i in range(producers)]
+    for thread in prod_threads:
+        thread.start()
+    for thread in prod_threads:
+        thread.join()
+
+    write_path_metrics = client.get_write_path_metrics()
+    client.flush()
+    write_stats = client.get_write_stats()
+    client.close()
+    wal_module.close_all_wals()
+    processed = int(write_stats.get("durable_commit_count", admitted))
+
+    return Result(
+        name=f"sdk_direct_{durability_mode}_{producers}_{with_work}",
+        producers=producers,
+        with_cognitive_work=with_work,
+        system=f"sdk_direct_{durability_mode}",
+        accepted_events=admitted,
+        processed_events=processed,
+        accepted_eps=admitted / duration_sec,
+        processed_eps=processed / duration_sec,
+        duration_sec=duration_sec,
+        write_path_metrics=write_path_metrics,
+        write_stats=write_stats,
+    )
+
+
 def print_table(results: list[Result]) -> None:
     headers = (
         "Scenario",
@@ -337,6 +413,24 @@ def main():
 
     results: list[Result] = []
     for scenario in scenarios:
+        results.append(
+            run_sdk_direct(
+                args.duration,
+                scenario.producers,
+                scenario.with_cognitive_work,
+                wal_dir,
+                durability_mode="sync",
+            )
+        )
+        results.append(
+            run_sdk_direct(
+                args.duration,
+                scenario.producers,
+                scenario.with_cognitive_work,
+                wal_dir,
+                durability_mode="batched",
+            )
+        )
         results.append(run_mt(args.duration, scenario.producers, scenario.with_cognitive_work, wal_dir))
         results.append(run_slab(args.duration, scenario.producers, scenario.with_cognitive_work, wal_dir))
         results.append(run_baseline(args.duration, scenario.producers, scenario.with_cognitive_work))

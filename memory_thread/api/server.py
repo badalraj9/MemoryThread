@@ -14,6 +14,7 @@ Docs:
 import logging
 import sys
 import os
+import secrets
 from collections import defaultdict
 import time
 
@@ -25,12 +26,27 @@ for _lib in ["httpx", "httpcore", "urllib3", "sqlalchemy", "psycopg2"]:
 logging.getLogger("memory_thread").setLevel(logging.INFO)
 
 from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import uuid
 from datetime import datetime
 from contextlib import asynccontextmanager
+
+security = HTTPBearer(auto_error=False)
+
+
+async def verify_token(
+    creds: HTTPAuthorizationCredentials = Depends(security),
+) -> Optional[str]:
+    api_key = os.environ.get("MT_API_KEY", "")
+    if not api_key:
+        return None  # No key configured = no auth required
+    if creds is None or not secrets.compare_digest(creds.credentials, api_key):
+        raise HTTPException(status_code=401, detail="Invalid API key")
+    return creds.credentials
+
 
 from memory_thread.sdk import MemoryClient
 from memory_thread.utils.logger import get_logger
@@ -225,10 +241,12 @@ app.add_middleware(RequestLoggingMiddleware)
 # CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=os.environ.get("MT_ALLOWED_ORIGINS", "").split(",")
+    if os.environ.get("MT_ALLOWED_ORIGINS")
+    else ["*"],
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
+    allow_headers=["Authorization", "Content-Type", "X-Namespace", "X-API-Key"],
 )
 
 
@@ -453,7 +471,12 @@ async def health_check():
     )
 
 
-@app.post("/memory/remember", response_model=RememberResponse, tags=["Memory"])
+@app.post(
+    "/memory/remember",
+    response_model=RememberResponse,
+    tags=["Memory"],
+    dependencies=[Depends(verify_token)],
+)
 async def remember(request: RememberRequest):
     try:
         namespace = request.namespace or "default"
@@ -471,7 +494,12 @@ async def remember(request: RememberRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/memory/recall", response_model=RecallResponse, tags=["Memory"])
+@app.post(
+    "/memory/recall",
+    response_model=RecallResponse,
+    tags=["Memory"],
+    dependencies=[Depends(verify_token)],
+)
 async def recall(request: RecallRequest):
     try:
         namespace = request.namespace or "default"
@@ -500,7 +528,7 @@ async def recall(request: RecallRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/memory/check_contradiction", tags=["Memory"])
+@app.post("/memory/check_contradiction", tags=["Memory"], dependencies=[Depends(verify_token)])
 async def check_contradiction(request: RecallRequest):
     try:
         namespace = request.namespace or "default"
@@ -512,7 +540,7 @@ async def check_contradiction(request: RecallRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/stats")
+@app.get("/stats", dependencies=[Depends(verify_token)])
 async def get_stats(namespace: str = "default"):
     """Get Memory Thread stats."""
     try:
@@ -523,7 +551,7 @@ async def get_stats(namespace: str = "default"):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.delete("/memory/{entity_id}", tags=["Memory"])
+@app.delete("/memory/{entity_id}", tags=["Memory"], dependencies=[Depends(verify_token)])
 async def forget_memory(entity_id: str, client: MemoryClient = Depends(get_client)):
     """Delete a memory by entity_id."""
     try:
@@ -535,7 +563,7 @@ async def forget_memory(entity_id: str, client: MemoryClient = Depends(get_clien
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/memory/{entity_id}/golden-thread", tags=["Memory"])
+@app.get("/memory/{entity_id}/golden-thread", tags=["Memory"], dependencies=[Depends(verify_token)])
 async def get_golden_thread(entity_id: str, client: MemoryClient = Depends(get_client)):
     """
     Get the complete causal chain for a memory.
@@ -552,7 +580,12 @@ async def get_golden_thread(entity_id: str, client: MemoryClient = Depends(get_c
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/galaxy/fact", response_model=FactResponse, tags=["Galaxy"])
+@app.post(
+    "/galaxy/fact",
+    response_model=FactResponse,
+    tags=["Galaxy"],
+    dependencies=[Depends(verify_token)],
+)
 async def ingest_fact(request: FactRequest, client: MemoryClient = Depends(get_client)):
     try:
         fact_id = client.ingest_fact(
@@ -566,7 +599,12 @@ async def ingest_fact(request: FactRequest, client: MemoryClient = Depends(get_c
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/galaxy/belief", response_model=BeliefResponse, tags=["Galaxy"])
+@app.post(
+    "/galaxy/belief",
+    response_model=BeliefResponse,
+    tags=["Galaxy"],
+    dependencies=[Depends(verify_token)],
+)
 async def derive_belief(request: BeliefRequest, client: MemoryClient = Depends(get_client)):
     try:
         belief_id = client.derive_belief(
@@ -581,7 +619,7 @@ async def derive_belief(request: BeliefRequest, client: MemoryClient = Depends(g
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.post("/galaxy/query", tags=["Galaxy"])
+@app.post("/galaxy/query", tags=["Galaxy"], dependencies=[Depends(verify_token)])
 async def query_galaxy(request: GalaxyQueryRequest, client: MemoryClient = Depends(get_client)):
     try:
         kwargs = {
@@ -614,7 +652,7 @@ async def query_galaxy(request: GalaxyQueryRequest, client: MemoryClient = Depen
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/galaxy/stats", tags=["Galaxy"])
+@app.get("/galaxy/stats", tags=["Galaxy"], dependencies=[Depends(verify_token)])
 async def galaxy_stats(client: MemoryClient = Depends(get_client)):
     try:
         return client.galaxy_stats()
@@ -622,7 +660,7 @@ async def galaxy_stats(client: MemoryClient = Depends(get_client)):
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@app.get("/galaxy/conflicts", tags=["Galaxy"])
+@app.get("/galaxy/conflicts", tags=["Galaxy"], dependencies=[Depends(verify_token)])
 async def galaxy_conflicts(client: MemoryClient = Depends(get_client)):
     try:
         return {"conflicts": client.get_galaxy_conflicts()}

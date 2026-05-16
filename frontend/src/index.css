@@ -1,0 +1,150 @@
+@import "tailwindcss";
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&family=Inter:wght@400;500;600&display=swap');
+
+@theme {
+  /* Minimal Academic / Research Tool Colors */
+
+  /* Dark Mode Default */
+  --color-bg-base: #050607;
+  --color-bg-surface: #0b0f14;
+  --color-border-subtle: #1a1f26;
+  --color-border-default: #1a1f26;
+  
+  --color-text-primary: #d6d9df;
+  --color-text-secondary: #7a828e;
+  --color-text-tertiary: #4a505a;
+  
+  --color-accent-primary: #3dd68c;
+  --color-accent-secondary: #3dd68c;
+  
+  --color-truth-track: #1a1f26;
+  --color-truth-fill: #3dd68c;
+
+  /* Typography */
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', monospace;
+  
+  /* Status/Terminal Colors */
+  --color-status-success: #3dd68c;
+  --color-status-warning: #eab308;
+  --color-status-error: #ef4444;
+}
+
+/* Light Mode Overrides */
+@media (prefers-color-scheme: light) {
+  :root {
+    --color-bg-base: #f7f7f5;
+    --color-bg-surface: #ffffff;
+    --color-border-subtle: #e4e7ec;
+    --color-border-default: #e4e7ec;
+    
+    --color-text-primary: #111317;
+    --color-text-secondary: #6b7280;
+    --color-text-tertiary: #9ca3af;
+    
+    --color-accent-primary: #2f7a4f;
+    --color-accent-secondary: #2f7a4f;
+    
+    --color-truth-track: #e4e7ec;
+    --color-truth-fill: #2f7a4f;
+  }
+}
+
+/* Global styles */
+* {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html, body, #root {
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg-base);
+  color: var(--color-text-primary);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  overflow: hidden;
+}
+
+/* Scrollbar styling - Minimal */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: var(--color-border-subtle);
+  border-radius: 0;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-text-secondary);
+}
+
+/* Focus visible styling */
+:focus-visible {
+  outline: 1px solid var(--color-accent-primary);
+  outline-offset: 1px;
+}
+
+::selection {
+  background: var(--color-accent-primary);
+  color: var(--color-bg-base);
+}
+
+/* Utility classes */
+.font-mono {
+  font-family: var(--font-mono);
+}
+
+.text-primary { color: var(--color-text-primary); }
+.text-secondary { color: var(--color-text-secondary); }
+.text-accent { color: var(--color-accent-primary); }
+
+.bg-base { background-color: var(--color-bg-base); }
+.bg-surface { background-color: var(--color-bg-surface); }
+
+.border-subtle { border-color: var(--color-border-subtle); }
+
+/* Ambient background animation */
+.ambient-field {
+  background-image: 
+    radial-gradient(var(--color-text-secondary) 1px, transparent 1px),
+    radial-gradient(var(--color-text-secondary) 1px, transparent 1px);
+  background-position: 0 0, 25px 25px;
+  background-size: 50px 50px;
+  opacity: 0.04;
+  animation: ambientMove 60s linear infinite;
+}
+
+@keyframes ambientMove {
+  0% { transform: translateY(0); }
+  100% { transform: translateY(-50px); }
+}
+
+/* System Pulse for presence */
+@keyframes systemPulse {
+  0%, 100% { opacity: 0.3; transform: scale(0.95); }
+  50% { opacity: 1; transform: scale(1.05); }
+}
+.animate-system-pulse {
+  animation: systemPulse 3s ease-in-out infinite;
+}
+
+/* Title breathing */
+@keyframes breathe {
+  0%, 100% { opacity: 0.8; }
+  50% { opacity: 1; }
+}
+.animate-breathe {
+  animation: breathe 6s ease-in-out infinite;
+}

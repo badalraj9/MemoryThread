@@ -1,432 +1,344 @@
 # Memory Thread
 
-> **A Truth-Preserving Cognitive Memory System for AI**
+Memory Thread is a **truth-preserving, graph-native cognitive memory layer** for AI agents. It stores memories with provenance, confidence, authority, freshness, and corroboration metadata, then retrieves them via **graph spreading activation** instead of flat vector scoring.
 
-[![Python 3.9+](https://img.shields.io/badge/python-3.9+-blue.svg)](https://www.python.org/downloads/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/tests-passing-brightgreen.svg)](tests/)
-[![Docker](https://img.shields.io/badge/Docker-ready-blue.svg)](#docker)
+The key insight: memory isn't a bag of vectors — it's a **causal graph** of events, entities, beliefs, and their relationships. Memory Thread materializes this graph in memory (iGraph backend) and uses it as its primary cognitive fabric for retrieval, reasoning, and context management.
 
 ---
 
-## What is Memory Thread?
+## Core Concepts
 
-Memory Thread (MT) is a **cognitive memory layer** for AI systems that solves the fundamental problem of **truth preservation** in multi-agent environments. Unlike traditional vector databases, MT tracks the _provenance_, _confidence_, and _decay_ of every piece of information.
+### Truth Vector
 
-### Why MT?
+Every memory carries four dimensions of metadata:
 
-```
-Traditional Vector DB          Memory Thread
-────────────────────          ──────────────
-All data = equal              Truth vectors: confidence, authority, freshness
-No decay                      Freshness decays over time  
-No provenance                 Full event sourcing & audit trail
-Single agent                  Multi-agent belief dimensions
-```
+| Component | Range | Meaning |
+|-----------|-------|---------|
+| `confidence` | 0.0–1.0 | Certainty in the content itself |
+| `authority` | 0.0–1.0 | Trust level of the source (USER=1.0, AGENT=0.5) |
+| `freshness` | 0.0–1.0 | Temporal relevance (decays over time) |
+| `corroboration` | 0+ | Independent confirmations (logarithmic boost) |
 
----
+Combined into a `truth_score = (conf×0.4 + auth×0.35 + fresh×0.25) + log1p(corroboration)×0.1`, capped at 1.0.
 
-## Quick Start
+### Event Sourcing
 
-### Option 1: Docker (Recommended)
+Writes create **events**, not state snapshots. Entity state is **derived** from the event log. This enables replay, auditability, causal chain tracing (Golden Thread), and crash recovery.
 
-```bash
-# Clone and start everything with one command
-git clone https://github.com/badalraj/MemoryThread.git
-cd MemoryThread
-docker compose up -d
+### Materialized Graph
 
-# Access the API at http://localhost:8000
-# API docs at http://localhost:8000/docs
-```
+Every event, entity, belief, agent relationship, and thread is materialized into a **single in-memory iGraph**. The graph is rebuilt from PostgreSQL on startup (~250ms for 100K events) and updated incrementally on each write. All retrievals go through graph traversal — vector search is a fallback.
 
-### Option 2: From Source
+### WAL Durability
 
-```bash
-# Clone the repository
-git clone https://github.com/badalraj/MemoryThread.git
-cd MemoryThread
-
-# Create virtual environment (recommended)
-python -m venv venv
-source venv/bin/activate  # Linux/Mac
-# or: venv\Scripts\activate  # Windows
-
-# Install dependencies
-pip install -e .
-
-# Start PostgreSQL and Qdrant (or use Docker)
-# Then run:
-mt serve
-```
-
-### Option 3: Python API (Recommended)
-
-```python
-from memory_thread.sdk import MemoryClient
-
-# Connect using connection string (connects to local server by default)
-mt = MemoryClient.connect("mt://localhost:8000/my-project")
-
-# Or use environment variable MT_URL
-# mt = MemoryClient.connect_from_env()
-
-# Store memories with truth metadata
-mt.remember("User prefers dark mode", confidence=0.9, source="user")
-mt.remember("Project deadline is Friday", confidence=1.0, source="user")
-
-# Chat with memory context using cloud LLM
-response = mt.chat("What are my preferences?", provider="groq")
-print(response)
-```
-
-**Connection String Format:**
-- `mt://localhost:8000/default` - Local server, default namespace
-- `mt://localhost:8000/my-project` - Local server, custom namespace
-- `mt://api.memorythread.io/org/project?api_key=sk-xxx` - Cloud server with auth
-
----
-
-## CLI Commands
-
-```bash
-# Start API server
-mt serve                                    # http://localhost:8000
-mt serve --port 9000                        # Custom port
-mt serve --workers 4                       # Multiple workers
-
-# Initialize workspace
-mt init                                     # Create .mt/config.json
-
-# Chat with memory
-mt ask "what do you remember about me?"     # One-shot question
-mt                                          # Interactive chat mode
-
-# Search & manage memories
-mt search "preferences"                     # Search memories
-mt status                                   # System health + stats
-
-# Galaxy Schema (OLAP queries)
-mt galaxy stats                            # Fact/belief counts
-mt galaxy slice --source code              # Filter by source
-```
+An application-level write-ahead log protects accepted operations across multiple storage systems (PostgreSQL, Qdrant, in-memory). Two modes: `sync` (durable at each call) and `batched` (durable at explicit `flush()` / `close()`).
 
 ---
 
 ## Architecture
 
+### High-Level Data Flow
+
 ```
-┌─────────────────────────────────────────────────────────────────────────┐
-│                           Memory Thread Architecture                    │
-├─────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────────┐ │
-│  │  REST API   │  │  Python SDK  │  │   CLI (mt)  │  │  Docker Compose │ │
-│  │  FastAPI    │  │MemoryClient │  │  Typer+Rich │  │  PostgreSQL     │ │
-│  │   :8000     │  │   (Python)   │  │             │  │  Qdrant         │ │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └───────┬───────┘ │
-│         └───────────────┼─────────────────┼─────────────────┘         │
-│                         ▼                                           │
-│  ┌────────────────────────────────────────────────────────────────────┐│
-│  │                      Core Services                                 ││
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌─────────────┐  ││
-│  │  │    TMS     │  │   Galaxy   │  │   Decay    │  │   WAL       │  ││
-│  │  │  Service   │  │   Schema   │  │  Engine    │  │ (fsync)     │  ││
-│  │  │ (Truth)    │  │  (OLAP)    │  │ (Forget)   │  │ (Crash-safe)│  ││
-│  │  └─────┬──────┘  └─────┬──────┘  └─────┬──────┘  └──────┬──────┘  ││
-│  └────────┼───────────────┼───────────────┼───────────────┼─────────┘│
-│           ▼               ▼               ▼               ▼          │
-│  ┌────────────────────────────────────────────────────────────────────┐│
-│  │                       Persistence Layer                             ││
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌───────────┐  ││
-│  │  │  PostgreSQL │  │   Qdrant    │  │   SQLite    │  │   WAL     │  ││
-│  │  │  (Events)   │  │  (Vectors)  │  │ (Fallback)  │  │  Files    │  ││
-│  │  └─────────────┘  └─────────────┘  └─────────────┘  └───────────┘  ││
-│  └────────────────────────────────────────────────────────────────────┘│
-└─────────────────────────────────────────────────────────────────────────┘
+                   ┌──────────────┐
+                   │  MemoryClient │  ← Public SDK (unchanged API)
+                   │ remember()   │
+                   │ recall()     │
+                   └──────┬───────┘
+                          │
+              ┌───────────┼──────────────┐
+              ▼           ▼              ▼
+       ┌──────────┐ ┌──────────┐ ┌──────────────┐
+       │   WAL    │ │  Events  │ │ GraphEngine  │
+       │(crash    │ │(in mem)  │ │(iGraph in    │
+       │ safety)  │ │          │ │ memory)      │
+       └──────────┘ └──────────┘ └──────┬───────┘
+              │              │          │
+              ▼              ▼          ▼
+       ┌─────────────────────────────────────┐
+       │        Persistence Layer            │
+       │  ┌──────────┐  ┌──────────────────┐ │
+       │  │PostgreSQL │  │ Qdrant (optional)│ │
+       │  │ events   │  │ vector store     │ │
+       │  │ entity_  │  │ fallback recall  │ │
+       │  │ state    │  └──────────────────┘ │
+       │  │ relations│                       │
+       │  └──────────┘                       │
+       └─────────────────────────────────────┘
+                          │
+              ┌───────────┼──────────────┐
+              ▼           ▼              ▼
+       ┌──────────┐ ┌──────────┐ ┌──────────────┐
+       │ Golden   │ │ Recall   │ │ Decay/Prune  │
+       │ Thread   │ │(graph    │ │(topology-    │
+       │(graph    │ │ primary) │ │ aware)       │
+       │ native)  │ │          │ │              │
+       └──────────┘ └──────────┘ └──────────────┘
 ```
+
+### Write Path
+
+```
+remember()
+  → normalize metadata
+  → create Event (with TruthVector, action, actor, antecedents, thread_id)
+  → WAL.append(event) for crash recovery
+  → persist to PostgreSQL (events + entity_state tables)
+  → WAL.commit(event)
+  → GraphEngine.apply_event(event) — adds node + edges to in-memory iGraph
+  → schedule async enrichment (Qdrant indexing, embedding, NER, relation inference)
+  → return entity_id
+```
+
+All action types (`PLANT`, `ADD`, `REMOVE`, `UPDATE`, `OBSERVE`, `INFER`, `LINK`, `UNLINK`, `MERGE`) produce consistent graph mutations.
+
+### Read Path
+
+```
+recall(query, mode="hybrid")
+  → resolve query to seed nodes:
+      1. UUID match → direct graph lookup
+      2. Entity name/content match → graph search
+      3. Vector fallback → Qdrant semantic search → resolve to graph seeds
+  → GraphEngine.activation(seeds, max_depth=3, decay_per_hop=0.5, truth_threshold=0.3)
+      — BFS spreading activation along truth-weighted edges
+      — seed starts at 1.0, each hop attenuates by edge.confidence × decay
+      — multiple paths to same node → max activation wins
+      — stops at threshold
+  → score activated nodes by sqrt(activation × truth_score)
+  → if mode="hybrid" and too few results: fill from Qdrant vector search
+  → return top-K scored results
+```
+
+### Graph Model
+
+| Node Type | Label | Key Attributes |
+|-----------|-------|----------------|
+| Entity | `entity` | `entity_id, namespace, entity_type, content, truth_vector, importance` |
+| Event | `event` | `event_id, action, actor, namespace, timestamp, truth_vector, delta` |
+| Belief | `belief` | `belief_id, agent_id, content, confidence, authority, fact_id` |
+| Agent | `agent` | `agent_id, authority` |
+| Thread | `thread` | `thread_id, title, created_by, started_at, status` |
+| Workflow | `workflow` | `workflow_id, title, description, success_count` |
+| Step | `step` | `step_id, description, order` |
+
+| Edge Type | Direction | Description |
+|-----------|-----------|-------------|
+| `modifies` | Event → Entity | Entity state timeline |
+| `causes` | Event → Event | Causal DAG (antecedents) |
+| `relates` | Entity → Entity | Knowledge graph (typed relations via LINK/UNLINK) |
+| `about` | Belief → Entity | Belief references a fact/entity |
+| `holds` | Agent → Belief | Agent belief ownership |
+| `supports` / `contradicts` | Belief → Belief | Cross-agent agreement/conflict |
+| `contains` | Thread → Event/Entity | Thread membership |
+| `has_step` | Workflow → Step | Procedural step ordering |
+| `summarized_to` | Thread → Entity | Semantic summarization link |
+
+Every edge carries truth-weighted confidence. Activation propagates along edges attenuated by `edge.confidence × decay_per_hop`.
 
 ---
 
-## How It Works: Memory Flow
+## Components
 
-```
-┌──────────────────────────────────────────────────────────────────────────┐
-│                        Autonomous Chat Flow                               │
-└──────────────────────────────────────────────────────────────────────────┘
+### GraphEngine (`services/graph_engine.py`)
+The single in-memory materialized view of all graph data. Backed by iGraph (C core, thread-safe reads). Provides spreading activation, centrality, bridge scores, PageRank, Leiden community detection, contradiction cycle detection, and snapshot/load. Rebuilt from PostgreSQL on startup, updated incrementally on each `remember()`.
 
- User Input: "My name is John and I work at Acme"
-      │
-      ├─▶ 1. remember() ──────────────────────────────────────▶ WAL.prewrite
-      │        ├── Create TruthVector (confidence, authority, freshness)
-      │        ├── Entity extraction (NER)
-      │        ├── Relation inference  
-      │        ├── Persist to PostgreSQL + Qdrant
-      │        └── WAL.commit (crash-safe)
-      │
-      ├─▶ 2. check_contradiction() ─────────────────────────────▶ Flag conflicts
-      │
-      ├─▶ 3. recall() ──────────────────────────────────────────▶ Query memories
-      │        └── Vector search + truth filtering
-      │
-      ├─▶ 4. build_context() ──────────────────────────────────▶ Aggregate context
-      │
-      ├─▶ 5. generate_response() ──────────────────────────────▶ LLM (Groq/OpenRouter)
-      │        └── Prompt = system + context + user message
-      │
-      └─▶ 6. remember(response, source="agent") ──────────────▶ Store with lower authority
-```
+### Golden Thread (`services/golden_thread.py`)
+Traces the complete causal chain of an entity from origin to present state — all events, antecedents, truth evolution, and consistency verification. Uses GraphEngine (0 Postgres queries) instead of the old replay-based approach (~250x faster). Outputs a human-readable narrative with `render_rich()` for CLI.
+
+### Memory Tiers (`services/memory_tiers.py`)
+Three-tier memory management:
+
+| Tier | Location | Access | Capacity |
+|------|----------|--------|----------|
+| **Core** | LLM context window (injected as system prompt) | Instant | ~8K tokens |
+| **Episodic** | In-memory iGraph | ~1ms | Unlimited (RAM-bound) |
+| **Semantic** | Summarized facts in PostgreSQL | ~10ms (reload) | Unlimited |
+
+A `MemoryRouter` scores nodes for tier placement using activation, recency, centrality, and bridge scores. A `SummarizationPipeline` consolidates threads into extracted facts when they age out of episodic.
+
+### Context Monitor (`services/context_monitor.py`)
+Proactive context injection — the difference between a memory *database* (waits for query) and a memory *system* (surfaces what's relevant without being asked). On each agent turn:
+1. Extracts entity mentions from agent text
+2. Resolves them to graph nodes
+3. Runs graph activation to find related context
+4. Deduplicates against already-injected context
+5. Returns formatted context to prepend to the agent's prompt
+6. Prunes stale injections after N inactive turns
+
+### Thread Layer (`services/thread_service.py`)
+Groups events into conversation sessions via `contains` edges in the graph. Thread-aware recall returns sibling events (±5 positions for context). Threads can nest (parent/child for branching discussions). Thread search works across titles and event content.
+
+### Workflow Induction (`services/workflow_induction.py`)
+AWM-style procedural memory. Extracts reusable workflows from successful agent action trajectories in the event graph. Stores them as Workflow nodes with `has_step` edges. Semantic matching retrieves relevant workflows for agent input. Success counting enables confidence scoring.
+
+### Attestation Service (`services/attestation_service.py`)
+Merkle chain of event checkpoints for enterprise/regulatory use. Each checkpoint attests to system state at a point in time. Verification detects tampering — if any event or hash is modified, the chain breaks. Proves "at timestamp T, agent A knew fact F with confidence C."
+
+### Content Resolver (`services/content_resolver.py`)
+Shared utility that resolves entity node IDs to their latest content by finding the most recent `modifies` event. Used by retrieval, context monitor, and memory tiers — eliminates copy-pasted resolution logic.
+
+### Galaxy Core (`nervous/galaxy_core.py`)
+Multi-agent orchestration with per-agent fact/belief spaces in Qdrant, belief bridges (supports/contradicts), and cross-agent queries. Contradiction cycles detected via graph traversal. ConflictResolver uses authority, centrality, or temporal strategies.
+
+### Proxy Server (`proxy.py`)
+OpenAI-compatible API server (`mt-serve`). Works as a transparent middleware between any OpenAI-compatible backend (Ollama, vLLM, OpenAI, OpenRouter) and the client. Automatically:
+- Remembers conversations via MT
+- Injects relevant context via ContextMonitor
+- Redacts secrets (API keys, private keys, PII) via guardrails
+- Assigns thread IDs for session grouping
 
 ---
 
-## Configuration
-
-### Environment Variables
+## Install
 
 ```bash
-# Database (optional - falls back to in-memory)
-POSTGRES_HOST=localhost
-POSTGRES_PORT=5432
-POSTGRES_DB=memorythread
-POSTGRES_USER=postgres
-POSTGRES_PASSWORD=your_password
-
-# Vector DB (optional - falls back to keyword search)
-QDRANT_HOST=localhost
-QDRANT_PORT=6333
-
-# LLM Providers (for chat functionality)
-GROQ_API_KEY=your_groq_key          # Get from https://console.groq.com
-OPENROUTER_API_KEY=your_key         # Get from https://openrouter.ai/keys
-
-# Identity
-MT_USER=yourname
-MT_NAMESPACE=default
+python -m venv .venv
+.venv\Scripts\activate
+pip install -e .
 ```
 
-### Docker Compose Override
+Optional dependencies:
 
-Create `docker-compose.override.yml` to customize:
-
-```yaml
-services:
-  mt-api:
-    environment:
-      - GROQ_API_KEY=your_key
-    volumes:
-      - ./data:/data
+```bash
+pip install -e ".[db]"       # PostgreSQL + Qdrant
+pip install -e ".[api]"      # FastAPI + uvicorn
+pip install -e ".[cli]"      # Typer + Rich
+pip install -e ".[full]"     # all extras
 ```
 
----
-
-## API Documentation
-
-Start the server: `mt serve` or `uvicorn memory_thread.api.server:app`
-
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
-
-### Key Endpoints
-
-| Method | Endpoint           | Description                   |
-|--------|--------------------|-------------------------------|
-| POST   | `/memory/remember` | Store a memory with truth     |
-| POST   | `/memory/recall`   | Search memories (vector/keyword) |
-| POST   | `/galaxy/fact`     | Ingest a fact (L0)            |
-| POST   | `/galaxy/belief`   | Derive a belief (L1)          |
-| POST   | `/galaxy/query`    | OLAP query (SLICE/DICE/ROLL)  |
-| GET    | `/health`          | Health check                  |
-
----
-
-## Galaxy Schema (OLAP for Cognition)
+## Basic Usage
 
 ```python
-# Store raw facts (immutable)
-fact_id = mt.ingest_fact(
-    content=code,
-    source_uri="file://auth.py",
-    content_type="code"
+from memory_thread.sdk import MemoryClient
+
+client = MemoryClient(
+    namespace="demo",
+    use_db=False,
+    durability_mode="batched",
 )
 
-# Multiple agents derive beliefs from the same fact
-mt.derive_belief(fact_id, "Handles JWT securely", agent_id="SecurityBot", confidence=0.95)
-mt.derive_belief(fact_id, "Needs refactoring", agent_id="CodeReviewer", authority=0.8)
+memory_id = client.remember(
+    "User prefers dark mode",
+    source="user",
+    confidence=0.95,
+    authority=0.9,
+)
 
-# OLAP-style queries
-mt.query_galaxy("SLICE", source_uri="file://auth.py")  # All beliefs about auth.py
-mt.query_galaxy("DICE", agent_id="SecurityBot", min_authority=0.8)
+client.flush()
+results = client.recall("dark mode", min_truth_score=0.0)
+print(results.format())
+client.close()
 ```
 
----
-
-## Truth Vectors
-
-Every memory has a truth vector:
-
-| Component     | Range  | Description                              |
-|---------------|--------|------------------------------------------|
-| Confidence    | [0,1]  | Certainty in the information            |
-| Authority     | [0,1]  | Source credibility (user=1.0, agent=0.5)|
-| Freshness    | [0,1]  | Temporal relevance (decays over time)   |
-| Corroboration | [0,∞)  | Independent confirmations                |
-
-```python
-# Query with truth filtering
-results = mt.recall("user preferences", min_truth_score=0.5)
-```
-
----
-
-## Timewarp
-
-Memory Thread supports **temporal repair** through its Timewarp engine. When a late event arrives (e.g., backdated information), Timewarp:
-
-1. Inserts the late event into the event log
-2. Recomputes entity state from the nearest snapshot or from scratch
-3. Compares new state to old and flags significant deltas
-4. Updates the entity state in a single transaction
-
-```python
-from memory_thread.services.timewarp_engine import TimewarpEngine
-
-engine = TimewarpEngine()
-result = engine.insert_late_event(late_event)
-```
-
-This ensures the timeline remains consistent even with out-of-order events.
-
----
-
-## Contemplator
-
-The **Contemplator** is MT's self-observation engine. It runs periodic reflections to:
-
-- Assess memory health (truth score distribution)
-- Detect conflicts across agent beliefs
-- Identify access anomalies
-- Find stale domains (low freshness)
-- Recommend consolidation candidates
-
-```python
-from memory_thread.services.contemplator import Contemplator
-
-contemplator = Contemplator(auto_start=True)  # Runs daily automatically
-reflection = contemplator.daily_reflection()
-summary = contemplator.generate_insight_summary()
-print(summary)
-```
-
-The Contemplator persists insights to the `insights_log` table and loads previous reflections on startup.
-
----
-
-## Replay
-
-Memory Thread supports **event replay** for state reconstruction:
-
-1. **Snapshot Service** - Creates checkpoints of entity state
-2. **Replay Service** - Rebuilds state from snapshots + subsequent events
-3. **Timewarp Integration** - Uses nearest snapshot to optimize replay
-
-```python
-from memory_thread.services.replay_service import ReplayService
-from memory_thread.services.snapshot_service import SnapshotService
-
-replay = ReplayService()
-snapshot = SnapshotService()
-
-# Create a checkpoint
-snap_id = snapshot.take_snapshot(entity_state)
-
-# Rebuild from snapshot
-rebuilt = replay.replay_from_snapshot(entity_id, snap_id.timestamp)
-```
-
----
-
-## Golden Thread
-
-The **Golden Thread** is Memory Thread's audit trail - a chronological record of all state changes that can reconstruct the entire history of any entity. It combines:
-
-- **Event Sourcing**: Every change is an event
-- **WAL (Write-Ahead Log)**: Crash-safe persistence
-- **Audit Ledger**: Immutable record of access and modifications
-
-```python
-from memory_thread.nervous.audit_ledger import AuditLedger
-
-ledger = AuditLedger()
-entries = ledger.query(entity_id=my_entity, limit=100)
-
-for entry in entries:
-    print(f"{entry.timestamp}: {entry.action} by {entry.actor}")
-```
-
-The Golden Thread ensures traceability and enables debugging, compliance, and state recovery.
-
----
-
-## External Dependencies
-
-Memory Thread requires the following external services:
-
-- **PostgreSQL** - Event storage and entity state
-- **Qdrant** - Vector similarity search (optional, falls back to keyword)
-
-Qdrant can be installed separately:
-```bash
-# Download Qdrant
-curl -L https://get.qdrant.io -o qdrant.sh
-bash qdrant.sh
-
-# Or use Docker
-docker run -p 6333:6333 qdrant/qdrant
-```
-
----
-
-## Testing
+### Proxy Server
 
 ```bash
-# Run all tests
-pytest
-
-# With coverage
-pytest --cov=memory_thread
-
-# Specific test
-pytest tests/test_sdk.py -v
+mt-serve                                          # Ollama backend (default)
+mt-serve --backend https://api.openai.com/v1      # OpenAI
+mt-serve --backend https://api.openrouter.ai/v1   # OpenRouter
 ```
+
+Then point any OpenAI-compatible app to `http://localhost:8000/v1`.
+
+### Durability Modes
+
+| Mode | Return Boundary | Durable Boundary | Throughput |
+|------|----------------|------------------|------------|
+| `sync` | After WAL flush | Each `remember()` | ~277 EPS |
+| `batched` | After WAL buffer accept | `flush()` or `close()` | ~4,780 EPS |
+
+### Commands
+
+| Command | Description |
+|---------|-------------|
+| `mt` | CLI entry point (Typer app, ~1223 lines) |
+| `mt-api` | FastAPI server |
+| `mt-serve` | OpenAI-compatible proxy with MT guardrails |
+| `memorythread` | TUI control centre (Textual) |
 
 ---
 
-## Project Structure
+## Key Files
 
-```
-MemoryThread/
-├── memory_thread/
-│   ├── api/              # REST API (FastAPI)
-│   ├── db/               # Database clients (PostgreSQL, Qdrant, SQLite)
-│   ├── nervous/          # Vault, Galaxy Core, Audit
-│   ├── services/         # Core services (TMS, WAL, Decay)
-│   └── utils/            # CLI, embeddings, logging
-├── tests/                # Test suite
-├── docs/                 # Architecture & design docs
-├── docker-compose.yml    # One-command startup
-├── pyproject.toml        # Python packaging
-└── README.md
-```
+| File | Purpose |
+|------|---------|
+| `memory_thread/sdk.py` | Public SDK — `MemoryClient` (2680 lines, to be split) |
+| `memory_thread/models/events.py` | Event, EntityState, TruthVector, ActionEnum, ActorEnum |
+| `memory_thread/services/graph_engine.py` | Core iGraph-backed graph (539 lines) |
+| `memory_thread/services/golden_thread.py` | Causal chain tracing via graph (497 lines) |
+| `memory_thread/services/thread_service.py` | Conversation session management (247 lines) |
+| `memory_thread/services/context_monitor.py` | Proactive context injection (206 lines) |
+| `memory_thread/services/memory_tiers.py` | Hot/warm/cold memory management (236 lines) |
+| `memory_thread/services/workflow_induction.py` | AWM-style procedural memory (222 lines) |
+| `memory_thread/services/attestation_service.py` | Merkle chain attestation (285 lines) |
+| `memory_thread/services/content_resolver.py` | Entity content resolution utility (39 lines) |
+| `memory_thread/services/pruner.py` | Topology-aware pruning (135 lines) |
+| `memory_thread/services/decay_engine.py` | Topology-aware decay (142 lines) |
+| `memory_thread/proxy.py` | OpenAI-compatible proxy (343 lines) |
+| `memory_thread/nervous/galaxy_core.py` | Multi-agent orchestration (356 lines) |
+| `memory_thread/nervous/conflict_resolution.py` | Contradiction detection & resolution |
+| `memory_thread/config/settings.py` | All config flags (206 lines) |
+| `docs/GRAPH_CORE_ARCHITECTURE.md` | Full architecture design doc (2252 lines) |
+| `docs/continuity.md` | Session handover — what's built, what remains |
 
 ---
 
-## License
+## Verification
 
-MIT License - see [LICENSE](LICENSE) for details.
+```bash
+pytest tests/ -q
+pytest test_cognitive_simulation.py -q   # End-to-end: 3 sessions, cross-thread, contradictions
+```
+
+Key test files:
+- `tests/test_golden_thread_reconstruction.py` — graph-native golden thread correctness
+- `tests/test_truth_retrieval_quality.py` — truth-weighted recall quality
+- `tests/test_memory_client_durability_modes.py` — sync/batched durability boundaries
+- `tests/test_wal_recovery.py` — WAL crash recovery
+- `tests/test_qdrant_dimension_guard.py` — vector dimension safety
+- `tests/test_namespace_isolation.py` — namespace isolation
 
 ---
 
-## Acknowledgments
+## Status
 
-- Truth Maintenance Systems (TMS) research
-- OLAP/Galaxy Schema concepts from data warehousing
-- The open-source AI community
+### Implemented
+
+| Phase | Feature | Files |
+|-------|---------|-------|
+| 0.5 | Schema cleanup + Galaxy DI | Archived 7 schema files, GalaxyCore accepts GraphEngine |
+| 1 | GraphEngine (iGraph backend) | `services/graph_engine.py` |
+| 2 | Golden Thread (graph-native) | `services/golden_thread.py` — 250x faster, 0 Postgres queries |
+| 3 | Graph-primary recall | `recall_graph()`, `_resolve_seeds()`, `retrieve_by_activation()` |
+| 4 | Topology-aware decay + prune | Config-gated (PRUNE_USE_TOPOLOGY, DECAY_USE_TOPOLOGY) |
+| 5 | Galaxy unified graph | Dual-write bridges, contradiction cycles via graph |
+| 6 | Session & thread layer | `services/thread_service.py`, thread nodes, contains edges |
+| 7 | Memory tiers | `services/memory_tiers.py`, Router scoring, SummarizationPipeline |
+| 8 | Proactive context injection | `services/context_monitor.py`, entity extraction, dedup, token budget |
+| 9 | Workflow induction (AWM-style) | `services/workflow_induction.py`, extract + match workflows |
+| 10 | Memory attestation | `services/attestation_service.py`, Merkle chain, tamper detection |
+
+### Remaining
+
+| Priority | Task | Effort |
+|----------|------|--------|
+| HIGH | Split `sdk.py` god class (2680 lines → `sdk/` package) | 1-2 days |
+| HIGH | Split `cli.py` god class (1223 lines) | 1 day |
+| MEDIUM | Consolidate `api/server.py` + `api/main.py` | — |
+| MEDIUM | Typed event delta validation (Pydantic discriminated unions) | — |
+| LOW | Graph snapshot on startup/shutdown | — |
+| LOW | Delta validation in `_apply` (LINK validates target_id exists, etc.) | — |
+| LOW | Dynamic decay rates per edge type | — |
+
+---
+
+## Documentation
+
+| File | Purpose |
+|------|---------|
+| `docs/README.md` | Documentation map |
+| `docs/GRAPH_CORE_ARCHITECTURE.md` | Full 2252-line graph-neural core architecture |
+| `docs/continuity.md` | Session handover — what's built and what remains |
+| `docs/THESIS.md` | Thesis-ready system description |
+| `test_cognitive_simulation.py` | Runnable end-to-end demo |

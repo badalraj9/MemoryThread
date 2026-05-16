@@ -40,8 +40,8 @@ class Settings(BaseSettings):
     MT_NAMESPACE: str = "default"
 
     # Legacy/fallback - individual connection vars (used if MT_URL not set)
-    POSTGRES_USER: str = "user"
-    POSTGRES_PASSWORD: str = "password"
+    POSTGRES_USER: str = os.environ.get("POSTGRES_USER", "")
+    POSTGRES_PASSWORD: str = os.environ.get("POSTGRES_PASSWORD", "")
     POSTGRES_SERVER: str = "localhost"
     POSTGRES_PORT: int = 5432
     POSTGRES_DB: str = "memory_thread_db"
@@ -114,8 +114,9 @@ class Settings(BaseSettings):
     }
 
     # Embedding Configuration
-    EMBEDDING_DIMENSION: int = 1536
+    EMBEDDING_DIMENSION: int = 384
     EMBEDDING_DISTANCE: str = "Cosine"
+    QDRANT_AUTO_RECREATE_COLLECTION_ON_DIMENSION_MISMATCH: bool = False
 
     # ZMQ Configuration
     ZMQ_FABRIC_ADDRESS: str = "ipc://fabric_router"
@@ -128,6 +129,12 @@ class Settings(BaseSettings):
     # Performance Tuning
     SLAB_COUNT: int = 128
     SLAB_SIZE: int = 65536
+    WAL_DURABILITY_MODE: str = "sync"
+    WAL_FLUSH_BATCH_SIZE: int = 100
+    WAL_FLUSH_INTERVAL_MS: int = 10
+    WAL_COMPACT_ON_CLOSE: bool = True
+    MEMORY_CLIENT_EVENT_LOG_MAX: int = 100000
+    WRITE_PATH_METRICS_ENABLED: bool = True
 
     # Benchmark Configuration
     BENCHMARK_TARGET_EPS: int = 50000
@@ -152,6 +159,48 @@ class Settings(BaseSettings):
     # Namespace Authority Weights
     # Weight applied to global namespace memories during recall merge
     GLOBAL_AUTHORITY_WEIGHT: float = 0.8
+
+    # Graph Recall (Phase 3)
+    MT_RECALL_MODE: str = "vector"  # "vector" | "graph" | "hybrid"
+    RECALL_GRAPH_MAX_DEPTH: int = 3
+    RECALL_GRAPH_DECAY: float = 0.5
+    RECALL_GRAPH_MIN_SEEDS: int = 1
+    RECALL_VECTOR_FALLBACK: bool = True
+
+    # Topology-Aware Prune (Phase 4)
+    PRUNE_USE_TOPOLOGY: bool = False
+    PRUNE_TOPOLOGY_BOOST: float = 0.3
+
+    # Topology-Aware Decay (Phase 4)
+    DECAY_USE_TOPOLOGY: bool = False
+    DECAY_TOPOLOGY_SLOW_FACTOR: float = 0.5
+
+    # Memory Tiers (Phase 7)
+    TIERS_ENABLED: bool = False
+    TIERS_CORE_MAX_TOKENS: int = 8000
+    TIERS_ACTIVATION_CORE_THRESHOLD: float = 0.7
+    TIERS_ACTIVATION_EPISODIC_THRESHOLD: float = 0.3
+    TIERS_EPISODIC_DAYS: int = 7
+    TIERS_SUMMARIZE_AFTER_EVENTS: int = 50
+    TIERS_ARCHIVE_INTERVAL_HOURS: int = 24
+
+    # Proactive Context Injection (Phase 8)
+    CONTEXT_INJECTION_ENABLED: bool = True
+    CONTEXT_INJECTION_MAX_TOKENS: int = 2000
+    CONTEXT_INJECTION_ACTIVATION_THRESHOLD: float = 0.3
+    CONTEXT_INJECTION_MAX_DEPTH: int = 2
+    CONTEXT_INJECTION_DECAY: float = 0.7
+    CONTEXT_INJECTION_MAX_SEEDS: int = 5
+    CONTEXT_INJECTION_STALE_TURNS: int = 5
+
+    # Workflow Induction (Phase 9)
+    WORKFLOW_INDUCTION_ENABLED: bool = True
+    WORKFLOW_MIN_EVENTS: int = 2
+    WORKFLOW_TOP_K: int = 3
+
+    # Memory Attestation (Phase 10)
+    ATTESTATION_ENABLED: bool = False
+    ATTESTATION_CHECKPOINT_INTERVAL: int = 100
 
 
 settings = Settings()

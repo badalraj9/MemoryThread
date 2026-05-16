@@ -20,3 +20,4 @@ prometheus-client
 fastapi
 uvicorn
 zmq
+python-igraph

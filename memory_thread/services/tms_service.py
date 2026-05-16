@@ -38,13 +38,13 @@ class TruthVectorService:
         Returns:
             Weighted composite score
         """
-        # Use configurable weights from settings
         W1 = settings.TMS_WEIGHT_CONFIDENCE
         W2 = settings.TMS_WEIGHT_AUTHORITY
         W3 = settings.TMS_WEIGHT_FRESHNESS
         W4 = settings.TMS_WEIGHT_CORROBORATION
 
-        # Logarithmic scaling for corroboration (unbounded positive)
+        total_weight = W1 + W2 + W3 + W4
+
         corr_score = math.log(1 + vector.corroboration)
 
         score = (
@@ -52,8 +52,8 @@ class TruthVectorService:
             + (W2 * vector.authority)
             + (W3 * vector.freshness)
             + (W4 * corr_score)
-        )
-        return score
+        ) / total_weight
+        return min(score, 1.0)
 
     @staticmethod
     def decay_freshness(

@@ -2,28 +2,33 @@
 Conflict Resolution for Galaxy Architecture.
 
 Detects and resolves contradictions between agent beliefs.
+Uses GraphEngine for fast cycle detection (Phase 5).
+Falls back to Postgres + NetworkX if GraphEngine unavailable.
 """
 
 from typing import List, Dict, Any, Optional
-import networkx as nx
 from memory_thread.utils.logger import get_logger
 
 log = get_logger(__name__)
 
 
+def _va(vertex, attr: str, default=None):
+    """Safe attribute access for iGraph vertices"""
+    return vertex.attributes().get(attr, default)
+
+
 class ConflictGraph:
-    """
-    Represents the galaxy structure:
-    Nodes = Beliefs
-    Edges = Relationships (supports/contradicts)
-    """
+    """Thin wrapper. In-memory conflicts now use GraphEngine directly."""
 
     def __init__(self):
-        self.graph = nx.DiGraph()
+        from memory_thread.services.graph_engine import graph_engine
+
+        self.ge = graph_engine
 
     def add_belief(self, belief: Dict):
-        self.graph.add_node(
+        self.ge._ensure_node(
             belief["id"],
+            type="belief",
             agent=belief.get("agent_id"),
             content=belief.get("content"),
             confidence=belief.get("confidence", 0.5),
@@ -31,16 +36,11 @@ class ConflictGraph:
         )
 
     def add_relationship(self, belief_a_id, belief_b_id, rel_type, weight):
-        self.graph.add_edge(belief_a_id, belief_b_id, type=rel_type, weight=weight)
+        if not self.ge.graph.are_adjacent(belief_a_id, belief_b_id):
+            self.ge.graph.add_edge(belief_a_id, belief_b_id, type=rel_type, weight=weight)
 
     def find_conflicts(self) -> List[List[str]]:
-        """Find groups (clusters) of contradictory beliefs."""
-        conflict_edges = [
-            (u, v) for u, v, d in self.graph.edges(data=True) if d.get("type") == "contradicts"
-        ]
-        undirected_conflict_graph = nx.Graph()
-        undirected_conflict_graph.add_edges_from(conflict_edges)
-        return list(nx.connected_components(undirected_conflict_graph))
+        return self.ge.contradiction_cycles()
 
 
 class ConflictResolver:
@@ -67,9 +67,55 @@ class ConflictResolver:
 
     def detect_conflicts(self, universes: Dict, agent_registry: Dict) -> List[Dict]:
         """
-        Detect conflicts across agent universes by querying Qdrant.
-        Searches for semantically similar beliefs across different agents.
+        Detect conflicts across agent universes.
+
+        Fast path: uses GraphEngine.contradiction_cycles() to find
+        connected components formed by 'contradicts' edges.
+
+        Slow path: falls back to Qdrant semantic search + NetworkX.
         """
+        try:
+            from memory_thread.services.graph_engine import graph_engine
+
+            if graph_engine.graph.vcount() > 0:
+                cycles = graph_engine.contradiction_cycles()
+                if cycles:
+                    conflicts = []
+                    for cycle in cycles:
+                        conflicts.append(
+                            {
+                                "fact_id": f"graph_cycle_{len(conflicts)}",
+                                "beliefs": [
+                                    {
+                                        "id": n,
+                                        "agent_id": _va(
+                                            graph_engine.graph.vs.find(name=n),
+                                            "agent_id",
+                                            "unknown",
+                                        ),
+                                        "content": _va(
+                                            graph_engine.graph.vs.find(name=n), "content", ""
+                                        ),
+                                        "confidence": _va(
+                                            graph_engine.graph.vs.find(name=n), "confidence", 0.5
+                                        ),
+                                        "authority": _va(
+                                            graph_engine.graph.vs.find(name=n), "authority", 0.5
+                                        ),
+                                    }
+                                    for n in cycle
+                                ],
+                                "type": "contradiction_cycle",
+                                "severity": "high" if len(cycle) > 3 else "medium",
+                                "source": "graph",
+                            }
+                        )
+                    self._conflicts = conflicts
+                    log.info(f"GraphEngine detected {len(conflicts)} conflict cycles")
+                    return conflicts
+        except Exception as e:
+            log.debug(f"GraphEngine conflict detection unavailable: {e}")
+
         try:
             from memory_thread.utils.embeddings import embed_text
 
