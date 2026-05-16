@@ -240,6 +240,10 @@ class MemoryClient:
             self._pg = PostgresClient()
             self._db_type = "postgres"
             log.info("PostgreSQL connected")
+
+            from memory_thread.services.graph_engine import graph_engine
+
+            graph_engine.rebuild(self._pg)
         except Exception as e:
             log.warning(f"PostgreSQL unavailable: {e}. Trying SQLite...")
             self._pg = None
@@ -418,6 +422,8 @@ class MemoryClient:
         memory_type: str = "fact",
         entity_id: Optional[uuid.UUID] = None,
         thread_id: Optional[str] = None,
+        antecedents: Optional[List[uuid.UUID]] = None,
+        action: Optional[str] = None,
     ) -> uuid.UUID:
         if self._slab_ingest is not None:
             if entity_id is None:
@@ -442,6 +448,8 @@ class MemoryClient:
             memory_type=memory_type,
             entity_id=entity_id,
             thread_id=thread_id,
+            antecedents=antecedents or [],
+            action=action,
         )
 
     def _remember_direct(
@@ -455,6 +463,8 @@ class MemoryClient:
         wal_seq: Optional[int] = None,
         wal_prewritten: bool = False,
         thread_id: Optional[str] = None,
+        antecedents: Optional[List[uuid.UUID]] = None,
+        action: Optional[str] = None,
     ) -> uuid.UUID:
         overall_started = time.perf_counter()
         entity_id = entity_id or uuid.uuid4()
@@ -480,6 +490,8 @@ class MemoryClient:
             authority=authority,
             memory_type=memory_type,
             thread_id=thread_id,
+            antecedents=antecedents or [],
+            action=action,
         )
         self._persist_required_state(entity_id, content, memory_type, state, event)
         if self.durability_mode == "batched" and not wal_prewritten:
@@ -614,7 +626,16 @@ class MemoryClient:
         return authority
 
     def _apply_memory_event(
-        self, entity_id, content, source, confidence, authority, memory_type, thread_id=None
+        self,
+        entity_id,
+        content,
+        source,
+        confidence,
+        authority,
+        memory_type,
+        thread_id=None,
+        antecedents=None,
+        action=None,
     ):
         started = time.perf_counter()
         truth_vector = TruthVector.model_construct(
@@ -622,7 +643,10 @@ class MemoryClient:
         )
         actor = ActorEnum.USER if source == "user" else ActorEnum.AGENT
         event_id = uuid.uuid4()
-        action = ActionEnum.ADD if entity_id not in self._memories else ActionEnum.UPDATE
+        if action is None:
+            action = ActionEnum.ADD if entity_id not in self._memories else ActionEnum.UPDATE
+        elif isinstance(action, str):
+            action = ActionEnum(action)
         delta = {"content": content, "type": memory_type, "namespace": self.namespace}
         tid = uuid.UUID(thread_id) if thread_id else None
         event = Event.model_construct(
@@ -633,7 +657,7 @@ class MemoryClient:
             action=action,
             object_id=entity_id,
             delta=delta,
-            antecedents=[],
+            antecedents=antecedents or [],
             truth_vector=truth_vector,
             thread_id=tid,
         )

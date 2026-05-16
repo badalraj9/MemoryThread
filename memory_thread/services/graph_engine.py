@@ -57,6 +57,21 @@ class GraphEngine:
 
     # ── Lifecycle ──────────────────────────────────────────────────────
 
+    @staticmethod
+    def _parse_antecedents(raw: Any) -> list:
+        if isinstance(raw, list):
+            return raw
+        if isinstance(raw, str):
+            raw = raw.strip()
+            if raw in ("{}", ""):
+                return []
+            if raw.startswith("{") and raw.endswith("}"):
+                inner = raw[1:-1]
+                parts = [p.strip().strip('"') for p in inner.split(",") if p.strip()]
+                return parts
+            return [raw]
+        return []
+
     def rebuild(self, pg) -> None:
         """Full rebuild from PostgreSQL events table. Called once on startup."""
         self.clear()
@@ -69,15 +84,18 @@ class GraphEngine:
         count = 0
         for row in rows:
             try:
+                raw_ants = row.get("antecedents")
+                antecedents = self._parse_antecedents(raw_ants)
+                delta = row.get("delta") or {}
                 event = Event(
-                    id=row.get("id") or row[0],
-                    namespace=row.get("namespace") or row[1],
-                    timestamp=row.get("timestamp") or row[2],
-                    actor=row.get("actor") or row[3],
-                    action=row.get("action") or row[4],
-                    object_id=row.get("object_id") or row[5],
-                    delta=row.get("delta") or row[6] or {},
-                    antecedents=row.get("antecedents") or row[7] or [],
+                    id=row.get("id"),
+                    namespace=row.get("namespace", "user"),
+                    timestamp=row.get("timestamp"),
+                    actor=row.get("actor"),
+                    action=row.get("action"),
+                    object_id=row.get("object_id"),
+                    delta=delta,
+                    antecedents=antecedents,
                     truth_vector=TruthVector(
                         confidence=0.5, authority=0.5, freshness=1.0, corroboration=0.0
                     ),
@@ -98,8 +116,8 @@ class GraphEngine:
         try:
             rels = pg.fetch_all("SELECT * FROM relations")
             for rel in rels:
-                src = str(rel.get("source_entity_id") or rel[0])
-                tgt = str(rel.get("target_entity_id") or rel[1])
+                src = str(rel.get("source_entity_id"))
+                tgt = str(rel.get("target_entity_id"))
                 self._ensure_node(src, type="entity")
                 self._ensure_node(tgt, type="entity")
                 if self.graph.are_adjacent(src, tgt):
@@ -108,8 +126,8 @@ class GraphEngine:
                     src,
                     tgt,
                     type="relates",
-                    relation_type=rel.get("relation_type") or rel[2],
-                    confidence=float(rel.get("confidence", 1.0) or rel[3]),
+                    relation_type=str(rel.get("relation_type", "")),
+                    confidence=float(rel.get("confidence", 1.0)),
                     is_inferred=bool(rel.get("is_inferred", False)),
                 )
         except Exception as e:
@@ -118,9 +136,9 @@ class GraphEngine:
         try:
             bridges = pg.fetch_all("SELECT * FROM belief_bridges")
             for bridge in bridges:
-                a = str(bridge.get("belief_a_id") or bridge[0])
-                b = str(bridge.get("belief_b_id") or bridge[1])
-                rel = bridge.get("relationship") or bridge[4]
+                a = str(bridge.get("belief_a_id"))
+                b = str(bridge.get("belief_b_id"))
+                rel = bridge.get("relationship")
                 self._ensure_node(a, type="belief")
                 self._ensure_node(b, type="belief")
                 if self.graph.are_adjacent(a, b):
@@ -129,7 +147,7 @@ class GraphEngine:
                     a,
                     b,
                     type=rel,
-                    confidence=float(bridge.get("confidence", 1.0) or bridge[5]),
+                    confidence=float(bridge.get("confidence", 1.0)),
                 )
         except Exception as e:
             log.debug("Could not load belief_bridges: %s", e)
