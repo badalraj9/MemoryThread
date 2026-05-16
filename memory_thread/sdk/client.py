@@ -494,6 +494,9 @@ class MemoryClient:
             action=action,
         )
         self._persist_required_state(entity_id, content, memory_type, state, event)
+        from memory_thread.services.graph_engine import graph_engine
+
+        graph_engine.apply_event(event)
         if self.durability_mode == "batched" and not wal_prewritten:
             self._wal_append_committed(
                 entity_id=entity_id,
@@ -870,7 +873,7 @@ class MemoryClient:
                     event.action.value,
                     str(event.object_id),
                     json.dumps(event.delta),
-                    [str(uid) for uid in event.antecedents],
+                    [uid for uid in event.antecedents],
                     json.dumps(
                         {
                             "confidence": event.truth_vector.confidence,

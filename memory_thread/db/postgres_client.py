@@ -9,10 +9,13 @@ This module provides a production-ready PostgreSQL client with:
 """
 
 import atexit
+import uuid as _uuid
 import psycopg2
 from psycopg2.pool import ThreadedConnectionPool
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import RealDictCursor, register_uuid
 from contextlib import contextmanager
+
+register_uuid()
 from typing import Optional, Dict, Any
 from threading import Lock
 
