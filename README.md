@@ -138,13 +138,12 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
                     ▼              ▼          ▼
              ┌──────────────────────────────────────┐
              │         Persistence Layer             │
-             │  ┌────────────┐  ┌─────────────────┐ │
-             │  │ PostgreSQL │  │ Qdrant (optional)│ │
-             │  │ events     │  │ vector store     │ │
-             │  │ entity_    │  │ fallback recall  │ │
-             │  │ state      │  └─────────────────┘ │
-             │  │ relations  │                       │
-             │  └────────────┘                       │
+             │  ┌──────────────────────────────────┐ │
+             │  │ PostgreSQL                       │ │
+             │  │ events (tsvector + GIN for FTS)  │ │
+             │  │ entity_state                     │ │
+             │  │ relations                        │ │
+             │  └──────────────────────────────────┘ │
              └──────────────────────────────────────┘
                                 │
                     ┌───────────┼──────────────┐
@@ -168,7 +167,7 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
   ├─ persist to PostgreSQL (events + entity_state)
   ├─ WAL.commit(event)
   ├─ GraphEngine.apply_event(event)       ← add node + edges to iGraph
-  └─ schedule async enrichment            ← Qdrant, embeddings, NER, inference
+  └─ schedule async enrichment            ← NER, relation inference
      └─ return entity_id
 </pre>
 
@@ -180,7 +179,7 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
   ├─ resolve query to seed nodes:
   │    1. UUID match         → direct graph lookup
   │    2. name/content match → graph search
-  │    3. vector fallback    → Qdrant → resolve to graph seeds
+  │    3. Postgres FTS       → entity_ids → graph seeds
   │
   ├─ GraphEngine.activation(seeds, depth=3, decay=0.5, threshold=0.3)
   │    ┌────────────────────────────────────────────────────────┐
@@ -190,7 +189,7 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
   │    └────────────────────────────────────────────────────────┘
   │
   ├─ score nodes: sqrt(activation × truth_score)
-  ├─ fill from vector search if too few results
+  ├─ fill from keyword search if too few results
   └─ return top-K scored results
 </pre>
 
@@ -333,7 +332,7 @@ memory_thread/
 ├── <b>models/</b>                 # Pydantic schemas (Event, EntityState, TruthVector)
 ├── <b>db/</b>                     # Database clients + schema archive
 ├── <b>config/</b>                # Settings (pydantic-settings)
-└── <b>utils/</b>                 # Embeddings, secure_sdk, health
+└── <b>utils/</b>                 # secure_sdk, health
 </pre>
 
 <br>
@@ -350,11 +349,11 @@ pytest tests/ -q       # 20 tests, 2 skipped (perf benchmarks)
 <tr><td><code>test_truth_retrieval_quality.py</code></td><td>Truth-weighted recall ranks high-truth memories higher</td></tr>
 <tr><td><code>test_memory_client_durability_modes.py</code></td><td>Sync/batched durability boundaries, WAL flush, compaction</td></tr>
 <tr><td><code>test_wal_recovery.py</code></td><td>Crash recovery at 5 sizes (10, 30, 50, 70, 90 entries)</td></tr>
-<tr><td><code>test_qdrant_dimension_guard.py</code></td><td>Graceful handling of embedding dimension mismatch</td></tr>
+<tr><td><code>test_postgres_fts_search.py</code></td><td>Postgres full-text search correctness</td></tr>
 <tr><td><code>test_namespace_isolation.py</code></td><td>Cross-namespace reads blocked. Truth scores isolated.</td></tr>
 <tr><td><code>test_contradiction_accuracy.py</code></td><td>Precision and recall of contradiction detection</td></tr>
 <tr><td><code>test_decay_curves.py</code></td><td>Freshness decay matches mathematical specification</td></tr>
-<tr><td><code>test_graceful_degradation.py</code></td><td>Behavior under Postgres/Qdrant/embedding failures</td></tr>
+<tr><td><code>test_graceful_degradation.py</code></td><td>Behavior under Postgres failures</td></tr>
 </table>
 
 <br>

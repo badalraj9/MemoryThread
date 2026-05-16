@@ -37,4 +37,4 @@ In `batched` mode, a write returns after WAL records are accepted into the WAL b
 
 ## Enrichment
 
-The optimized system treats Qdrant indexing, embeddings, entity extraction, and relation inference as enrichment. These tasks run asynchronously and do not block the direct write path.
+The optimized system treats entity extraction and relation inference as enrichment. These tasks run asynchronously and do not block the direct write path.

@@ -50,7 +50,7 @@ Flat retrieval = fast matching, bad reasoning. The graph topology IS the cogniti
 
 - Visual graph rendering (this is an infrastructure change, not a UI one)
 - Replacing PostgreSQL (it stays as the event store and read-model persistence)
-- Replacing Qdrant entirely (it becomes a fallback recall mode)
+- Replacing the event-sourcing model (graph is a derived view, not a new primary store)
 - Breaking existing WAL format (new action types serialize the same way)
 
 ---
@@ -86,7 +86,7 @@ A single `GraphEngine` that materializes the event log into an **in-memory iGrap
 |------|-------|---------------|--------|
 | Entity | `entity` | `entity_id, namespace, entity_type, content, truth_vector, created_at, updated_at, importance, access_count` | `events` table (projected), `entities` table |
 | Event | `event` | `event_id, action, actor, namespace, timestamp, truth_vector, delta` | `events` table (each row = 1 node) |
-| Belief | `belief` | `belief_id, agent_id, content, confidence, authority, fact_id` | Galaxy `beliefs` Qdrant collections |
+| Belief | `belief` | `belief_id, agent_id, content, confidence, authority, fact_id` | Galaxy `beliefs` table |
 | Agent | `agent` | `agent_id, authority` | Galaxy `agents` table |
 
 ### Edge Types
@@ -148,16 +148,16 @@ When activation propagates along an edge, the propagated signal is attenuated by
        └──────────┘ └──────────┘ └──────┬───────┘
               │              │          │
               ▼              ▼          ▼
-       ┌─────────────────────────────────────┐
-       │        Persistence Layer            │
-       │  ┌──────────┐  ┌──────────────────┐ │
-       │  │PostgreSQL │  │ Qdrant (optional)│ │
-       │  │ events   │  │ vector store     │ │
-       │  │ entity_  │  │ fallback recall  │ │
-       │  │ state    │  └──────────────────┘ │
-       │  │ relations│                       │
-       │  └──────────┘                       │
-       └─────────────────────────────────────┘
+        ┌────────────────────────────────────────┐
+        │        Persistence Layer              │
+        │  ┌──────────────────────────────────┐ │
+        │  │PostgreSQL                        │ │
+        │  │ events (search_vector tsvector   │ │
+        │  │   + GIN index for FTS)           │ │
+        │  │ entity_state                     │ │
+        │  │ relations                        │ │
+        │  └──────────────────────────────────┘ │
+        └────────────────────────────────────────┘
                           │
               ┌───────────┼──────────────┐
               ▼           ▼              ▼
@@ -180,17 +180,17 @@ remember()
   → persist to PostgreSQL (events + entity_state)
   → WAL.commit(event)
   → GraphEngine.apply_event(event)    ← NEW (non-blocking, synchronous)
-  → schedule async enrichment (Qdrant, NER, relation inference)
+  → schedule async enrichment (NER, relation inference)
   → return entity_id
 ```
 
 **Read path (changes significantly):**
 ```
 recall(query)
-  → resolve query to seed nodes (entity match + vector fallback)
+  → resolve query to seed nodes (entity match + FTS fallback)
   → GraphEngine.activation(seeds, max_depth=3, truth_threshold=0.3)
   → score activated subgraph by activation × truth_vector
-  → if not enough results: fallback to Qdrant vector search
+  → if not enough results: fallback to keyword search via Postgres FTS
   → return scored results
 ```
 
@@ -199,8 +199,7 @@ recall(query)
 ```
 1. Load settings
 2. Connect to PostgreSQL
-3. Connect to Qdrant (if configured)
-4. GraphEngine.rebuild(pg)
+3. GraphEngine.rebuild(pg)
    → Single query: "SELECT * FROM events ORDER BY timestamp"
    → Apply each event to iGraph (entities, events, antecedents, relations)
    → Load belief_bridges → add supports/contradicts edges
@@ -475,7 +474,7 @@ GraphEngine.read_lock = threading.Lock()   # for apply_event only
   → On conflict edges, keep ALL (multiple contradictions over time).
 - Database unavailable at startup:
   → GraphEngine starts empty, populates as events are remembered.
-  → Graceful degradation: recall falls back to vector-only.
+  → Graceful degradation: recall falls back to keyword-only via FTS.
 ```
 
 ---
@@ -698,18 +697,18 @@ def _graph_neighbors_paths(self, entity_node: str) -> List[Dict]:
 
 ### The Core Change
 
-**Before:** Vector search is primary. Graph is dead code (broken import).
+**Before:** Vector search was primary. Graph was dead code (broken import).
 
 ```
 embed(query) → Qdrant search → flat score → sort → return top K
 ```
 
-**After:** Graph activation is primary. Vector search is fallback.
+**After:** Graph activation is primary. Postgres FTS resolves seeds.
 
 ```
-resolve(query → seeds) → graph activation → score → return
-                                   ↓
-                    (fallback) vector search if too few results
+FTS query → entity_ids (seeds) → graph activation → score → return
+                                    ↓
+               (fallback) keyword search via FTS if too few results
 ```
 
 ### New Recall Pipeline
@@ -721,22 +720,22 @@ def recall(
     top_k: int = 10,
     min_truth_score: float = 0.0,
     namespace: Optional[str] = None,
-    mode: str = "hybrid",  # "graph" | "vector" | "hybrid"
+    mode: str = "hybrid",  # "graph" | "keyword" | "hybrid"
     max_graph_depth: int = 3,
     graph_decay: float = 0.5,
 ) -> List[Dict]:
     """
-    Recall memories using graph-primary retrieval with vector fallback.
+    Recall memories using graph-primary retrieval with keyword fallback.
     
     Args:
         mode: "graph" = graph activation only
-              "vector" = Qdrant vector search only (legacy behavior)
-              "hybrid" = graph primary, vector fallback (default)
+              "keyword" = keyword search via Postgres FTS only
+              "hybrid" = graph primary, keyword fallback (default)
     """
-    if mode == "vector":
-        return self._recall_vector(query, top_k)
+    if mode == "keyword":
+        return self._recall_keyword(query, top_k)
     
-    # Step 1: Resolve query to seed nodes
+    # Step 1: Resolve query to seed nodes via FTS
     seeds = self._resolve_query_to_nodes(query)
     
     # Step 2: Spreading activation
@@ -753,8 +752,8 @@ def recall(
     
     # Step 4: Fallback if graph returned too few results
     if mode == "hybrid" and len(scored) < top_k:
-        vector_results = self._recall_vector(query, top_k - len(scored))
-        scored = self._hybrid_fusion(scored, vector_results)
+        keyword_results = self._recall_keyword(query, top_k - len(scored))
+        scored = self._hybrid_fusion(scored, keyword_results)
     
     return scored[:top_k]
 ```
@@ -764,12 +763,12 @@ def recall(
 ```python
 def _resolve_query_to_nodes(self, query: str) -> List[str]:
     """
-    Find seed nodes for a query.
+    Find seed nodes for a query via Postgres FTS.
     
     Strategy:
     1. Check if query contains explicit entity mentions (names/UUIDs)
     2. If so, resolve to existing graph nodes
-    3. If not, use vector search to find semantically similar entities
+    3. If not, use Postgres FTS to find matching entities
     4. Return top 5 matching nodes as seeds
     """
     seeds = []
@@ -785,7 +784,6 @@ def _resolve_query_to_nodes(self, query: str) -> List[str]:
     
     # 2. Named entity resolution (from content)
     if not seeds:
-        # Exact name/attribute match in graph
         for v in graph_engine.graph.vs:
             if v["type"] == "entity":
                 content = v.get("content", "")
@@ -793,13 +791,18 @@ def _resolve_query_to_nodes(self, query: str) -> List[str]:
                 if query.lower() in str(content).lower() or query.lower() in str(name).lower():
                     seeds.append(v["name"])
     
-    # 3. Vector fallback for seed resolution
+    # 3. Postgres FTS fallback for seed resolution
     if not seeds:
-        query_embedding = generate_embeddings_async((query,))[0]
-        vector_results = search_vectors(query_embedding, top_k=5)
-        for r in vector_results:
-            if str(r.id) in graph_engine.node_index:
-                seeds.append(str(r.id))
+        fts_results = pg.execute("""
+            SELECT entity_id FROM events
+            WHERE search_vector @@ plainto_tsquery('english', %s)
+            AND object_id IS NOT NULL
+            LIMIT 5
+        """, (query,))
+        for row in fts_results:
+            entity_id = str(row['entity_id'])
+            if entity_id in graph_engine.node_index:
+                seeds.append(entity_id)
     
     return seeds[:5]
 ```
@@ -868,11 +871,16 @@ def retrieve_by_activation(
     )
     return _score_and_sort(activated)
 
-def retrieve_by_vector(query: str, top_k: int = 10) -> List[Dict]:
-    """Vector-only retrieval (legacy path)."""
-    query_embedding = generate_embeddings_async((query,))[0]
-    candidates = search_vectors(query_embedding, top_k=top_k)
-    return [{"id": str(c.id), "score": c.score} for c in candidates]
+def retrieve_by_keyword(query: str, top_k: int = 10) -> List[Dict]:
+    """Keyword retrieval via Postgres FTS."""
+    candidates = pg.execute("""
+        SELECT entity_id, ts_rank(search_vector, plainto_tsquery('english', %s)) AS score
+        FROM events
+        WHERE search_vector @@ plainto_tsquery('english', %s)
+        ORDER BY score DESC
+        LIMIT %s
+    """, (query, query, top_k))
+    return [{"id": str(c["entity_id"]), "score": c["score"]} for c in candidates]
 
 def _score_and_sort(activated: Dict[str, float]) -> List[Dict]:
     """Score activated nodes and return sorted results."""
@@ -889,11 +897,11 @@ In `memory_thread/config/settings.py`:
 
 ```python
 # Graph Retrieval
-MT_RECALL_MODE: str = "hybrid"  # "graph" | "vector" | "hybrid"
+MT_RECALL_MODE: str = "hybrid"  # "graph" | "keyword" | "hybrid"
 RECALL_GRAPH_MAX_DEPTH: int = 3
 RECALL_GRAPH_DECAY: float = 0.5
 RECALL_GRAPH_MIN_SEEDS: int = 1
-RECALL_VECTOR_FALLBACK: bool = True
+RECALL_FTS_FALLBACK: bool = True
 ```
 
 ### Migration Strategy (Critical)
@@ -901,10 +909,10 @@ RECALL_VECTOR_FALLBACK: bool = True
 This is the **highest risk change** in the entire project. Rollout plan:
 
 1. **Phase 3a:** Add `recall_graph()` method to SDK (NEW method, doesn't touch existing `recall()`)
-2. **Phase 3b:** Add `mode` parameter to `recall()` with default `"vector"` (unchanged behavior)
+2. **Phase 3b:** Add `mode` parameter to `recall()` with default `"keyword"` (unchanged behavior)
 3. **Phase 3c:** Run both paths in shadow mode — compare recall_graph vs recall results silently
 4. **Phase 3d:** When graph quality is verified, change default to `"hybrid"`
-5. **Phase 3e:** After sufficient burn-in, remove `"vector"` mode (or keep as opt-in)
+5. **Phase 3e:** After sufficient burn-in, remove `"keyword"` mode (or keep as opt-in)
 
 Each step is reversible. Gating via `MT_RECALL_MODE` env var means rollback = flip one env var.
 
@@ -989,7 +997,7 @@ When `False`, `_get_topology_factor()` returns `0.0` and the old scoring formula
 
 Currently, Galaxy has its own separate graph infrastructure:
 - `GalaxyBridge` with a separate `belief_bridges` table
-- `AgentMemorySpace` with per-agent Qdrant collections
+- `AgentMemorySpace` with per-agent memory namespaces
 - `ConflictGraph` (NetworkX) rebuilt from scratch each time
 
 **After unification:** All galaxy data becomes edges in the single materialized GraphEngine graph.
@@ -1023,7 +1031,7 @@ Dual-write ensures zero data loss during migration. The `belief_bridges` table c
 # In GalaxyCore.query_galaxy(), new graph-native path:
 
 def query_galaxy_graph(self, query: str, requesting_agent: Optional[str] = None):
-    """Cross-agent query using graph traversal instead of multi-Qdrant-search."""
+    """Cross-agent query using graph traversal instead of multi-collection search."""
     # 1. Find the requesting agent's node
     agent_node = f"agent_{requesting_agent}" if requesting_agent else None
     
@@ -1129,11 +1137,11 @@ def resolve(self, conflict: List[str], strategy: str = "authority") -> Dict:
 | `db/schema_phase_*.sql` | Existing migrations are immutable. |
 | `db/postgres_client.py` | Connection pooling stays. GraphEngine uses PostgresClient the same way. |
 | `db/sqlite_client.py` | Same Postgres-compatible interface. |
-| `db/qdrant_client.py` | Qdrant stays as vector fallback. |
+| `db/qdrant_client.py` | REMOVED — Qdrant no longer used. FTS replaces vector search. |
 | `api/server.py` | All existing endpoints unchanged. New endpoints optional. |
 | `cli.py` (~1223 lines) | CLI commands unchanged. Underlying calls change transparently. |
 | `tests/conftest.py` | Existing fixtures unchanged. New fixtures added. |
-| `docker-compose.yml` | Services unchanged. |
+| `docker-compose.yml` | Qdrant service removed. Only Postgres remains. |
 | `setup.py` / `pyproject.toml` | Only add `python-igraph` dependency. |
 
 ### Rollback Plan
@@ -1145,7 +1153,7 @@ Every change has a rollback:
 | GraphEngine | Delete file, `sdk.py` catches import error, skips graph |
 | LINK/UNLINK actions | Remove from ActionEnum, replay ignores them |
 | Golden Thread rewrite | Revert to old `golden_thread.py` (keep file as `golden_thread_v1.py` during transition) |
-| Graph-primary recall | Set `MT_RECALL_MODE=vector` → exact old behavior |
+| Graph-primary recall | Set `MT_RECALL_MODE=keyword` → keyword-only via FTS |
 | Topology-aware pruner | Set `PRUNE_USE_TOPOLOGY=False` → exact old behavior |
 | Galaxy unified graph | Dual-write ensures belief_bridges table is always current |
 
@@ -1216,12 +1224,11 @@ Every change has a rollback:
 
 ### Phase 3 — Graph-Primary Recall (2 weeks, HIGH risk)
 
-**Deliverable:** `recall()` with `MT_RECALL_MODE` config. Default stays `"vector"`. Graph mode available via `recall_graph()`.
+**Deliverable:** `recall()` with `MT_RECALL_MODE` config. Default is `"hybrid"`. Graph mode available via `recall_graph()`.
 
 **Files modified:**
 - `memory_thread/sdk.py` — recall method + recall_graph + seed resolution
 - `memory_thread/services/retrieval_service.py` — rewrite to support both paths
-- `memory_thread/services/vector_service.py` — minor adjustments if needed
 - `memory_thread/config/settings.py` — recall mode config
 
 **Tests:**
@@ -1240,13 +1247,13 @@ Every change has a rollback:
   - Assert graph results are never worse than vector (by configurable margin)
 
 **Acceptance criteria:**
-- [ ] `MT_RECALL_MODE=vector` produces identical results to pre-graph recall
+- [ ] `MT_RECALL_MODE=keyword` produces keyword-only results via Postgres FTS
 - [ ] `MT_RECALL_MODE=graph` produces relevant results with meaningful topology
-- [ ] `MT_RECALL_MODE=hybrid` never returns FEWER results than vector alone
-- [ ] Seed resolution works with entity IDs, names, and arbitrary text
-- [ ] Cold-start: empty graph falls back to 100% vector
+- [ ] `MT_RECALL_MODE=hybrid` never returns FEWER results than keyword alone
+- [ ] Seed resolution works with entity IDs, names, and arbitrary text via FTS
+- [ ] Cold-start: empty graph falls back to 100% keyword FTS
 - [ ] Config-gated rollback works (flip env var, restart, exact old behavior)
-- [ ] Latency: graph recall < 20ms for 1000-node graph (vs ~15ms vector)
+- [ ] Latency: graph recall < 20ms for 1000-node graph
 
 ### Phase 4 — Topology-Aware Decay & Prune (3 days, LOW risk)
 
@@ -1281,12 +1288,12 @@ Every change has a rollback:
 
 **Tests:**
 - `tests/test_galaxy_unification.py` (NEW):
-  - Cross-agent query via graph returns same results as via Qdrant
+  - Cross-agent query via graph returns same results as via table scan
   - Conflict detection via graph cycles matches old connected_components
   - Dual-write: belief_bridges table and graph both contain same edges
 
 **Acceptance criteria:**
-- [ ] Galaxy cross-agent queries work via graph traversal (not per-agent Qdrant search)
+- [ ] Galaxy cross-agent queries work via graph traversal (not per-agent search)
 - [ ] Conflict detection uses existing graph edges (no full scan)
 - [ ] Dual-write: both belief_bridges table and graph are consistent
 - [ ] AutoBridge creates edges that reach GraphEngine
@@ -1360,10 +1367,10 @@ def test_shadow_mode_recall_quality():
     queries = ["who is Elon Musk?", "Python async patterns", ...]
     
     for q in queries:
-        vector_results = client.recall(q, mode="vector")
+        keyword_results = client.recall(q, mode="keyword")
         graph_results = client.recall(q, mode="graph")
         
-        assert len(graph_results) >= len(vector_results) * 0.8  # at most 20% fewer
+        assert len(graph_results) >= len(keyword_results) * 0.8  # at most 20% fewer
         assert graph_results[0]["score"] >= 0.3  # meaningful scores
 ```
 
@@ -1438,24 +1445,24 @@ def test_activation_large_graph(benchmark):
 
 **Trade-off:** Startup time. 100K events → ~250ms rebuild. Acceptable for a Python service startup. Can add binary snapshot later if needed.
 
-### Decision 4: Activation replaces flat scoring, not vector search
+### Decision 4: Activation replaces flat scoring, with FTS fallback
 
-**Chosen:** Graph activation is PRIMARY retrieval mechanism. Vector search is FALLBACK for cold starts.
+**Chosen:** Graph activation is PRIMARY retrieval mechanism. Postgres FTS is used for SEED RESOLUTION and fallback.
 
 **Rationale:**
 - Graph-connected retrieval produces STRUCTURED results (paths, context, contradictions)
 - Flat vector scoring produces INDEPENDENT results (no awareness of relationships)
 - For well-connected entities, graph is strictly better (returns the subgraph, not just the node)
-- For cold queries (no seed entity), vector search fills the gap
+- For cold queries (no seed entity), FTS fills the gap
 
-**Trade-off:** Two retrieval paths to maintain. But the vector path already existed. We're adding the graph path in parallel, not replacing.
+**Trade-off:** Two retrieval paths to maintain. FTS replaces the old Qdrant vector path entirely.
 
 ### Decision 5: Config-gated rollback for retrieval change
 
 **Chosen:** Every behavior change has a configuration flag that preserves old behavior.
 
 **Rationale:**
-- `MT_RECALL_MODE=vector` = exact pre-graph behavior
+- `MT_RECALL_MODE=keyword` = keyword-only via FTS (pre-graph approximation)
 - `PRUNE_USE_TOPOLOGY=False` = exact pre-graph pruning
 - Rollback = flip one env var and restart
 - No data migration required to roll back

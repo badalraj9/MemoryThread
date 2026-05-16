@@ -27,11 +27,11 @@ Writes create events. Entity state is derived from those events. This supports r
 
 ### Durability
 
-Memory Thread uses an application-level WAL because a memory write may span multiple storage systems. The WAL protects accepted operations even when PostgreSQL, SQLite, or Qdrant behavior differs.
+Memory Thread uses an application-level WAL because a memory write may span multiple storage systems. The WAL protects accepted operations even when PostgreSQL or SQLite behavior differs.
 
 ## Current Architecture
 
-The optimized direct write path keeps required state mutation in the foreground and moves optional enrichment to the background. Qdrant indexing, embeddings, entity extraction, and relation inference do not block `remember()` in the optimized path.
+The optimized direct write path keeps required state mutation in the foreground and moves optional enrichment to the background. Entity extraction and relation inference do not block `remember()` in the optimized path.
 
 ## Evaluation
 
@@ -49,7 +49,7 @@ Latest focused verification:
 14 passed, 1 warning
 ```
 
-Validated behavior includes WAL recovery, batched durability boundaries, Qdrant dimension guard behavior, async indexing drain on close, and truth-weighted recall ranking.
+Validated behavior includes WAL recovery, batched durability boundaries, tsvector migration, async enrichment drain on close, and truth-weighted recall ranking.
 
 ## Claims To Use
 
@@ -67,6 +67,6 @@ Validated behavior includes WAL recovery, batched durability boundaries, Qdrant 
 ## Future Work
 
 - WAL sharding or per-thread WAL files for higher direct SDK throughput
-- broader recall/indexing benchmarks with real Qdrant
+- broader recall benchmarks with FTS and graph-primary modes
 - long-running compaction policy validation
 - formal crash-recovery semantics for batched mode

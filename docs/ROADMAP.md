@@ -12,7 +12,7 @@ Done:
 - WAL compaction controls
 - write stats and optional write metrics
 - final benchmark report
-- focused tests for durability, recovery, Qdrant dimension guard, async indexing drain, and truth-weighted recall
+- focused tests for durability, recovery, tsvector migration, async enrichment drain, and truth-weighted recall
 
 ## Remaining Work
 
@@ -25,14 +25,14 @@ Direct SDK currently reaches 2.7K-4.8K EPS. To chase 9K EPS:
 - reduce namespace-wide lock contention
 - benchmark long-running writes with compaction enabled
 
-### 2. Real Qdrant Recall Benchmark
+### 2. FTS + Graph Recall Benchmarks
 
-Current recall validation uses focused tests and fake Qdrant behavior. Add:
+Current recall validation uses focused tests. Add:
 
-- real Qdrant indexing catch-up test
-- recall latency benchmark
-- recall quality benchmark
-- stale-index detection
+- FTS seed resolution latency and precision benchmark
+- graph activation recall quality benchmark
+- hybrid (graph + FTS) vs graph-only recall comparison
+- cold-start (empty graph → pure FTS) latency benchmark
 
 ### 3. Production Shutdown
 

@@ -25,7 +25,7 @@ Latest benchmark artifact:
 Latest focused test command:
 
 ```bash
-pytest tests/test_memory_client_durability_modes.py tests/test_truth_retrieval_quality.py tests/test_qdrant_dimension_guard.py tests/test_wal_recovery.py -q
+pytest tests/test_memory_client_durability_modes.py tests/test_truth_retrieval_quality.py tests/test_graph_recall.py tests/test_wal_recovery.py -q
 ```
 
 Result:
@@ -41,7 +41,7 @@ Verified areas:
 - batched `flush()` and `close()` durability boundaries
 - WAL compaction
 - async indexing drain
-- Qdrant dimension guard
+- tsvector migration and FTS query performance
 - truth-weighted recall ranking
 
 ## Limitations

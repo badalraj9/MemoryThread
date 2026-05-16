@@ -63,7 +63,7 @@ result = client.recall("dark mode", top_k=5, min_truth_score=0.0)
 print(result.format())
 ```
 
-Recall uses Qdrant when available. If Qdrant is unavailable, Memory Thread falls back to keyword/in-memory retrieval.
+Recall uses graph spreading activation with Postgres FTS for seed resolution. Falls back to keyword/in-memory search when the graph or database is unavailable.
 
 ## Write Stats
 

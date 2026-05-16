@@ -335,7 +335,6 @@ export const mt_status = {
     const health = healthResult.data as {
       status?: string;
       postgres_connected?: boolean;
-      qdrant_connected?: boolean;
     };
     const stats = statsResult.ok
       ? (statsResult.data as { total_memories?: number; avg_truth_score?: number })
@@ -346,7 +345,6 @@ export const mt_status = {
       `Namespace: ${namespace}`,
       `Status: ${health?.status ?? "unknown"}`,
       `PostgreSQL: ${health?.postgres_connected ? "✓ connected" : "✗ disconnected"}`,
-      `Qdrant: ${health?.qdrant_connected ? "✓ connected" : "✗ disconnected"}`,
       "",
       "Stats:",
       `  Total Memories: ${stats?.total_memories ?? "N/A"}`,

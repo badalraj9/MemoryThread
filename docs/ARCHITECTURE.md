@@ -11,8 +11,8 @@ Memory Thread is organized around a direct SDK write path, optional persistence 
 | TMS/Event Model | Truth-vector events and derived entity state |
 | In-memory state cache | Fast local state for direct SDK operation |
 | PostgreSQL/SQLite | Optional durable state/event storage |
-| Qdrant | Optional vector retrieval backend |
-| Async enrichment queue | Qdrant indexing, entity extraction, and relation inference outside the synchronous write path |
+| PostgreSQL FTS | Keyword search via tsvector + GIN index on events table |
+| Async enrichment queue | Entity extraction and relation inference outside the synchronous write path |
 
 ## Direct Write Path
 
@@ -27,8 +27,6 @@ The optimized direct `remember()` path is:
 
 Optional enrichment does not block direct writes:
 
-- Qdrant indexing
-- embedding generation
 - user entity extraction
 - relation inference
 
@@ -43,7 +41,7 @@ Optional enrichment does not block direct writes:
 
 ## Recall Path
 
-Recall uses Qdrant when available and falls back to keyword/in-memory retrieval when Qdrant is unavailable. Results are ranked using truth-aware scoring, not raw vector similarity alone.
+Recall uses the graph engine as the primary path. Seed resolution uses Postgres FTS (tsvector + GIN on events.search_vector). A keyword fallback via FTS is available when the graph is cold. Results are ranked using truth-aware scoring combined with graph activation scores.
 
 ## Current Bottleneck
 

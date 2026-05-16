@@ -16,8 +16,8 @@ Memory Thread provides:
 
 1. **Truth vectors:** confidence, authority, freshness, and corroboration attached to memories.
 2. **Event-sourced memory:** writes create events, and entity state is derived from those events.
-3. **Application-level WAL:** durability spans in-memory state, optional SQL storage, and optional vector indexing.
-4. **Graceful degradation:** the system continues operating when PostgreSQL or Qdrant are unavailable.
+3. **Application-level WAL:** durability spans in-memory state, optional SQL storage, and optional SQL persistence.
+4. **Graceful degradation:** the system continues operating when PostgreSQL is unavailable.
 5. **Optimized direct SDK writes:** batched mode gives high-throughput local writes with explicit `flush()` and `close()` durability boundaries.
 
 ## 3. Architecture
@@ -29,7 +29,7 @@ The public interface is `MemoryClient`. The key operations are:
 - `flush()`: make pending batched WAL records durable
 - `close()`: drain enrichment, flush WAL, and release resources
 
-The optimized write path separates required state mutation from optional enrichment. Qdrant indexing, embedding generation, entity extraction, and relation inference are scheduled asynchronously rather than blocking `remember()`.
+The optimized write path separates required state mutation from optional enrichment. Entity extraction and relation inference are scheduled asynchronously rather than blocking `remember()`.
 
 ## 4. Durability Model
 
@@ -70,7 +70,7 @@ Focused verification:
 14 passed, 1 warning
 ```
 
-The verification covers WAL recovery, sync and batched durability boundaries, WAL compaction, Qdrant dimension guarding, async indexing drain on close, and truth-weighted retrieval ranking.
+The verification covers WAL recovery, sync and batched durability boundaries, WAL compaction, Postgres FTS search, async enrichment drain on close, and truth-weighted retrieval ranking.
 
 ## 6. Limitations
 

@@ -58,7 +58,7 @@ python benchmarks/benchmark_throughput.py --duration 10 --output reports/through
 ## Verified Tests
 
 ```bash
-pytest tests/test_memory_client_durability_modes.py tests/test_truth_retrieval_quality.py tests/test_qdrant_dimension_guard.py tests/test_wal_recovery.py -q
+pytest tests/test_memory_client_durability_modes.py tests/test_truth_retrieval_quality.py tests/test_postgres_fts_search.py tests/test_wal_recovery.py -q
 ```
 
 Result:
