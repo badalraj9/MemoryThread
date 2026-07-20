@@ -28,7 +28,6 @@ from memory_thread.services.tms_service import (
 from memory_thread.config.settings import settings
 from memory_thread.utils.logger import get_logger
 from memory_thread.sdk.models import Memory, RecallResult, WritePathMetric, ConnectionConfig
-from memory_thread.sdk.slab_ingest import SlabIngestPipeline
 
 log = get_logger(__name__)
 
@@ -94,11 +93,6 @@ class MemoryClient:
         wal_flush_batch_size: Optional[int] = None,
         wal_flush_interval_ms: Optional[int] = None,
         enable_write_metrics: Optional[bool] = None,
-        use_slab_ingest: bool = False,
-        slab_num_slabs: int = 512,
-        slab_size: int = 65536,
-        slab_drain_threads: int = 4,
-        slab_drain_batch_size: int = 32,
     ):
         if namespace is None:
             namespace = self._resolve_namespace()
@@ -118,11 +112,6 @@ class MemoryClient:
             else enable_write_metrics
         )
         self.event_log_max = max(0, settings.MEMORY_CLIENT_EVENT_LOG_MAX)
-        self.use_slab_ingest = use_slab_ingest
-        self.slab_num_slabs = slab_num_slabs
-        self.slab_size = slab_size
-        self.slab_drain_threads = slab_drain_threads
-        self.slab_drain_batch_size = slab_drain_batch_size
 
         self._memories: Dict[uuid.UUID, EntityState] = {}
         self._global_memories: Dict[uuid.UUID, EntityState] = {}
@@ -150,20 +139,6 @@ class MemoryClient:
         if use_db:
             self._init_db_clients()
 
-        self._slab_ingest = (
-            SlabIngestPipeline(
-                remember_fn=self._remember_direct,
-                namespace=namespace,
-                slab_process_hook=self._slab_process_hook,
-                num_slabs=slab_num_slabs,
-                slab_size=slab_size,
-                drain_threads=slab_drain_threads,
-                drain_batch_size=slab_drain_batch_size,
-            )
-            if use_slab_ingest
-            else None
-        )
-        self._slab_process_hook = None
         self._wal = self._create_wal()
 
     def _resolve_namespace(self) -> str:
@@ -341,21 +316,6 @@ class MemoryClient:
         antecedents: Optional[List[uuid.UUID]] = None,
         action: Optional[str] = None,
     ) -> uuid.UUID:
-        if self._slab_ingest is not None:
-            if entity_id is None:
-                entity_id = uuid.uuid4()
-            self._slab_ingest.enqueue(
-                {
-                    "entity_id": str(entity_id),
-                    "content": content,
-                    "source": source,
-                    "confidence": confidence,
-                    "authority": authority,
-                    "memory_type": memory_type,
-                }
-            )
-            return entity_id
-
         return self._remember_direct(
             content=content,
             source=source,
@@ -1218,8 +1178,6 @@ class MemoryClient:
             stats = {"total_memories": 0, "avg_truth_score": 0}
             if hasattr(self, "_db_type"):
                 stats["db_type"] = self._db_type
-            if self._slab_ingest is not None:
-                stats.update(self._slab_ingest.stats())
             return stats
 
         scores = [
@@ -1232,15 +1190,9 @@ class MemoryClient:
             "namespace": self.namespace,
             "db_type": getattr(self, "_db_type", "memory"),
         }
-        if self._slab_ingest is not None:
-            stats.update(self._slab_ingest.stats())
         return stats
 
-    def close(self) -> Optional[Dict[str, int]]:
-        stats = None
-        if self._slab_ingest is not None:
-            stats = self._slab_ingest.close()
-            self._slab_ingest = None
+    def close(self) -> None:
         self._enrichment_queue.join()
         for _ in self._enrichment_workers:
             self._enrichment_queue.put(None)
@@ -1251,7 +1203,6 @@ class MemoryClient:
 
             close_wal(self.namespace, compact=settings.WAL_COMPACT_ON_CLOSE)
             self._wal = None
-        return stats
 
     def clear(self):
         self._memories.clear()

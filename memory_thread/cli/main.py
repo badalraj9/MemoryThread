@@ -148,7 +148,6 @@ def serve(
 
         embeddings_status = "loading..."
         try:
-
             embeddings_status = "loaded"
         except Exception:
             embeddings_status = "unavailable"
@@ -421,17 +420,6 @@ def migrate_command(
 
     applied = runner.run_migrations()
     console.print(f"[green]Applied {len(applied)} migration(s).[/green]")
-
-
-@app.command("chat")
-def chat_command(
-    model: str = typer.Option(None, "--model", help="Model to use e.g. ollama/llama2"),
-    namespace: str = typer.Option(None, "--namespace", help="Namespace to use"),
-):
-    """Launch interactive chat TUI with memory context."""
-    from memory_thread.tui.chat import run as chat_run
-
-    chat_run(model=model, namespace=namespace)
 
 
 def run():

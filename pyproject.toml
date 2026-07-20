@@ -33,7 +33,6 @@ classifiers = [
 
 dependencies = [
     "pydantic>=2.0",
-    "networkx>=3.0",
     "python-igraph>=1.0",
     "python-dotenv>=1.0",
     "httpx>=0.25",
@@ -49,7 +48,6 @@ db = [
 ]
 streaming = [
     "pyzmq>=25.0",
-    "aiokafka>=0.8",
 ]
 tui = [
     "textual>=0.40",
@@ -61,14 +59,8 @@ cli = [
 nlp = [
     "spacy>=3.5",
 ]
-observability = [
-    "opentelemetry-api>=1.20",
-    "opentelemetry-sdk>=1.20",
-    "opentelemetry-instrumentation-fastapi>=0.41",
-    "opentelemetry-exporter-otlp>=1.20",
-]
 full = [
-    "memory-thread[api,db,streaming,cli,nlp,observability]",
+    "memory-thread[api,db,streaming,cli,nlp]",
 ]
 dev = [
     "pytest>=7.0",
