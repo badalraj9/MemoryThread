@@ -84,9 +84,6 @@ def worker_process(allocator: SlabAllocator, persistence_engine: Any):
                 memory_type, confidence, has_negation = classify_memory(text)
                 decay_rate = get_decay_rate(memory_type)
 
-                if meta_service.check_drift(text, domain=memory_type):
-                    log.warning(f"Drift detected in domain: {memory_type}")
-
                 if "action" in content_obj and "delta" in content_obj:
                     action = ActionEnum[content_obj.get("action", "UPDATE")]
                     delta = content_obj.get("delta", {})

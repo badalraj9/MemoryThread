@@ -835,9 +835,10 @@ class MemoryClient:
         project_result = self._recall_impl(query, top_k, min_truth_score)
 
         if global_namespace != self.namespace:
+            original_namespace = self.namespace
             self.namespace = global_namespace
             global_result = self._recall_impl(query, top_k, min_truth_score)
-            self.namespace = self.namespace
+            self.namespace = original_namespace
             return self._merge_results(project_result, global_result, top_k)
 
         return project_result

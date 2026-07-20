@@ -152,6 +152,9 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         postgres_status = "unavailable"
 
+    # Check API auth
+    api_key = os.environ.get("MT_API_KEY", "")
+    auth_status = "unset — all endpoints open"
 
     # Print service status
     table = Table(show_header=False, box=None, padding=(0, 2))
@@ -163,6 +166,11 @@ async def lifespan(app: FastAPI):
         table.add_row("✓ PostgreSQL", "healthy", f"({postgres_latency}ms)")
     else:
         table.add_row("✗ PostgreSQL", postgres_status, "")
+
+    if not api_key:
+        table.add_row("⚠ Auth", "MT_API_KEY", "unset — no auth on any endpoint")
+    else:
+        table.add_row("✓ Auth", "MT_API_KEY", "configured")
 
     print(table)
     print()
@@ -373,7 +381,6 @@ class HealthResponse(BaseModel):
     timestamp: str
     version: str
     postgres_connected: bool = False
-
 
 
 # ==============================================================================

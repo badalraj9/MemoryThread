@@ -31,14 +31,10 @@ class TruthVector(BaseModel):
 
     @property
     def truth_score(self) -> float:
-        """Compute overall truth score from components."""
-        # Weighted average: confidence 40%, authority 35%, freshness 25%
-        base = (self.confidence * 0.4) + (self.authority * 0.35) + (self.freshness * 0.25)
-        # Corroboration boost (logarithmic)
-        import math
+        """Compute overall truth score by delegating to TruthVectorService."""
+        from memory_thread.services.tms_service import TruthVectorService
 
-        boost = math.log1p(self.corroboration) * 0.1
-        return min(1.0, base + boost)
+        return TruthVectorService.calculate_score(self)
 
 
 class Event(BaseModel):

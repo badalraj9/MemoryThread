@@ -1,5 +1,5 @@
 """
-GraphEngine — In-memory materialized graph for MemoryThread.
+GraphEngine — In-memory materialized cognitive graph.
 
 Rebuilds the entire cognitive graph from the event log on startup.
 Provides traversal (spreading activation), topological analytics
@@ -8,6 +8,8 @@ Provides traversal (spreading activation), topological analytics
 Backed by iGraph for performance and thread-safe reads.
 """
 
+from __future__ import annotations
+
 import uuid
 import math
 import logging
@@ -15,7 +17,13 @@ import threading
 from typing import List, Dict, Optional, Set, Tuple, Any, Union
 from datetime import datetime
 
-import igraph as ig
+try:
+    import igraph as ig
+
+    _HAS_IGRAPH = True
+except ImportError:
+    ig = None  # type: ignore
+    _HAS_IGRAPH = False
 
 from memory_thread.models.events import Event, ActionEnum, TruthVector
 from memory_thread.utils.logger import get_logger
@@ -50,6 +58,11 @@ class GraphEngine:
     """
 
     def __init__(self):
+        if not _HAS_IGRAPH:
+            raise RuntimeError(
+                "python-igraph is required but not installed. "
+                "Install it with: pip install python-igraph"
+            )
         self.graph: ig.Graph = ig.Graph(directed=True)
         self.node_index: Dict[str, str] = {}
         self._write_lock = threading.Lock()

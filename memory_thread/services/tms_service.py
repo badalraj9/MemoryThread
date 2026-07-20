@@ -30,13 +30,18 @@ class TruthVectorService:
         """
         Calculates composite truth score from vector components.
 
-        Formula: score = W1*confidence + W2*authority + W3*freshness + W4*log(1+corroboration)
+        Formula: score = W1*clamp(confidence) + W2*clamp(authority)
+                 + W3*clamp(freshness) + W4*log(1+clamp(corroboration))
+
+        Weights are normalized to sum to 1.0 in settings, so the weighted
+        average naturally stays in [0, 1].  The final min(1.0) is defense
+        in depth against future weight misconfiguration.
 
         Args:
             vector: TruthVector with confidence, authority, freshness, corroboration
 
         Returns:
-            Weighted composite score
+            Weighted composite score in [0.0, 1.0]
         """
         W1 = settings.TMS_WEIGHT_CONFIDENCE
         W2 = settings.TMS_WEIGHT_AUTHORITY
@@ -45,14 +50,15 @@ class TruthVectorService:
 
         total_weight = W1 + W2 + W3 + W4
 
-        corr_score = math.log(1 + vector.corroboration)
+        c = max(0.0, min(1.0, float(vector.confidence)))
+        a = max(0.0, min(1.0, float(vector.authority)))
+        f = max(0.0, min(1.0, float(vector.freshness)))
+        corr = max(0.0, float(vector.corroboration))
 
-        score = (
-            (W1 * vector.confidence)
-            + (W2 * vector.authority)
-            + (W3 * vector.freshness)
-            + (W4 * corr_score)
-        ) / total_weight
+        corr_score = math.log(1 + corr)
+        corr_score = min(corr_score, 1.0)
+
+        score = ((W1 * c) + (W2 * a) + (W3 * f) + (W4 * corr_score)) / total_weight
         return min(score, 1.0)
 
     @staticmethod
@@ -97,6 +103,12 @@ class TruthVectorService:
         Merges two truth vectors using weighted averaging.
         Higher authority source wins - weights derived from authority.
 
+        All components are clamped to valid ranges after merge:
+          confidence  [0.0, 1.0]
+          authority   [0.0, 1.0]
+          freshness   [0.0, 1.0]
+          corroboration >= 0
+
         Args:
             v1: First TruthVector
             v2: Second TruthVector
@@ -111,11 +123,12 @@ class TruthVectorService:
             w1 = v1.authority / total_authority
             w2 = v2.authority / total_authority
 
+        merged_corroboration = max(0.0, v1.corroboration + v2.corroboration + 1)
         return TruthVector(
-            confidence=(w1 * v1.confidence + w2 * v2.confidence),
-            authority=max(v1.authority, v2.authority),
-            freshness=max(v1.freshness, v2.freshness),
-            corroboration=v1.corroboration + v2.corroboration + 1,
+            confidence=max(0.0, min(1.0, w1 * v1.confidence + w2 * v2.confidence)),
+            authority=max(0.0, min(1.0, max(v1.authority, v2.authority))),
+            freshness=max(0.0, min(1.0, max(v1.freshness, v2.freshness))),
+            corroboration=merged_corroboration,
         )
 
 

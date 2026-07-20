@@ -89,11 +89,12 @@ class Settings(BaseSettings):
 
     # TMS Truth Vector Weights
     # Controls how components combine into the final truth score
-    # Valid range: 0.0 to 2.0 (higher = more influence)
-    TMS_WEIGHT_CONFIDENCE: float = 1.0  # Certainty in the information
-    TMS_WEIGHT_AUTHORITY: float = 1.2  # Source credibility (user=1.0, agent=0.5)
-    TMS_WEIGHT_FRESHNESS: float = 0.8  # Temporal relevance (decays over time)
-    TMS_WEIGHT_CORROBORATION: float = 0.6  # Independent confirmations
+    # These sum to 1.0 so the raw weighted score naturally stays in [0, 1]
+    # without relying on a final clamp (defense in depth: calculate_score also clamps)
+    TMS_WEIGHT_CONFIDENCE: float = 0.28  # Certainty in the information
+    TMS_WEIGHT_AUTHORITY: float = 0.33  # Source credibility (user=1.0, agent=0.5)
+    TMS_WEIGHT_FRESHNESS: float = 0.22  # Temporal relevance (decays over time)
+    TMS_WEIGHT_CORROBORATION: float = 0.17  # Independent confirmations
 
     # Drift Detection
     # Cosine distance threshold for semantic drift detection
