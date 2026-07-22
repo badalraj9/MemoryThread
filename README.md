@@ -12,9 +12,10 @@
 <p align="center">
   <a href="#"><img src="https://img.shields.io/badge/Python-3.11%2B-3776AB?logo=python&logoColor=white" /></a>
   <a href="#"><img src="https://img.shields.io/badge/License-MIT-9370DB?logo=opensourceinitiative&logoColor=white" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Tests-22%2F22-brightgreen?logo=pytest&logoColor=white" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Security-Audited-CC2936?logo=trustpilot&logoColor=white" /></a>
-  <a href="#"><img src="https://img.shields.io/badge/Status-Active-00ADD8?logo=quantum&logoColor=white" /></a>
+  <a href="#"><img src="https://img.shields.io/badge/Tests-20%20files-brightgreen?logo=pytest&logoColor=white" /></a>
+  <a href="#"><img src="https://img.shields.io/badge/API-FastAPI-009688?logo=fastapi&logoColor=white" /></a>
+  <a href="#"><img src="https://img.shields.io/badge/Graph-iGraph-5428A0?logo=graphql&logoColor=white" /></a>
+  <a href="#"><img src="https://img.shields.io/badge/Frontend-Scaffolded-grey?logo=react&logoColor=white" /></a>
 </p>
 
 <p align="center">
@@ -63,7 +64,12 @@ Memory Thread is built on a different premise: **memory is a causal graph** of e
 <tr>
   <td width="33%"><b>🚧 Namespace Isolation</b><br><small>Per-namespace memory spaces. Cross-namespace reads blocked at the SDK level.</small></td>
   <td width="33%"><b>🔑 Encrypted Vault</b><br><small>Provider API keys encrypted at rest with Fernet (AES-CBC, 256-bit). Not base64.</small></td>
+  <td width="33%"><b>📡 SSE Event Stream</b><br><small>Real-time graph mutation events pushed to connected clients via Server-Sent Events.</small></td>
+</tr>
+<tr>
   <td width="33%"><b>🛡️ API Auth</b><br><small>Optional <code>MT_API_KEY</code> bearer token on all HTTP endpoints. CORS restricted to <code>MT_ALLOWED_ORIGINS</code>.</small></td>
+  <td width="33%"><b>🔍 Postgres FTS + Graph</b><br><small>Hybrid recall: FTS for seed resolution + graph activation for reasoning. Qdrant removed.</small></td>
+  <td width="33%"><b>🧪 20 Integration Tests</b><br><small>Golden thread, decay curves, WAL recovery, contradiction accuracy, namespace isolation, graceful degradation.</small></td>
 </tr>
 </table>
 
@@ -118,7 +124,7 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
 
 <h2>🏗️ Architecture</h2>
 
-<h3>Data Flow</h3>
+<h3>Backend Data Flow</h3>
 
 <pre>
                         ┌──────────────────┐
@@ -132,7 +138,7 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
              ┌──────────┐ ┌──────────┐ ┌──────────────┐
              │   WAL    │ │  Events  │ │ GraphEngine  │
              │(crash    │ │(in-mem)  │ │(iGraph)      │
-             │ safety)  │ │          │ │              │
+             │ safety)  │ │          │ │  725 lines   │
              └──────────┘ └──────────┘ └──────┬───────┘
                     │              │          │
                     ▼              ▼          ▼
@@ -142,19 +148,21 @@ Point any OpenAI-compatible app to <code>http://localhost:8000/v1</code>. Memory
              │  │ PostgreSQL                       │ │
              │  │ events (tsvector + GIN for FTS)  │ │
              │  │ entity_state                     │ │
-             │  │ relations                        │ │
+             │  │ relations / threads / beliefs    │ │
              │  └──────────────────────────────────┘ │
              └──────────────────────────────────────┘
                                 │
-                    ┌───────────┼──────────────┐
-                    ▼           ▼              ▼
-             ┌──────────┐ ┌──────────┐ ┌──────────────┐
-             │ Golden   │ │ Recall   │ │ Decay/Prune  │
-             │ Thread   │ │(graph    │ │(topology-    │
-             │(causal   │ │ primary) │ │ aware)       │
-             │ chain)   │ │          │ │              │
-             └──────────┘ └──────────┘ └──────────────┘
+                    ┌───────────┼──────────────────┐
+                    ▼           ▼                  ▼
+             ┌──────────┐ ┌──────────┐ ┌──────────────────┐
+             │ Golden   │ │ Recall   │ │ SSE Event Bus    │
+             │ Thread   │ │(graph    │ │(real-time pushes  │
+             │(causal   │ │ primary) │ │ to frontend)      │
+             │ chain)   │ │          │ │                  │
+             └──────────┘ └──────────┘ └──────────────────┘
 </pre>
+
+The backend is fully built: FastAPI server (870 lines, 20+ endpoints), iGraph engine (725 lines), 35 service modules (9,595 total lines), SSE event bus, and 20 integration tests.
 
 <h3>Write Path</h3>
 
@@ -256,6 +264,51 @@ freshness(t) = freshness₀ × e^(-λ × days_elapsed)
 
 <br>
 
+<h2>🖥️ Frontend: Memory Space (In Development)</h2>
+
+<p>The frontend is currently <b>scaffolded</b> — the project structure, dependencies, build config, and Tailwind theme are in place, but the Cognitive Renderer has not been implemented yet.</p>
+
+<table>
+<tr><th>Status</th><th>What's done</th></tr>
+<tr><td>✅ Complete</td><td>Project structure, <code>package.json</code> (React 19, D3, Framer Motion, Zustand, TanStack Router, Tailwind v4), Vite config with API proxy, dark academic theme (<code>index.css</code>)</td></tr>
+<tr><td>🔧 Planned</td><td><b>Cognitive Renderer</b> — Three.js GPU particle field with custom shaders, D3 force simulation (physics only, no DOM), visual BFS activation engine, animation director, camera controller with inertia, delta SSE integration, event-driven architecture via typed EventBus</td></tr>
+<tr><td>🔧 Planned</td><td><b>Memory Space UI</b> — Minimal interface with search overlay and temporary Node Inspector. No sidebar, no chat, no dashboard, no permanent controls.</td></tr>
+<tr><td>🔧 Planned</td><td><b>Delta SSE</b> — Incremental graph mutations pushed from backend instead of full re-fetches</td></tr>
+</table>
+
+<p>The full design philosophy and architecture is documented in <a href="frontend.md">frontend.md</a>.</p>
+
+<h3>Target Architecture (To Be Built)</h3>
+
+<pre>
+Memory Space
+  └── CognitiveCanvas
+        └── CognitiveFieldEngine
+              ├── ParticleRenderer     (Three.js GPU particles)
+              ├── FlowField            (ambient drift)
+              ├── ShaderPipeline       (custom GLSL)
+              ├── ForceSimulation      (D3 physics only)
+              ├── ActivationEngine     (visual BFS propagation)
+              ├── AnimationDirector    (events → choreography)
+              ├── CameraController     (inertia, overshoot)
+              ├── SelectionManager     (raycaster picking)
+              └── InspectorManager     (detail panel)
+
+EventBus — decouples all subsystems via typed events
+</pre>
+
+<h3>Design Principles</h3>
+
+<ul>
+  <li><b>Single Responsibility</b> — Every component owns exactly one concern</li>
+  <li><b>Event-Driven</b> — No component directly controls another. Everything communicates through typed events.</li>
+  <li><b>Cognitive Logic ≠ Rendering Logic</b> — ActivationEngine and AnimationDirector understand cognition. ParticleRenderer and ShaderPipeline understand only particles and pixels.</li>
+  <li><b>Dual Activation</b> — Frontend runs visual BFS (zero latency, 60 FPS). Backend runs truth-aware reasoning (golden thread, contradiction).</li>
+  <li><b>Semantic Animation</b> — Every motion has meaning. Nothing moves "just because."</li>
+</ul>
+
+<br>
+
 <h2>⌨️ CLI</h2>
 
 <pre>
@@ -303,37 +356,72 @@ freshness(t) = freshness₀ × e^(-λ × days_elapsed)
 <h2>📦 Project Structure</h2>
 
 <pre>
-memory_thread/
-├── <b>sdk/</b>                    # Public SDK
-│   ├── client.py            # MemoryClient — main API surface
-│   ├── models.py            # RecallResult, Memory, etc.
-│   └── slab_ingest.py       # Background slab ingestion
-├── <b>cli/</b>                    # CLI commands
-│   ├── main.py              # Typer entry point
-│   ├── provider.py          # LLM provider CRUD
-│   ├── client_admin.py      # API key management
-│   └── galaxy.py            # Schema inspection
-├── <b>api/</b>                    # FastAPI server (with auth)
-├── <b>services/</b>                # Core services
-│   ├── graph_engine.py      # iGraph materialized view
-│   ├── golden_thread.py     # Causal chain tracing
-│   ├── memory_tiers.py      # Hot/warm/cold tiers
-│   ├── context_monitor.py   # Proactive injection
-│   ├── thread_service.py    # Session management
+memory_thread/                          # Python backend (BUILT)
+├── sdk/                    # Public SDK
+│   ├── client.py           # MemoryClient — main API surface
+│   ├── models.py           # RecallResult, Memory, etc.
+│   └── enrichment.py       # Async enrichment pipeline
+├── cli/                    # CLI commands (Typer)
+├── api/                    # FastAPI server
+│   ├── server.py           # 20+ endpoints + SSE event stream (870 lines)
+│   └── routers/            # Maintenance routes
+├── services/               # 35 service modules (9,595 total lines)
+│   ├── graph_engine.py     # iGraph cognitive graph (725 lines)
+│   ├── golden_thread.py    # Causal chain tracing
+│   ├── tms_service.py      # Truth vector math (459 lines)
+│   ├── event_bus.py        # SSE fan-out for real-time events
+│   ├── wal.py              # Write-ahead log (525 lines)
+│   ├── decay_engine.py     # Freshness decay curves
+│   ├── context_monitor.py  # Proactive context injection
+│   ├── contemplator.py     # Reflection/consolidation
+│   ├── pruner.py           # Memory pruning
 │   ├── workflow_induction.py
-│   ├── attestation_service.py
-│   ├── tms_service.py       # Truth vector math
-│   └── wal.py               # Write-ahead log
-├── <b>nervous/</b>                # Security & access control
-│   ├── vault.py             # Fernet-encrypted credential store
-│   ├── access_control.py    # RBAC engine
-│   ├── client_registry.py   # API key registry
-│   ├── audit_ledger.py      # Audit trail
-│   └── galaxy_core.py       # Multi-agent orchestration
-├── <b>models/</b>                 # Pydantic schemas (Event, EntityState, TruthVector)
-├── <b>db/</b>                     # Database clients + schema archive
-├── <b>config/</b>                # Settings (pydantic-settings)
-└── <b>utils/</b>                 # secure_sdk, health
+│   ├── fact_store.py / belief_store.py
+│   ├── galaxy_query.py     # Multi-agent OLAP queries
+│   ├── timewarp_engine.py  # Temporal graph queries
+│   ├── file_ingest_service.py
+│   └── ... (35 total)
+├── nervous/                # Security & access control
+│   ├── vault.py            # Fernet-encrypted credential store
+│   ├── galaxy_core.py      # Multi-agent orchestration
+│   ├── client_registry.py  # API key registry
+│   └── audit_ledger.py     # Audit trail
+├── models/                 # Pydantic schemas
+│   ├── events.py           # Event, TruthVector, EntityState
+│   ├── entity.py           # Entity, MergeProposal
+│   └── provenance.py       # Actor, Origin, ProvenanceEnvelope
+├── db/                     # Database clients + migrations
+│   ├── postgres_client.py
+│   └── sqlite_client.py
+├── config/                 # Pydantic-settings
+│   └── settings.py
+└── utils/                  # Health check, logging
+
+frontend/                               # TypeScript frontend (SCAFFOLDED)
+├── src/
+│   ├── api/                # (empty — to be built)
+│   ├── event-bus/          # (empty — to be built)
+│   ├── store/              # (empty — to be built)
+│   ├── types/              # (empty — to be built)
+│   ├── components/         # (empty directories — to be built)
+│   │   ├── cognitive-renderer/
+│   │   ├── graph/
+│   │   └── layout/
+│   ├── App.tsx             # Placeholder (7 lines)
+│   ├── main.tsx            # Entry point
+│   └── index.css           # Tailwind v4 dark academic theme
+├── package.json            # React 19, D3, Framer Motion, Zustand, etc.
+├── vite.config.ts          # Vite 8 + React + Tailwind + API proxy
+├── tsconfig.json
+├── DESIGN_SPEC.md          # Original design spec (448 lines, legacy)
+└── index.html              # Entry HTML
+
+docs/
+├── API.md, ARCHITECTURE.md
+├── GRAPH_CORE_ARCHITECTURE.md
+├── THESIS.md, ROADMAP.md
+├── DURABILITY_AND_PERFORMANCE.md
+└── thesis/                 # Expanded thesis notes
 </pre>
 
 <br>
@@ -341,11 +429,14 @@ memory_thread/
 <h2>🧪 Tests</h2>
 
 <pre>
-pytest tests/ -q       # 22 tests, 2 skipped (perf benchmarks)
+pytest tests/ -q       # 20 test files
 </pre>
 
 <table>
 <tr><th>Test</th><th>What it verifies</th></tr>
+<tr><td><code>test_api_endpoints.py</code></td><td>All REST endpoints respond correctly</td></tr>
+<tr><td><code>test_postgres_integration.py</code></td><td>PostgreSQL persistence layer</td></tr>
+<tr><td><code>test_latency_profile.py</code></td><td>Write/read throughput benchmarks</td></tr>
 <tr><td><code>test_golden_thread_reconstruction.py</code></td><td>Causal chain correctness via graph traversal</td></tr>
 <tr><td><code>test_truth_retrieval_quality.py</code></td><td>Truth-weighted recall ranks high-truth memories higher</td></tr>
 <tr><td><code>test_memory_client_durability_modes.py</code></td><td>Sync/batched durability boundaries, WAL flush, compaction</td></tr>
@@ -353,8 +444,13 @@ pytest tests/ -q       # 22 tests, 2 skipped (perf benchmarks)
 <tr><td><code>test_qdrant_dimension_guard.py</code></td><td>Qdrant-free init + keyword recall fallback after removal</td></tr>
 <tr><td><code>test_namespace_isolation.py</code></td><td>Cross-namespace reads blocked. Truth scores isolated.</td></tr>
 <tr><td><code>test_contradiction_accuracy.py</code></td><td>Precision and recall of contradiction detection</td></tr>
+<tr><td><code>test_contradiction_edge.py</code></td><td>Edge cases in contradiction detection</td></tr>
+<tr><td><code>test_contradiction_classifier.py</code></td><td>Contradiction classifier</td></tr>
 <tr><td><code>test_decay_curves.py</code></td><td>Freshness decay matches mathematical specification</td></tr>
+<tr><td><code>test_graph_export.py</code></td><td>Graph JSON export correctness</td></tr>
 <tr><td><code>test_graceful_degradation.py</code></td><td>Behavior under Postgres failures</td></tr>
+<tr><td><code>test_scale_ceiling.py</code></td><td>Scale ceiling benchmarks</td></tr>
+<tr><td><code>test_event_bus.py</code></td><td>SSE event bus pub/sub</td></tr>
 </table>
 
 <br>
@@ -363,11 +459,15 @@ pytest tests/ -q       # 22 tests, 2 skipped (perf benchmarks)
 
 <table>
 <tr><th>File</th><th>Content</th></tr>
+<tr><td><code>frontend.md</code></td><td>Frontend architecture, philosophy, event catalog, and implementation plan</td></tr>
 <tr><td><code>docs/README.md</code></td><td>Documentation map</td></tr>
 <tr><td><code>docs/GRAPH_CORE_ARCHITECTURE.md</code></td><td>Full graph-neural core architecture (2,252 lines)</td></tr>
 <tr><td><code>docs/continuity.md</code></td><td>Session handover — what's built and what remains</td></tr>
 <tr><td><code>docs/THESIS.md</code></td><td>Thesis-ready system description</td></tr>
+<tr><td><code>docs/ARCHITECTURE.md</code></td><td>Architecture overview (pre-graph, historical)</td></tr>
+<tr><td><code>docs/API.md</code></td><td>SDK usage and durability contract</td></tr>
 <tr><td><code>docs/DURABILITY_AND_PERFORMANCE.md</code></td><td>WAL architecture and throughput benchmarks</td></tr>
+<tr><td><code>docs/ROADMAP.md</code></td><td>Pre-graph roadmap (historical)</td></tr>
 </table>
 
 <br>
