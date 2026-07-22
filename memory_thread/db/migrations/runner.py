@@ -225,7 +225,57 @@ MIGRATIONS = [
                     to_tsvector('english', coalesce(jsonb_extract_path_text(delta, 'content'), ''))
                 ) STORED;
 
+            -- TODO: GIN index build acquires a brief write-lock on the events table.
+            -- At current scale (<10k rows) this is acceptable (sub-second).
+            -- Once the events table grows past ~100k rows, use CONCURRENTLY:
+            --   DROP INDEX IF EXISTS events_search_idx;
+            --   CREATE INDEX CONCURRENTLY events_search_idx ON events USING GIN(search_vector);
+            -- This avoids the write-lock but requires a longer build window.
             CREATE INDEX IF NOT EXISTS events_search_idx ON events USING GIN(search_vector);
+        """,
+    },
+    {
+        "id": 11,
+        "name": "threads",
+        "description": "Persistent threads/sessions table with metadata and parent hierarchy",
+        "sql": """
+            CREATE TABLE IF NOT EXISTS threads (
+                thread_id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+                title TEXT NOT NULL DEFAULT '',
+                created_by TEXT NOT NULL DEFAULT 'USER',
+                started_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+                status TEXT NOT NULL DEFAULT 'active'
+                    CHECK (status IN ('active', 'archived')),
+                parent_thread_id UUID REFERENCES threads(thread_id),
+                session_metadata JSONB DEFAULT '{}'
+            );
+            CREATE INDEX IF NOT EXISTS idx_threads_status ON threads(status);
+            CREATE INDEX IF NOT EXISTS idx_threads_parent ON threads(parent_thread_id);
+        """,
+    },
+    {
+        "id": 12,
+        "name": "contradiction_audit",
+        "description": "Persistent contradiction detection audit log with checkpoint/resume",
+        "sql": """
+            CREATE TABLE IF NOT EXISTS contradiction_audit (
+                id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+                batch_id UUID NOT NULL,
+                entity_a_id UUID NOT NULL,
+                entity_b_id UUID NOT NULL,
+                model_name TEXT NOT NULL,
+                input_pair JSONB NOT NULL,
+                result TEXT NOT NULL,
+                confidence FLOAT,
+                edge_type TEXT,
+                edge_id TEXT,
+                status TEXT DEFAULT 'pending',
+                created_at TIMESTAMP DEFAULT NOW(),
+                processed_at TIMESTAMP,
+                error TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_contradiction_audit_status ON contradiction_audit(status);
+            CREATE INDEX IF NOT EXISTS idx_contradiction_audit_batch ON contradiction_audit(batch_id);
         """,
     },
 ]

@@ -196,5 +196,19 @@ class Settings(BaseSettings):
     ATTESTATION_ENABLED: bool = False
     ATTESTATION_CHECKPOINT_INTERVAL: int = 100
 
+    # Contradiction Classification
+    CONTRADICTION_MODE: str = "lightweight"  # "api" | "local" | "lightweight" | "auto"
+    CONTRADICTION_API_PROVIDER: str = "openai"  # "openai" | "anthropic"
+    CONTRADICTION_MODEL_PATH: str = "cross-encoder/nli-deberta-v3-base"
+
+    # API Keys (also used by contradiction classifier)
+    OPENAI_API_KEY: str = os.environ.get("OPENAI_API_KEY", "")
+    ANTHROPIC_API_KEY: str = os.environ.get("ANTHROPIC_API_KEY", "")
+
+    # Graph Snapshot
+    # Path where the in-memory iGraph is persisted on close() and loaded on startup.
+    # Relative to the working directory. Set to "" to disable snapshot behaviour.
+    GRAPH_SNAPSHOT_PATH: str = ".mt/graph.pkl"
+
 
 settings = Settings()

@@ -60,6 +60,8 @@ class MetaStabilityService:
         Returns True when cosine similarity below 0.7 (distance above 0.3).
         """
 
+        from memory_thread.utils.ner import embed_text
+
         embedding = embed_text(content)
 
         if domain not in self.domain_centroids:

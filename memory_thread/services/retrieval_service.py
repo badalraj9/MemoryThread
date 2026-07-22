@@ -4,6 +4,7 @@ import logging
 from typing import List, Dict, Optional
 
 from memory_thread.config.settings import settings
+from memory_thread.models.events import TruthVector
 from memory_thread.services.content_resolver import resolve_content as _resolve_content
 
 log = logging.getLogger(__name__)
@@ -55,7 +56,13 @@ def retrieve_by_activation(
         truth_confidence = _safe_float(vattrs.get("truth_confidence"), 0.5)
         truth_authority = _safe_float(vattrs.get("truth_authority"), 0.5)
         truth_freshness = _safe_float(vattrs.get("truth_freshness"), 1.0)
-        truth_score = (truth_confidence * 0.4) + (truth_authority * 0.35) + (truth_freshness * 0.25)
+        tv = TruthVector(
+            confidence=truth_confidence,
+            authority=truth_authority,
+            freshness=truth_freshness,
+            corroboration=0.0,
+        )
+        truth_score = tv.truth_score
         final_score = (activation_score * truth_score) ** 0.5
         scored.append(
             {

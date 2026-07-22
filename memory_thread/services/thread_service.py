@@ -39,6 +39,17 @@ class ThreadResult:
 class ThreadService:
     """Creates, queries, and manages conversation threads in the graph."""
 
+    def __init__(self):
+        self._pg = None
+
+    @property
+    def pg(self):
+        if self._pg is None:
+            from memory_thread.db.postgres_client import PostgresClient
+
+            self._pg = PostgresClient()
+        return self._pg
+
     def create_thread(
         self, title: str, created_by: str = "USER", parent_thread_id: Optional[str] = None
     ) -> Thread:
@@ -76,6 +87,23 @@ class ThreadService:
                 started_at=datetime.utcnow().isoformat(),
                 status="active",
             )
+
+        try:
+            self.pg.execute(
+                """INSERT INTO threads (thread_id, title, created_by, started_at, status, parent_thread_id, session_metadata)
+                   VALUES (%s, %s, %s, %s, %s, %s, '{}')
+                   ON CONFLICT (thread_id) DO NOTHING""",
+                (
+                    thread_id,
+                    title,
+                    created_by,
+                    datetime.utcnow().isoformat(),
+                    "active",
+                    parent_thread_id,
+                ),
+            )
+        except Exception as e:
+            log.warning("Failed to persist thread to Postgres: %s", e)
 
         log.info("Created thread %s: %s", thread_id[:8], title)
         return thread_result

@@ -27,6 +27,7 @@ setup(
         "streaming": ["pyzmq>=25.0", "aiokafka>=0.8"],
         "tui": ["textual>=0.40"],
         "nlp": ["spacy>=3.5"],
+        "nli": ["sentence-transformers>=2.2", "torch>=1.13"],
         "dev": ["pytest>=7.0", "pytest-asyncio>=0.21", "black>=23.0", "ruff>=0.1"],
     },
     entry_points={

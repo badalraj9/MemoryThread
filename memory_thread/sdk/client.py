@@ -28,6 +28,9 @@ from memory_thread.services.tms_service import (
 from memory_thread.config.settings import settings
 from memory_thread.utils.logger import get_logger
 from memory_thread.sdk.models import Memory, RecallResult, WritePathMetric, ConnectionConfig
+from memory_thread.sdk.wal_manager import WalManager
+from memory_thread.sdk.persistence import PersistenceService
+from memory_thread.sdk.enrichment import EnrichmentPipeline
 
 log = get_logger(__name__)
 
@@ -122,24 +125,44 @@ class MemoryClient:
         ]
         self._write_path_metrics_lock = threading.Lock()
         self._write_path_metrics_local = threading.local()
-        self._enrichment_queue: "queue.Queue[Optional[Dict[str, Any]]]" = queue.Queue()
-        self._enrichment_workers = [
-            threading.Thread(
-                target=self._enrichment_worker_loop,
-                name=f"mt-enrichment-{namespace}-{index}",
-                daemon=True,
-            )
-            for index in range(2)
-        ]
-        for worker in self._enrichment_workers:
-            worker.start()
+
+        self._persistence = PersistenceService(self.namespace)
+        self._wal_manager = WalManager(
+            self.namespace,
+            self.durability_mode,
+            self.wal_flush_batch_size,
+            self.wal_flush_interval_ms,
+        )
+        self._enrichment = EnrichmentPipeline(
+            self.namespace,
+            self._memories,
+            self._persistence,
+        )
+        self._enrichment.start()
+
+        from memory_thread.nervous.contradiction_worker import ContradictionWorker
+
+        self._contradiction_worker = ContradictionWorker(self.namespace)
+        self._contradiction_worker.start()
 
         self._pg = None
+        self._sqlite = None
+        self._recall_graph_fallback_count = 0
 
         if use_db:
             self._init_db_clients()
+            self.load_from_db()
 
-        self._wal = self._create_wal()
+        self._replay_uncommitted()
+        self._replay_pending_contradictions()
+
+    def _replay_pending_contradictions(self):
+        """Re-queue any contradiction checks that were pending at last crash."""
+        if not hasattr(self, "_contradiction_worker"):
+            return
+        replayed = self._contradiction_worker.replay_pending()
+        if replayed:
+            log.info("Re-queued %d pending contradiction checks from audit log", replayed)
 
     def _resolve_namespace(self) -> str:
         import json
@@ -196,113 +219,59 @@ class MemoryClient:
 
         return namespace
 
-    def _create_wal(self):
-        from memory_thread.services.wal import get_wal
+    def _replay_uncommitted(self):
+        entries = self._wal_manager.get_uncommitted()
+        if not entries:
+            return
+        log.info("Replaying %d uncommitted WAL entries on startup", len(entries))
+        from memory_thread.services.graph_engine import graph_engine
 
-        return get_wal(
-            self.namespace,
-            flush_batch_size=self.wal_flush_batch_size,
-            flush_interval_ms=self.wal_flush_interval_ms,
-            async_flush=self.durability_mode == "batched",
-        )
+        for entry in entries:
+            try:
+                data = entry.data
+                replay_entity_id = uuid.UUID(data["entity_id"])
+                replay_event_id = (
+                    uuid.UUID(data["event_id"]) if data.get("event_id") else uuid.uuid4()
+                )
+                replay_content = data.get("content", "")
+                replay_source = data.get("source", "agent")
+                replay_confidence = float(data.get("confidence", 0.8))
+                replay_authority = float(data.get("authority", 0.5))
+                replay_memory_type = data.get("memory_type", "fact")
+
+                replay_event, replay_state = self._apply_memory_event(
+                    entity_id=replay_entity_id,
+                    content=replay_content,
+                    source=replay_source,
+                    confidence=replay_confidence,
+                    authority=replay_authority,
+                    memory_type=replay_memory_type,
+                    event_id=replay_event_id,
+                )
+                self._persistence.save(
+                    replay_entity_id,
+                    replay_content,
+                    replay_memory_type,
+                    replay_state,
+                    replay_event,
+                )
+                graph_engine.apply_event(replay_event)
+                self._wal_manager.commit_sequence(entry.sequence)
+                log.info("Replayed WAL entry %d for entity %s", entry.sequence, replay_entity_id)
+            except Exception as e:
+                log.error("Failed to replay WAL entry %d: %s", entry.sequence, e)
 
     def _init_db_clients(self):
-        try:
-            from memory_thread.db.postgres_client import PostgresClient
+        self._persistence.connect()
+        self._pg = self._persistence.pg
+        self._sqlite = self._persistence.sqlite
+        self._db_type = self._persistence.db_type
 
-            self._pg = PostgresClient()
-            self._db_type = "postgres"
-            log.info("PostgreSQL connected")
-
+        if self._pg:
             from memory_thread.services.graph_engine import graph_engine
 
-            graph_engine.rebuild(self._pg)
-        except Exception as e:
-            log.warning(f"PostgreSQL unavailable: {e}. Trying SQLite...")
-            self._pg = None
-
-            try:
-                from memory_thread.db.sqlite_client import SQLiteClient
-
-                self._sqlite = SQLiteClient()
-                self._db_type = "sqlite"
-                log.info("SQLite connected (fallback mode)")
-            except Exception as e2:
-                log.warning(f"SQLite also failed: {e2}. Using in-memory only.")
-                self._sqlite = None
-                self._db_type = "memory"
-
-    def _extract_entities(self, text: str) -> List[Dict]:
-        try:
-            from memory_thread.services.hybrid_ner_service import extract_entities
-
-            return extract_entities(text)
-        except ImportError:
-            log.warning("hybrid_ner_service not available, skipping entity extraction")
-            return []
-        except Exception as e:
-            log.warning(f"Entity extraction failed: {e}")
-            return []
-
-    def _infer_user_relations(self, text: str, entities: List[Dict]) -> List[Dict]:
-        relations = []
-        text_lower = text.lower()
-
-        if any(p in text_lower for p in ["my name is", "i am ", "i'm ", "call me "]):
-            for ent in entities:
-                if ent.get("entity") == "PERSON":
-                    relations.append(
-                        {
-                            "type": "HAS_NAME",
-                            "target": ent["value"],
-                            "target_type": "PERSON",
-                            "confidence": 0.95,
-                        }
-                    )
-
-        if any(
-            p in text_lower for p in ["work at", "work for", "working at", "employed at", "job at"]
-        ):
-            for ent in entities:
-                if ent.get("entity") in ["ORG", "ORGANIZATION"]:
-                    relations.append(
-                        {
-                            "type": "WORKS_AT",
-                            "target": ent["value"],
-                            "target_type": "ORG",
-                            "confidence": 0.9,
-                        }
-                    )
-
-        if any(p in text_lower for p in ["live in", "from ", "based in", "located in"]):
-            for ent in entities:
-                if ent.get("entity") in ["GPE", "LOC", "LOCATION"]:
-                    relations.append(
-                        {
-                            "type": "LOCATED_IN",
-                            "target": ent["value"],
-                            "target_type": "LOCATION",
-                            "confidence": 0.85,
-                        }
-                    )
-
-        if any(p in text_lower for p in ["i like", "i prefer", "i love", "i enjoy"]):
-            for keyword in ["like", "prefer", "love", "enjoy"]:
-                if keyword in text_lower:
-                    idx = text_lower.find(keyword)
-                    preference = text[idx + len(keyword) :].strip()
-                    if preference and len(preference) < 50:
-                        relations.append(
-                            {
-                                "type": "PREFERS",
-                                "target": preference.rstrip(".!"),
-                                "target_type": "PREFERENCE",
-                                "confidence": 0.9,
-                            }
-                        )
-                    break
-
-        return relations
+            if not graph_engine.load_snapshot(settings.GRAPH_SNAPSHOT_PATH):
+                graph_engine.rebuild(self._pg)
 
     def remember(
         self,
@@ -341,14 +310,17 @@ class MemoryClient:
         thread_id: Optional[str] = None,
         antecedents: Optional[List[uuid.UUID]] = None,
         action: Optional[str] = None,
+        event_id: Optional[uuid.UUID] = None,
     ) -> uuid.UUID:
         overall_started = time.perf_counter()
         entity_id = entity_id or uuid.uuid4()
+        event_id = event_id or uuid.uuid4()
 
         authority = self._normalize_authority(source, authority)
         if self.durability_mode != "batched" or wal_prewritten:
-            wal_seq = self._wal_prewrite(
+            wal_seq = self._wal_manager.prewrite(
                 entity_id=entity_id,
+                event_id=event_id,
                 content=content,
                 source=source,
                 confidence=confidence,
@@ -356,6 +328,7 @@ class MemoryClient:
                 memory_type=memory_type,
                 wal_seq=wal_seq,
                 wal_prewritten=wal_prewritten,
+                record_metric=self._record_write_path_metric,
             )
 
         event, state = self._apply_memory_event(
@@ -368,23 +341,28 @@ class MemoryClient:
             thread_id=thread_id,
             antecedents=antecedents or [],
             action=action,
+            event_id=event_id,
         )
-        self._persist_required_state(entity_id, content, memory_type, state, event)
+        self._persistence.save(entity_id, content, memory_type, state, event)
         from memory_thread.services.graph_engine import graph_engine
 
         graph_engine.apply_event(event)
+
         if self.durability_mode == "batched" and not wal_prewritten:
-            self._wal_append_committed(
+            self._wal_manager.append_committed(
                 entity_id=entity_id,
                 content=content,
                 source=source,
                 confidence=confidence,
                 authority=authority,
                 memory_type=memory_type,
+                record_metric=self._record_write_path_metric,
             )
         else:
-            self._wal_commit(wal_seq, wal_prewritten)
-        self._schedule_async_enrichment(source, content, entity_id, event.id, memory_type, state)
+            self._wal_manager.commit(
+                wal_seq, wal_prewritten, record_metric=self._record_write_path_metric
+            )
+        self._enrichment.schedule(source, content, entity_id, event.id, memory_type, state)
         self._record_write_path_metric("remember.total", overall_started)
 
         return entity_id
@@ -430,72 +408,14 @@ class MemoryClient:
             "wal_flush_interval_ms": self.wal_flush_interval_ms,
             "write_metrics_enabled": self.enable_write_metrics,
         }
-        if self._wal is not None:
-            stats.update(self._wal.stats())
+        stats.update(self._wal_manager.get_stats())
         return stats
 
     def flush(self) -> None:
-        if self._wal is not None:
-            self._wal.flush()
+        self._wal_manager.flush()
 
     def compact_wal(self) -> None:
-        if self._wal is not None:
-            self._wal.compact()
-
-    def _wal_prewrite(
-        self,
-        entity_id,
-        content,
-        source,
-        confidence,
-        authority,
-        memory_type,
-        wal_seq,
-        wal_prewritten,
-    ):
-        if wal_prewritten:
-            return wal_seq
-
-        started = time.perf_counter()
-        wal_seq = None
-        try:
-            wal_seq = self._wal.append(
-                "remember",
-                {
-                    "entity_id": str(entity_id),
-                    "content": content,
-                    "source": source,
-                    "confidence": confidence,
-                    "authority": authority,
-                    "memory_type": memory_type,
-                },
-            )
-        except Exception as e:
-            log.warning(f"WAL unavailable: {e}")
-        finally:
-            self._record_write_path_metric("remember.wal_prewrite", started)
-        return wal_seq
-
-    def _wal_append_committed(self, entity_id, content, source, confidence, authority, memory_type):
-        started = time.perf_counter()
-        wal_seq = None
-        try:
-            wal_seq = self._wal.append_committed(
-                "remember",
-                {
-                    "entity_id": str(entity_id),
-                    "content": content,
-                    "source": source,
-                    "confidence": confidence,
-                    "authority": authority,
-                    "memory_type": memory_type,
-                },
-            )
-        except Exception as e:
-            log.warning(f"WAL append committed failed: {e}")
-        finally:
-            self._record_write_path_metric("remember.wal_append_committed", started)
-        return wal_seq
+        self._wal_manager.compact()
 
     def _normalize_authority(self, source: str, authority: float) -> float:
         started = time.perf_counter()
@@ -515,13 +435,14 @@ class MemoryClient:
         thread_id=None,
         antecedents=None,
         action=None,
+        event_id=None,
     ):
         started = time.perf_counter()
         truth_vector = TruthVector.model_construct(
             confidence=confidence, authority=authority, freshness=1.0, corroboration=0
         )
         actor = ActorEnum.USER if source == "user" else ActorEnum.AGENT
-        event_id = uuid.uuid4()
+        event_id = event_id or uuid.uuid4()
         if action is None:
             action = ActionEnum.ADD if entity_id not in self._memories else ActionEnum.UPDATE
         elif isinstance(action, str):
@@ -558,6 +479,22 @@ class MemoryClient:
                 updated_at=datetime.utcnow(),
             )
         else:
+            from memory_thread.services.meta_stability_service import MetaStabilityService
+
+            meta = MetaStabilityService()
+            has_conflict = meta.check_contradiction(state, delta)
+            if has_conflict:
+                delta["contradiction_detected"] = True
+                log.info("Contradiction detected (tier 1 key-based) for entity %s", entity_id)
+
+            self._contradiction_worker.schedule(
+                entity_id=str(entity_id),
+                event_id=str(event.id),
+                existing_content=state.current_value.get("content", ""),
+                new_content=content,
+                source=source,
+            )
+
             state.current_value.update(delta)
 
         previous_vector = state.truth_vector
@@ -585,197 +522,36 @@ class MemoryClient:
         self._record_write_path_metric("remember.derive_state", started)
         return event, state
 
-    def _persist_required_state(self, entity_id, content, memory_type, state, event):
-        started = time.perf_counter()
-        if self._pg:
-            try:
-                self._persist_to_postgres(entity_id, content, memory_type, state, event)
-            except Exception as e:
-                log.warning(f"Postgres persist failed: {e}")
-        elif hasattr(self, "_sqlite") and self._sqlite:
-            try:
-                self._persist_to_sqlite(entity_id, content, memory_type, state, event)
-            except Exception as e:
-                log.warning(f"SQLite persist failed: {e}")
-        self._record_write_path_metric("remember.persist_required_state", started)
+    def remember_in_thread(
+        self,
+        content,
+        thread_id,
+        source="agent",
+        confidence=0.8,
+        authority=0.5,
+        memory_type="fact",
+        entity_id=None,
+    ):
+        from memory_thread.services.graph_engine import graph_engine as ge
 
-    def _wal_commit(self, wal_seq, wal_prewritten):
-        if wal_seq is None or wal_prewritten:
-            return
-        started = time.perf_counter()
-        try:
-            self._wal.commit(wal_seq)
-        except Exception as e:
-            log.warning(f"WAL commit failed: {e}")
-        finally:
-            self._record_write_path_metric("remember.wal_commit", started)
+        if not ge._vertex_exists(thread_id):
+            raise ValueError(f"Thread {thread_id} does not exist")
 
-    def _schedule_async_enrichment(self, source, content, entity_id, event_id, memory_type, state):
-        started = time.perf_counter()
-        if source == "user":
-            self._enrichment_queue.put(
-                {
-                    "kind": "entity_extraction",
-                    "content": content,
-                    "entity_id": entity_id,
-                    "event_id": event_id,
-                }
-            )
-        self._record_write_path_metric("remember.schedule_async_enrichment", started)
-
-    def _enrichment_worker_loop(self) -> None:
-        while True:
-            task = self._enrichment_queue.get()
-            if task is None:
-                self._enrichment_queue.task_done()
-                break
-            try:
-                if task["kind"] == "entity_extraction":
-                    self._run_entity_extraction_async(
-                        content=task["content"],
-                        entity_id=task["entity_id"],
-                        event_id=task["event_id"],
-                    )
-            finally:
-                self._enrichment_queue.task_done()
-
-    def _run_entity_extraction_async(self, content, entity_id, event_id):
-        try:
-            extracted_entities = self._extract_entities(content)
-            extracted_relations = self._infer_user_relations(content, extracted_entities)
-
-            def get_entity_context(text, entity_value, window_chars=50):
-                pos = text.lower().find(entity_value.lower())
-                if pos == -1:
-                    return ""
-                start = max(0, pos - window_chars)
-                end = min(len(text), pos + len(entity_value) + window_chars)
-                return text[start:end].strip()
-
-            for ent in extracted_entities:
-                ent_type = ent.get("entity", "UNKNOWN")
-                ent_value = ent.get("value", "")
-                if ent_value and ent_type in ["PERSON", "ORG", "GPE", "PRODUCT"]:
-                    context_window = get_entity_context(content, ent_value)
-                    ent_id = uuid.uuid4()
-                    self._memories[ent_id] = EntityState(
-                        entity_id=ent_id,
-                        namespace=self.namespace,
-                        current_value={
-                            "content": ent_value,
-                            "context": context_window,
-                            "type": "entity",
-                            "entity_type": ent_type,
-                            "source_memory_id": str(entity_id),
-                        },
-                        truth_vector=TruthVector(
-                            confidence=ent.get("confidence", 0.9),
-                            authority=0.9,
-                            freshness=1.0,
-                            corroboration=0,
-                        ),
-                        last_event_id=event_id,
-                    )
-
-            for rel in extracted_relations:
-                rel_id = uuid.uuid4()
-                self._memories[rel_id] = EntityState(
-                    entity_id=rel_id,
-                    namespace=self.namespace,
-                    current_value={
-                        "content": f"USER {rel['type']} {rel['target']}",
-                        "type": "relation",
-                        "relation_type": rel["type"],
-                        "target": rel["target"],
-                        "target_type": rel["target_type"],
-                        "source_memory_id": str(entity_id),
-                    },
-                    truth_vector=TruthVector(
-                        confidence=rel.get("confidence", 0.9),
-                        authority=0.9,
-                        freshness=1.0,
-                        corroboration=0,
-                    ),
-                    last_event_id=event_id,
-                )
-
-            if extracted_entities or extracted_relations:
-                log.info(
-                    f"Extracted {len(extracted_entities)} entities, {len(extracted_relations)} relations"
-                )
-        except Exception as e:
-            log.debug(f"Entity extraction skipped: {e}")
-
-    def _persist_to_postgres(self, entity_id, content, memory_type, state, event):
-        with self._pg.get_cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO events (id, namespace, timestamp, actor, action, object_id, delta, antecedents, truth_vector)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (id) DO NOTHING
-                """,
-                (
-                    str(event.id),
-                    event.namespace,
-                    event.timestamp,
-                    event.actor.value,
-                    event.action.value,
-                    str(event.object_id),
-                    json.dumps(event.delta),
-                    [uid for uid in event.antecedents],
-                    json.dumps(
-                        {
-                            "confidence": event.truth_vector.confidence,
-                            "authority": event.truth_vector.authority,
-                            "freshness": event.truth_vector.freshness,
-                            "corroboration": event.truth_vector.corroboration,
-                        }
-                    ),
-                ),
-            )
-
-            cur.execute(
-                """
-                INSERT INTO entity_state (entity_id, namespace, current_value, truth_vector, last_event_id, updated_at, version)
-                VALUES (%s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT (entity_id) DO UPDATE SET
-                    current_value = EXCLUDED.current_value,
-                    truth_vector = EXCLUDED.truth_vector,
-                    last_event_id = EXCLUDED.last_event_id,
-                    updated_at = EXCLUDED.updated_at,
-                    version = entity_state.version + 1
-                """,
-                (
-                    str(entity_id),
-                    self.namespace,
-                    json.dumps(state.current_value),
-                    json.dumps(
-                        {
-                            "confidence": state.truth_vector.confidence,
-                            "authority": state.truth_vector.authority,
-                            "freshness": state.truth_vector.freshness,
-                            "corroboration": state.truth_vector.corroboration,
-                        }
-                    ),
-                    str(event.id),
-                    datetime.utcnow(),
-                    state.version if hasattr(state, "version") else 1,
-                ),
-            )
-
-    def _persist_to_sqlite(self, entity_id, content, memory_type, state, event):
-        self._sqlite.save_state(
-            entity_id=str(entity_id),
-            namespace=self.namespace,
-            current_value=state.current_value,
-            truth_vector={
-                "confidence": state.truth_vector.confidence,
-                "authority": state.truth_vector.authority,
-                "freshness": state.truth_vector.freshness,
-                "corroboration": state.truth_vector.corroboration,
-            },
-            last_event_id=str(event.id),
+        entity_id = entity_id or uuid.uuid4()
+        tv = TruthVector(
+            confidence=confidence, authority=authority, freshness=1.0, corroboration=0.0
         )
+        event = Event(
+            actor=ActorEnum.USER if source == "user" else ActorEnum.AGENT,
+            action=ActionEnum.ADD,
+            object_id=entity_id,
+            delta={"content": content, "type": memory_type, "source": source},
+            truth_vector=tv,
+            thread_id=uuid.UUID(thread_id) if isinstance(thread_id, str) else thread_id,
+        )
+        self._event_log.append(event)
+        ge.apply_event(event)
+        return entity_id
 
     def recall(
         self,
@@ -846,50 +622,21 @@ class MemoryClient:
             for t in results
         ]
 
-    def remember_in_thread(
-        self,
-        content,
-        thread_id,
-        source="agent",
-        confidence=0.8,
-        authority=0.5,
-        memory_type="fact",
-        entity_id=None,
-    ):
-        from memory_thread.services.graph_engine import graph_engine as ge
-
-        if not ge._vertex_exists(thread_id):
-            raise ValueError(f"Thread {thread_id} does not exist")
-
-        entity_id = entity_id or uuid.uuid4()
-        tv = TruthVector(
-            confidence=confidence, authority=authority, freshness=1.0, corroboration=0.0
-        )
-        event = Event(
-            actor=ActorEnum.USER if source == "user" else ActorEnum.AGENT,
-            action=ActionEnum.ADD,
-            object_id=entity_id,
-            delta={"content": content, "type": memory_type, "source": source},
-            truth_vector=tv,
-            thread_id=uuid.UUID(thread_id) if isinstance(thread_id, str) else thread_id,
-        )
-        self._apply_event(event)
-        return entity_id
-
-    def recall_graph(
-        self, query, top_k=5, min_truth_score=0.3, max_depth=3, decay=0.5, project=None
-    ):
+    def _recall_graph_primary(self, query, top_k=5, min_truth_score=0.3, max_depth=3, decay=0.5):
+        """Graph-primary retrieval with keyword fallback. No global namespace merge."""
         from memory_thread.services.graph_engine import graph_engine
         from memory_thread.services.retrieval_service import retrieve_by_activation
 
-        if not graph_engine.is_built or graph_engine.graph.vcount() == 0:
-            log.info("Graph not built or empty, falling back to vector recall")
-            return self.recall(query, top_k=top_k, min_truth_score=min_truth_score, project=project)
+        if graph_engine.graph.vcount() == 0:
+            self._recall_graph_fallback_count += 1
+            log.info("Graph recall fallback: graph empty")
+            return self._recall_keyword(query, top_k, min_truth_score)
 
         seeds = self._resolve_seeds(query)
         if not seeds:
-            log.info("No seed nodes found for query, falling back to vector recall")
-            return self.recall(query, top_k=top_k, min_truth_score=min_truth_score, project=project)
+            self._recall_graph_fallback_count += 1
+            log.info("Graph recall fallback: no seed nodes for '%s'", query)
+            return self._recall_keyword(query, top_k, min_truth_score)
 
         activated = retrieve_by_activation(
             seeds=seeds,
@@ -916,18 +663,42 @@ class MemoryClient:
                 )
             )
 
-        if len(memories) < top_k and settings.MT_RECALL_MODE == "hybrid":
-            vector_result = self.recall(
-                query, top_k=top_k - len(memories), min_truth_score=min_truth_score, project=project
+        if len(memories) < top_k:
+            keyword_result = self._recall_keyword(
+                query, top_k=top_k - len(memories), min_truth_score=min_truth_score
             )
             seen_ids = {str(m.entity_id) for m in memories}
-            for mem in vector_result.memories:
+            for mem in keyword_result.memories:
                 if str(mem.entity_id) not in seen_ids:
                     memories.append(mem)
                     seen_ids.add(str(mem.entity_id))
 
         memories.sort(key=lambda m: (m.truth_score, m.authority), reverse=True)
         return RecallResult(memories=memories[:top_k], query=query, total_found=len(memories))
+
+    def recall_graph(
+        self, query, top_k=5, min_truth_score=0.3, max_depth=3, decay=0.5, project=None
+    ):
+        if project:
+            original_namespace = self.namespace
+            self.namespace = project
+            result = self._recall_graph_primary(query, top_k, min_truth_score, max_depth, decay)
+            self.namespace = original_namespace
+            return result
+
+        global_namespace = self._get_global_namespace()
+        project_result = self._recall_graph_primary(query, top_k, min_truth_score, max_depth, decay)
+
+        if global_namespace != self.namespace:
+            original_namespace = self.namespace
+            self.namespace = global_namespace
+            global_result = self._recall_graph_primary(
+                query, top_k, min_truth_score, max_depth, decay
+            )
+            self.namespace = original_namespace
+            return self._merge_results(project_result, global_result, top_k)
+
+        return project_result
 
     def _resolve_seeds(self, query: str) -> List[str]:
         from memory_thread.services.graph_engine import graph_engine
@@ -939,14 +710,14 @@ class MemoryClient:
             node = str(uid)
             if graph_engine._vertex_exists(node):
                 seeds.append(node)
-                return seeds
         except (ValueError, AttributeError):
             pass
 
-        matches = graph_engine.search_nodes(query, attr="content")[:5]
+        # Collect generous initial matches — filtering by namespace below
+        matches = graph_engine.search_nodes(query, attr="content")
         seeds.extend(matches)
 
-        name_matches = graph_engine.search_nodes(query, attr="name")[:3]
+        name_matches = graph_engine.search_nodes(query, attr="name")
         seeds.extend(n for n in name_matches if n not in seeds)
 
         if not seeds and self._pg:
@@ -959,10 +730,21 @@ class MemoryClient:
             except Exception:
                 pass
 
-        return list(set(seeds))[: settings.RECALL_GRAPH_MIN_SEEDS]
+        # Filter to current namespace — graph is shared, seeds must not leak across namespaces
+        filtered = []
+        for name in seeds:
+            try:
+                v = graph_engine.graph.vs.find(name=name)
+                v_ns = v.attributes().get("namespace")
+                if v_ns == self.namespace:
+                    filtered.append(name)
+            except (ValueError, KeyError):
+                filtered.append(name)
+
+        return list(set(filtered))[: settings.RECALL_GRAPH_MIN_SEEDS]
 
     def _recall_impl(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
-        return self._recall_keyword(query, top_k, min_truth_score)
+        return self._recall_graph_primary(query, top_k, min_truth_score)
 
     def _merge_results(self, project_result, global_result, top_k):
         from memory_thread.config.settings import settings
@@ -1054,72 +836,18 @@ class MemoryClient:
         top_memories = [m for m, _ in scored_memories[:top_k]]
         return RecallResult(memories=top_memories, query=query, total_found=len(scored_memories))
 
-    def get_context_for_llm(
-        self, query: str, max_tokens: int = 500, include_scores: bool = True
-    ) -> str:
-        result = self.recall(query, top_k=10)
-
-        if not result.memories:
-            return "No relevant memories found."
-
-        max_chars = max_tokens * 4
-
-        if include_scores:
-            return result.to_context(max_chars)
-        else:
-            lines = []
-            char_count = 0
-            for mem in result.memories:
-                if char_count + len(mem.content) > max_chars:
-                    break
-                lines.append(f"- {mem.content}")
-                char_count += len(mem.content)
-            return "\n".join(lines) if lines else "No relevant memories."
-
     def forget(self, entity_id: uuid.UUID) -> bool:
         if entity_id in self._memories:
             state = self._memories[entity_id]
             state.truth_vector.freshness = 0.0
-
-            if self._pg:
-                try:
-                    with self._pg.get_cursor() as cur:
-                        cur.execute(
-                            "DELETE FROM entity_state WHERE entity_id = %s", (str(entity_id),)
-                        )
-                except Exception:
-                    pass
-
+            self._persistence.delete(entity_id)
             return True
         return False
 
     def load_from_db(self) -> int:
-        if not self._pg:
-            return 0
-
-        count = 0
-        try:
-            with self._pg.get_cursor() as cur:
-                cur.execute(
-                    "SELECT entity_id, namespace, current_value, truth_vector FROM entity_state WHERE namespace = %s",
-                    (self.namespace,),
-                )
-                for row in cur.fetchall():
-                    entity_id = uuid.UUID(row[0])
-                    current_value = row[2] if isinstance(row[2], dict) else json.loads(row[2])
-                    tv_data = row[3] if isinstance(row[3], dict) else json.loads(row[3])
-                    state = EntityState(
-                        entity_id=entity_id,
-                        namespace=row[1],
-                        current_value=current_value,
-                        truth_vector=TruthVector(**tv_data),
-                        last_event_id=uuid.uuid4(),
-                    )
-                    self._memories[entity_id] = state
-                    count += 1
-        except Exception as e:
-            log.warning(f"Failed to load from DB: {e}")
-
+        loaded = self._persistence.load_all(self.namespace)
+        self._memories.update(loaded)
+        count = len(loaded)
         self._load_shared_memories()
         return count
 
@@ -1193,16 +921,13 @@ class MemoryClient:
         return stats
 
     def close(self) -> None:
-        self._enrichment_queue.join()
-        for _ in self._enrichment_workers:
-            self._enrichment_queue.put(None)
-        for worker in self._enrichment_workers:
-            worker.join(timeout=1.0)
-        if self._wal is not None:
-            from memory_thread.services.wal import close_wal
+        self._enrichment.shutdown()
+        self._contradiction_worker.shutdown()
+        self._wal_manager.close(compact=settings.WAL_COMPACT_ON_CLOSE)
 
-            close_wal(self.namespace, compact=settings.WAL_COMPACT_ON_CLOSE)
-            self._wal = None
+        from memory_thread.services.graph_engine import graph_engine
+
+        graph_engine.snapshot(settings.GRAPH_SNAPSHOT_PATH)
 
     def clear(self):
         self._memories.clear()
@@ -1447,176 +1172,6 @@ class MemoryClient:
             }
         )
         return stats
-
-    def chat(self, user_message, system_prompt=None, use_local=True, provider=None, model=None):
-        contradiction = self.check_contradiction(user_message)
-        contradiction_note = ""
-        if contradiction.get("has_contradiction"):
-            contradiction_note = (
-                f"\n[Note: User previously said: {contradiction.get('conflicting_memory', '')}]"
-            )
-
-        context = self.get_context_for_llm(query=user_message, max_tokens=1000, include_scores=True)
-
-        if not contradiction.get("has_contradiction"):
-            self.remember(user_message, source="user")
-
-        default_system = """You are a helpful assistant with deep memory about the user's codebase and documents.
-Use the recalled memory context below to give accurate, specific answers.
-When answering about code, reference file names, classes, and functions from the context.
-If the context doesn't contain relevant information, say so honestly."""
-
-        full_prompt = f"""{system_prompt or default_system}
-
-RECALLED MEMORY CONTEXT:
-{context}{contradiction_note}
-
-User: {user_message}
-Assistant:"""
-
-        if provider == "ollama":
-            response = self._generate_ollama(full_prompt, model=model)
-        elif use_local and not provider:
-            response = self._generate_local(full_prompt)
-        else:
-            response = self._generate_cloud(full_prompt, provider=provider or "auto")
-
-        self.remember(response, source="agent", confidence=0.7, authority=0.5)
-        return response
-
-    def _generate_local(self, prompt: str) -> str:
-        try:
-            from transformers import AutoTokenizer, AutoModelForCausalLM
-            import torch
-
-            if not hasattr(self, "_llm_model"):
-                log.info("Loading SmolLM-135M...")
-                self._llm_tokenizer = AutoTokenizer.from_pretrained(
-                    "HuggingFaceTB/SmolLM-135M-Instruct"
-                )
-                self._llm_model = AutoModelForCausalLM.from_pretrained(
-                    "HuggingFaceTB/SmolLM-135M-Instruct", torch_dtype=torch.float32
-                )
-                log.info("SmolLM loaded")
-
-            inputs = self._llm_tokenizer(
-                prompt, return_tensors="pt", truncation=True, max_length=512
-            )
-            with torch.no_grad():
-                outputs = self._llm_model.generate(
-                    **inputs,
-                    max_new_tokens=150,
-                    do_sample=True,
-                    temperature=0.7,
-                    pad_token_id=self._llm_tokenizer.eos_token_id,
-                )
-            response = self._llm_tokenizer.decode(outputs[0], skip_special_tokens=True)
-            if "Assistant:" in response:
-                response = response.split("Assistant:")[-1].strip()
-            return response
-        except Exception as e:
-            log.error(f"Local generation failed: {e}")
-            return (
-                f"[Memory context retrieved, but local LLM unavailable. Context: {prompt[:200]}...]"
-            )
-
-    def _generate_cloud(self, prompt: str, provider: str = "auto") -> str:
-        try:
-            import requests
-
-            groq_key = os.environ.get("GROQ_API_KEY")
-            groq_model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-            openrouter_key = os.environ.get("OPENROUTER_API_KEY")
-            openrouter_model = os.environ.get(
-                "OPENROUTER_MODEL", "meta-llama/llama-3.1-405b-instruct"
-            )
-
-            if provider == "groq" or (provider == "auto" and groq_key):
-                if groq_key:
-                    log.info(f"Using Groq ({groq_model})")
-                    response = requests.post(
-                        "https://api.groq.com/openai/v1/chat/completions",
-                        headers={"Authorization": f"Bearer {groq_key}"},
-                        json={
-                            "model": groq_model,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": 500,
-                            "temperature": 0.7,
-                        },
-                        timeout=30,
-                    )
-                    if response.ok:
-                        return response.json()["choices"][0]["message"]["content"]
-                    log.warning(f"Groq error: {response.status_code}")
-
-            if provider == "openrouter" or (provider == "auto" and openrouter_key):
-                if openrouter_key:
-                    log.info(f"Using OpenRouter ({openrouter_model})")
-                    response = requests.post(
-                        "https://openrouter.ai/api/v1/chat/completions",
-                        headers={
-                            "Authorization": f"Bearer {openrouter_key}",
-                            "HTTP-Referer": "https://github.com/badalraj9/MemoryThread",
-                            "X-Title": "MemoryThread",
-                        },
-                        json={
-                            "model": openrouter_model,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": 500,
-                            "temperature": 0.7,
-                        },
-                        timeout=60,
-                    )
-                    if response.ok:
-                        return response.json()["choices"][0]["message"]["content"]
-                    log.warning(f"OpenRouter error: {response.status_code}")
-
-            log.warning("No cloud API available, falling back to local model")
-            return self._generate_local(prompt)
-        except Exception as e:
-            log.error(f"Cloud generation failed: {e}")
-            return self._generate_local(prompt)
-
-    def list_ollama_models(self) -> List[str]:
-        import requests
-
-        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-        try:
-            response = requests.get(f"{host}/api/tags", timeout=5)
-            if response.ok:
-                data = response.json()
-                return [m["name"] for m in data.get("models", [])]
-            return []
-        except Exception as e:
-            log.warning(f"Failed to list Ollama models: {e}")
-            return []
-
-    def _generate_ollama(self, prompt: str, model: str = None) -> str:
-        import requests
-        import json
-
-        host = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-        model = model or os.environ.get("OLLAMA_MODEL", "deepseek-r1")
-
-        try:
-            log.info(f"Using Ollama ({model})")
-            response = requests.post(
-                f"{host}/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.7, "num_ctx": 4096},
-                },
-                timeout=120,
-            )
-            if response.ok:
-                return response.json().get("response", "").strip()
-            log.warning(f"Ollama error: {response.status_code} - {response.text[:100]}")
-            return f"[Error: Ollama generation failed using {model}]"
-        except Exception as e:
-            log.error(f"Ollama generation failed: {e}")
-            return f"[Error: Could not connect to Ollama at {host}]"
 
     def ingest_fact(self, content, source_uri=None, content_type="text", metadata=None):
         try:

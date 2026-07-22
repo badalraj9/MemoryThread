@@ -165,6 +165,27 @@ class GraphEngine:
         except Exception as e:
             log.debug("Could not load belief_bridges: %s", e)
 
+        try:
+            thread_rows = pg.fetch_all("SELECT * FROM threads")
+            for row in thread_rows:
+                tid = str(row["thread_id"])
+                if tid not in {v["name"] for v in self.graph.vs}:
+                    self.graph.add_vertex(
+                        tid,
+                        type="thread",
+                        title=row.get("title", ""),
+                        created_by=row.get("created_by", "USER"),
+                        started_at=str(row.get("started_at", "")),
+                        status=row.get("status", "active"),
+                    )
+                if row.get("parent_thread_id"):
+                    parent_tid = str(row["parent_thread_id"])
+                    if parent_tid in {v["name"] for v in self.graph.vs}:
+                        if not self.graph.are_adjacent(parent_tid, tid):
+                            self.graph.add_edge(parent_tid, tid, type="contains")
+        except Exception as e:
+            log.debug("Could not load threads from Postgres: %s", e)
+
         self._built = True
         log.info(
             "GraphEngine rebuilt: %d vertices, %d edges", self.graph.vcount(), self.graph.ecount()
@@ -394,33 +415,140 @@ class GraphEngine:
         comps = sub.connected_components()
         return [list(comp) for comp in comps]
 
+    def _community_map(self) -> Dict[str, int]:
+        """Flatten community() into {node_id: community_id}."""
+        if self.graph.vcount() < 2:
+            return {}
+        try:
+            simple = ig.Graph.simplify(self.graph, combine_edges=None)
+            if simple.vcount() < 2:
+                return {}
+            vc = simple.community_leiden(objective_function="modularity")
+            return {simple.vs[i]["name"]: mem for i, mem in enumerate(vc.membership)}
+        except Exception:
+            return {}
+
+    def export_graph_json(self, namespace: Optional[str] = None) -> Dict:
+        """Export full graph as JSON-serializable dict for the frontend."""
+        if self.graph.vcount() == 0:
+            return {
+                "nodes": [],
+                "edges": [],
+                "metadata": {"node_count": 0, "edge_count": 0, "community_count": 0},
+            }
+
+        community_map = self._community_map()
+        pr_scores = self.pagerank()
+        vcount = self.graph.vcount()
+
+        try:
+            layout = self.graph.layout_fruchterman_reingold()
+        except Exception:
+            import random
+
+            random.seed(42)
+            layout = [(random.uniform(-1, 1), random.uniform(-1, 1)) for _ in range(vcount)]
+
+        nodes = []
+        for i, v in enumerate(self.graph.vs):
+            attrs = v.attributes()
+            if namespace and attrs.get("namespace") not in (namespace, None):
+                continue
+            vname = attrs.get("name", "")
+            deg = self.graph.degree(i, mode="all")
+            centrality = deg / (vcount - 1) if vcount > 1 else 0.0
+            nodes.append(
+                {
+                    "id": vname,
+                    "type": attrs.get("type", ""),
+                    "memory_type": attrs.get("memory_type", attrs.get("type", "")),
+                    "namespace": attrs.get("namespace", ""),
+                    "content": attrs.get("content", ""),
+                    "truth_confidence": attrs.get("truth_confidence", 0.5),
+                    "truth_authority": attrs.get("truth_authority", 0.5),
+                    "truth_freshness": attrs.get("truth_freshness", 1.0),
+                    "truth_corroboration": attrs.get("truth_corroboration", 0.0),
+                    "centrality": centrality,
+                    "pagerank": pr_scores.get(vname, 0.0),
+                    "community_id": community_map.get(vname, -1),
+                    "x": float(layout[i][0]),
+                    "y": float(layout[i][1]),
+                }
+            )
+
+        edges = []
+        for e in self.graph.es:
+            eattrs = e.attributes()
+            edges.append(
+                {
+                    "source": self.graph.vs[e.source]["name"],
+                    "target": self.graph.vs[e.target]["name"],
+                    "type": eattrs.get("type", ""),
+                    "relation_type": eattrs.get("relation_type", ""),
+                    "confidence": float(eattrs.get("confidence", 1.0)),
+                    "timestamp": eattrs.get("timestamp", ""),
+                }
+            )
+
+        community_ids = set(community_map.values())
+        return {
+            "nodes": nodes,
+            "edges": edges,
+            "metadata": {
+                "node_count": len(nodes),
+                "edge_count": len(edges),
+                "community_count": len(community_ids),
+            },
+        }
+
     # ── Persistence ────────────────────────────────────────────────────
 
     def snapshot(self, path: str) -> None:
-        """Binary snapshot of the iGraph to disk (fast restart)."""
+        """Persist graph + node_index to disk. Faster restarts than full rebuild."""
+        import pickle, os
+
         try:
-            self.graph.write_pickle(path)
-            log.info("Graph snapshot saved to %s", path)
+            os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+            with self._write_lock:
+                with open(path, "wb") as f:
+                    pickle.dump(
+                        {"graph": self.graph, "node_index": self.node_index},
+                        f,
+                        protocol=pickle.HIGHEST_PROTOCOL,
+                    )
+            log.info(
+                "Graph snapshot saved to %s (%d v, %d e)",
+                path,
+                self.graph.vcount(),
+                self.graph.ecount(),
+            )
         except Exception as e:
             log.warning("Could not save graph snapshot: %s", e)
 
     def load_snapshot(self, path: str) -> bool:
-        """Load binary snapshot. Returns False if file doesn't exist."""
+        """Load graph + node_index from snapshot. Returns False if missing or corrupt."""
+        import pickle
+
         try:
-            with open(path, "rb"):
-                pass
+            open(path, "rb").close()
         except FileNotFoundError:
             return False
         try:
-            self.graph = ig.Graph.Read_Pickle(path)
-            self.node_index = {
-                v["name"]: v["name"] for v in self.graph.vs if _va(v, "type") == "entity"
-            }
-            self._built = True
-            log.info("Graph snapshot loaded from %s", path)
+            with open(path, "rb") as f:
+                data = pickle.load(f)
+            with self._write_lock:
+                self.graph = data["graph"]
+                self.node_index = data["node_index"]
+                self._built = True
+            log.info(
+                "Graph snapshot loaded from %s (%d v, %d e)",
+                path,
+                self.graph.vcount(),
+                self.graph.ecount(),
+            )
             return True
         except Exception as e:
-            log.warning("Could not load graph snapshot: %s", e)
+            log.warning("Snapshot load failed (%s) — rebuilding from Postgres", e)
             return False
 
     # ── Query Helpers ──────────────────────────────────────────────────
@@ -430,12 +558,13 @@ class GraphEngine:
         return [v["name"] for v in self.graph.vs if _va(v, attr) == value]
 
     def search_nodes(self, text: str, attr: str = "content") -> List[str]:
-        """Search nodes by substring match on an attribute."""
-        text_lower = text.lower()
+        """Search nodes by word-overlap match on an attribute."""
+        query_words = set(text.lower().split())
         return [
             v["name"]
             for v in self.graph.vs
-            if isinstance(_va(v, attr), str) and text_lower in str(_va(v, attr, "")).lower()
+            if isinstance(_va(v, attr), str)
+            and (query_words & set(str(_va(v, attr, "")).lower().split()))
         ]
 
     # ── Internal ───────────────────────────────────────────────────────
@@ -468,6 +597,19 @@ class GraphEngine:
 
         if not self.graph.are_adjacent(event_id, entity_id):
             self.graph.add_edge(event_id, entity_id, type="modifies", action=event.action.value)
+
+        if event.delta.get("contradiction_detected"):
+            self.graph.add_edge(
+                event_id,
+                entity_id,
+                type="contradicts",
+                direction="event_to_entity",
+                detector="tier1_key_based",
+                confidence=event.truth_vector.confidence,
+                timestamp=event.timestamp.isoformat()
+                if isinstance(event.timestamp, datetime)
+                else str(event.timestamp),
+            )
 
         if event.thread_id:
             thread_id = str(event.thread_id)
@@ -526,6 +668,19 @@ class GraphEngine:
                 target_id = str(target_id)
                 self._ensure_node(target_id, type="entity")
                 self._merge_nodes(entity_id, target_id)
+
+        from memory_thread.services.event_bus import event_bus
+
+        event_bus.publish_sync(
+            "graph_mutation",
+            {
+                "event_id": event_id,
+                "object_id": entity_id,
+                "action": event.action.value,
+                "namespace": event.namespace,
+                "contradiction": event.delta.get("contradiction_detected", False),
+            },
+        )
 
     def _ensure_node(self, name: str, **attrs) -> str:
         if name not in {v["name"] for v in self.graph.vs}:

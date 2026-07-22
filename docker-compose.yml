@@ -1,5 +1,3 @@
-version: '3.8'
-
 services:
   mt-api:
     build: .
@@ -13,20 +11,26 @@ services:
       - MT_POSTGRES_USER=memory
       - MT_POSTGRES_PASSWORD=memory123
       - MT_POSTGRES_DB=memorythread
+      - MT_API_KEY=${MT_API_KEY:-change-me-in-production}
     depends_on:
-      - postgres
-    command: uvicorn memory_thread.api.server:app --host 0.0.0.0 --port 8000
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
 
   postgres:
-    image: postgres:15
+    image: postgres:16
     environment:
       - POSTGRES_USER=memory
       - POSTGRES_PASSWORD=memory123
       - POSTGRES_DB=memorythread
     volumes:
       - postgres_data:/var/lib/postgresql/data
-    ports:
-      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U memory -d memorythread"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    restart: unless-stopped
 
 volumes:
   postgres_data:

@@ -3,7 +3,7 @@ Golden Thread Service - MT's most unique feature.
 
 Traces the complete causal chain from origin to present state in a human-readable narrative.
 Uses GraphEngine (in-memory iGraph) instead of Postgres round-trips.
-Same public API as before — drop-in replacement.
+Same public API as before -- drop-in replacement.
 """
 
 import uuid
@@ -92,6 +92,90 @@ class GoldenThreadService:
             eid = uuid.uuid4()
         return self.trace(eid)
 
+    def trace_topic(
+        self,
+        topic: str,
+        max_entities: int = 10,
+        max_events: int = 500,
+    ) -> Dict:
+        """
+        Trace the evolution of a topic across all related entities.
+        Resolves topic to entity nodes via graph search, then merges
+        each entity's golden thread chronologically.
+
+        Returns a dict with merged events, entity count, and narrative.
+        """
+        # Search for matching event vertices (only events have content attribute)
+        event_matches = graph_engine.search_nodes(topic, attr="content")
+        # Resolve to entity vertices by following modifies edges from event -> entity
+        entity_nodes = set()
+        for ename in event_matches:
+            try:
+                vidx = graph_engine.graph.vs.find(name=ename).index
+            except (ValueError, KeyError):
+                continue
+            for e in graph_engine.graph.es:
+                eattrs = e.attributes()
+                if eattrs.get("type") == "modifies" and e.source == vidx:
+                    entity_nodes.add(graph_engine.graph.vs[e.target]["name"])
+            if len(entity_nodes) >= max_entities:
+                break
+
+        # Also search by name attribute for direct entity name matches
+        name_matches = graph_engine.search_nodes(topic, attr="name")
+        entity_nodes.update(name_matches)
+        all_nodes = list(entity_nodes)[:max_entities]
+
+        if not all_nodes:
+            return {
+                "topic": topic,
+                "entity_count": 0,
+                "event_count": 0,
+                "events": [],
+                "truncated": False,
+                "narrative": f"No entities found for topic '{topic}'.",
+            }
+
+        all_events = []
+        seen_event_names: set = set()
+
+        for node_name in all_nodes:
+            raw = self._collect_entity_events(node_name)
+            ancestors = self._collect_ancestor_events(raw)
+            merged = self._merge_and_sort(raw, ancestors)
+            for evt in merged:
+                ename = evt.get("_name", "")
+                if ename not in seen_event_names:
+                    seen_event_names.add(ename)
+                    all_events.append(evt)
+
+        all_events.sort(key=lambda x: x.get("timestamp", ""))
+        truncated = len(all_events) > max_events
+        if truncated:
+            all_events = all_events[-max_events:]
+
+        thread_events = self._build_thread_events(all_events)
+
+        lines = [f"Topic Evolution: {topic}", "━" * 40, ""]
+        for event in thread_events[-20:]:
+            ts = event.timestamp[:19] if event.timestamp else "Unknown"
+            lines.append(f"[{ts}] {event.event_type} by {event.actor}")
+            content = event.delta.get("content", "")[:80]
+            if content:
+                lines.append(f'  "{content}"')
+            lines.append("")
+        lines.append("━" * 40)
+        lines.append(f"{len(all_nodes)} entities \u00b7 {len(all_events)} events")
+
+        return {
+            "topic": topic,
+            "entity_count": len(all_nodes),
+            "event_count": len(all_events),
+            "events": thread_events,
+            "truncated": truncated,
+            "narrative": "\n".join(lines),
+        }
+
     # ── Graph Collection (replaces ReplayService + AncestryCache) ──────
 
     def _collect_entity_events(self, entity_node: str) -> List[Dict]:
@@ -150,7 +234,7 @@ class GoldenThreadService:
             if n not in seen:
                 seen.add(n)
                 merged.append(e)
-        merged.sort(key=lambda x: x.get("timestamp", ""))
+        merged.sort(key=lambda x: x.get("timestamp") or "")
         return merged
 
     def _vertex_to_event(self, v, edge_attrs: Optional[Dict] = None) -> Dict:
@@ -169,15 +253,15 @@ class GoldenThreadService:
         return {
             "_name": v["name"],
             "event_id": v["name"],
-            "timestamp": vattrs.get("timestamp", ""),
+            "timestamp": vattrs.get("timestamp") or "",
             "actor": vattrs.get("actor", "UNKNOWN"),
             "action": vattrs.get("action", "UNKNOWN"),
             "object_id": vattrs.get("object_id", ""),
             "delta": delta,
             "truth_vector": {
-                "confidence": vattrs.get("truth_confidence", 0.5),
-                "authority": vattrs.get("truth_authority", 0.5),
-                "freshness": vattrs.get("truth_freshness", 1.0),
+                "confidence": vattrs.get("truth_confidence") or 0.5,
+                "authority": vattrs.get("truth_authority") or 0.5,
+                "freshness": vattrs.get("truth_freshness") or 1.0,
                 "corroboration": 0.0,
             },
             "antecedents": [],
@@ -256,8 +340,8 @@ class GoldenThreadService:
         if delta.get("resolved") or delta.get("conflict_resolved"):
             return "RESOLVED"
         if prev_state and new_state:
-            old_f = prev_state.get("freshness", 1.0)
-            new_f = new_state.get("freshness", 1.0)
+            old_f = prev_state.get("freshness") or 1.0
+            new_f = new_state.get("freshness") or 1.0
             if old_f - new_f > 0.3:
                 return "DECAYED"
         action = event.get("action", "")
@@ -328,7 +412,7 @@ class GoldenThreadService:
             lines.append(f"{seq_emoji} {ts}  {event.event_type} by {event.actor}")
 
             if event.event_type == "CREATED":
-                content = event.delta.get("content", "")[:100]
+                content = (event.delta.get("content") or "")[:100]
                 lines.append(f'  "{content}"')
             elif event.event_type == "CONTRADICTED":
                 conflicting = event.delta.get("conflicting_content", "")
@@ -337,7 +421,7 @@ class GoldenThreadService:
                 if event.truth_before and event.truth_after:
                     before = event.truth_before.get("confidence", 0)
                     after = event.truth_after.get("confidence", 0)
-                    lines.append(f"  Trust dropped: {before:.2f} → {after:.2f}")
+                    lines.append(f"  Trust dropped: {before:.2f} -> {after:.2f}")
             elif event.event_type == "UPDATED":
                 if event.delta:
                     changes = []
@@ -348,14 +432,14 @@ class GoldenThreadService:
                         lines.append(f"  Changed: {', '.join(changes)}")
             elif event.event_type == "DECAYED":
                 if event.truth_before and event.truth_after:
-                    before = event.truth_before.get("freshness", 0)
-                    after = event.truth_after.get("freshness", 0)
-                    lines.append(f"  Freshness: {before:.2f} → {after:.2f}")
+                    before = event.truth_before.get("freshness") or 0
+                    after = event.truth_after.get("freshness") or 0
+                    lines.append(f"  Freshness: {before:.2f} -> {after:.2f}")
 
             if event.truth_after:
                 conf = event.truth_after.get("confidence", 0)
                 auth = event.truth_after.get("authority", 0)
-                fresh = event.truth_after.get("freshness", 0)
+                fresh = event.truth_after.get("freshness") or 0
                 lines.append(
                     f"  Truth: confidence={conf:.2f}, authority={auth:.2f}, freshness={fresh:.2f}"
                 )
@@ -379,7 +463,7 @@ class GoldenThreadService:
             for p in paths_sample:
                 target = p.get("target", "")[:8]
                 rel = p.get("relation", "UNKNOWN")
-                path_strs.append(f"{result.entity_id[:8]} → {rel} → {target}")
+                path_strs.append(f"{result.entity_id[:8]} -> {rel} -> {target}")
             lines.append(f"Related:       {', '.join(path_strs)}")
 
         return "\n".join(lines)
@@ -409,7 +493,7 @@ class GoldenThreadService:
                 if event.truth_before and event.truth_after:
                     before = event.truth_before.get("confidence", 0)
                     after = event.truth_after.get("confidence", 0)
-                    lines.append(f"  Trust dropped: {before:.2f} → {after:.2f}")
+                    lines.append(f"  Trust dropped: {before:.2f} -> {after:.2f}")
             elif event.event_type == "UPDATED":
                 if event.delta:
                     changes = []
@@ -420,16 +504,16 @@ class GoldenThreadService:
                         lines.append(f"  Changed: {', '.join(changes)}")
             elif event.event_type == "DECAYED":
                 if event.truth_before and event.truth_after:
-                    before = event.truth_before.get("freshness", 0)
-                    after = event.truth_after.get("freshness", 0)
-                    lines.append(f"  Freshness: {before:.2f} → [yellow]{after:.2f}[/yellow]")
+                    before = event.truth_before.get("freshness") or 0
+                    after = event.truth_after.get("freshness") or 0
+                    lines.append(f"  Freshness: {before:.2f} -> [yellow]{after:.2f}[/yellow]")
             elif event.event_type == "VERIFIED":
                 lines.append("  [green]Verified through replay[/green]")
 
             if event.truth_after:
                 conf = event.truth_after.get("confidence", 0)
                 auth = event.truth_after.get("authority", 0)
-                fresh = event.truth_after.get("freshness", 0)
+                fresh = event.truth_after.get("freshness") or 0
                 lines.append(
                     f"  Truth: confidence={conf:.2f}, authority={auth:.2f}, freshness={fresh:.2f}"
                 )
@@ -456,7 +540,7 @@ class GoldenThreadService:
             for p in paths_sample:
                 target = p.get("target", "")[:8]
                 rel = p.get("relation", "UNKNOWN")
-                path_strs.append(f"{result.entity_id[:8]} → {rel} → {target}")
+                path_strs.append(f"{result.entity_id[:8]} -> {rel} -> {target}")
             lines.append(f"[bold]Related:[/bold]       {', '.join(path_strs)}")
 
         return "\n".join(lines)

@@ -112,3 +112,48 @@ def test_latency_profile(memory_client_factory, perf_enabled, monkeypatch):
     for operation_name, idle in idle_profiles.items():
         assert idle["p99"] >= idle["p50"]
         assert concurrent_profiles[operation_name]["p99"] <= idle["p99"] * 3
+
+
+def test_latency_smoke(memory_client_factory):
+    """
+    Always-running structural smoke test for the latency-profile operations.
+
+    Does NOT assert timing — just verifies all operations execute without error
+    and return structurally correct results. Catches import breaks, API
+    regressions, and enrichment worker crashes without the overhead of the
+    full 1000-iteration profile.
+
+    To run the full latency profile with timing assertions:
+        MT_RUN_PERF=1 pytest tests/test_latency_profile.py::test_latency_profile -v -s
+    """
+    client = memory_client_factory("latency_smoke", use_db=False)
+
+    ids = [client.remember(f"smoke memory {i} token", source="agent") for i in range(20)]
+
+    # recall
+    result = client.recall("smoke memory token", top_k=5, min_truth_score=0.0)
+    assert result.total_found >= 0
+
+    # get_truth_score
+    score = client.get_truth_score(ids[0])
+    assert score is None or isinstance(score, float)
+
+    # contradiction check
+    service = MetaStabilityService()
+    from memory_thread.models.events import EntityState, TruthVector
+    import uuid as _uuid
+    state = EntityState(
+        entity_id=ids[0],
+        namespace=client.namespace,
+        current_value={"content": "smoke test"},
+        truth_vector=TruthVector(confidence=0.9, authority=0.9, freshness=1.0, corroboration=0),
+        last_event_id=_uuid.uuid4(),
+    )
+    result = service.check_contradiction(state, {"content": "different value"})
+    assert isinstance(result, bool)
+
+    # truth score calculation
+    score = TruthVectorService.calculate_score(
+        TruthVector(confidence=0.9, authority=0.9, freshness=1.0, corroboration=3)
+    )
+    assert 0.0 <= score <= 1.0

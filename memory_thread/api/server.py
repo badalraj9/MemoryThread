@@ -25,9 +25,10 @@ for _lib in ["httpx", "httpcore", "urllib3", "sqlalchemy", "psycopg2"]:
 # Set MT logs to INFO
 logging.getLogger("memory_thread").setLevel(logging.INFO)
 
-from fastapi import FastAPI, HTTPException, Depends, Header
+from fastapi import FastAPI, HTTPException, Depends, Header, Request
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import PlainTextResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from typing import Optional, List, Dict, Any
 import uuid
@@ -179,6 +180,14 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     print("\n[yellow]Shutting down...[/yellow]")
+    # Close all cached MemoryClient instances (shuts down enrichment pipelines + WAL)
+    for namespace, client in list(_client_cache.items()):
+        try:
+            client.close()
+            log.info("Closed MemoryClient for namespace '%s'", namespace)
+        except Exception as e:
+            log.warning("Error closing MemoryClient for '%s': %s", namespace, e)
+    _client_cache.clear()
 
 
 # ==============================================================================
@@ -224,6 +233,10 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE", "OPTIONS"],
     allow_headers=["Authorization", "Content-Type", "X-Namespace", "X-API-Key"],
 )
+
+from memory_thread.api.routers import maintenance as maintenance_router
+
+app.include_router(maintenance_router.router)
 
 
 # ==============================================================================
@@ -383,6 +396,25 @@ class HealthResponse(BaseModel):
     postgres_connected: bool = False
 
 
+class GraphSearchRequest(BaseModel):
+    query: str = Field(..., description="Search text")
+    attr: str = Field("content", description="Vertex attribute to search")
+    namespace: Optional[str] = Field(None, description="Filter by namespace")
+
+
+class GraphPathsRequest(BaseModel):
+    source: str = Field(..., description="Source entity ID")
+    target: str = Field(..., description="Target entity ID")
+    max_hops: int = Field(5, ge=1, le=20, description="Max path length")
+
+
+class GraphActivationRequest(BaseModel):
+    seeds: List[str] = Field(..., min_length=1, description="Seed node IDs to activate from")
+    max_depth: int = Field(3, ge=1, le=10, description="Max traversal depth")
+    decay_per_hop: float = Field(0.5, ge=0.0, le=1.0, description="Activation decay per hop")
+    truth_threshold: float = Field(0.0, ge=0.0, le=1.0, description="Minimum activation threshold")
+
+
 # ==============================================================================
 # Dependencies
 # ==============================================================================
@@ -415,25 +447,76 @@ async def root():
 
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
-    postgres_connected = False
-    qdrant_connected = False
+    from memory_thread.utils.health import get_health_checker
 
-    try:
-        from memory_thread.db.postgres_client import PostgresClient
+    checker = get_health_checker()
+    result = checker.full_check()
 
-        pg = PostgresClient()
-        with pg.get_cursor() as cur:
-            cur.execute("SELECT 1")
-        postgres_connected = True
-    except Exception:
-        pass
+    postgres_connected = result.get("services", {}).get("postgres", {}).get("status") == "healthy"
 
     return HealthResponse(
-        status="healthy" if postgres_connected else "degraded",
+        status=result.get("status", "degraded"),
         timestamp=datetime.utcnow().isoformat(),
         version="1.0.0",
         postgres_connected=postgres_connected,
     )
+
+
+@app.get("/health/ready", tags=["Health"])
+async def readiness_check():
+    """Kubernetes readiness probe — 200 only if service can accept traffic."""
+    from memory_thread.utils.health import get_health_checker
+
+    checker = get_health_checker()
+    result = checker.full_check()
+    pg_ok = result.get("services", {}).get("postgres", {}).get("status") == "healthy"
+
+    if not pg_ok:
+        raise HTTPException(status_code=503, detail="PostgreSQL not available")
+    return {"ready": True, "status": "healthy"}
+
+
+@app.get("/health/live", tags=["Health"])
+async def liveness_check():
+    """Kubernetes liveness probe — 200 if process is running."""
+    return {"alive": True}
+
+
+_metrics_store = {"requests_total": 0, "requests_errors": 0, "events_processed": 0}
+
+
+@app.get("/metrics", response_class=PlainTextResponse, tags=["Health"])
+async def prometheus_metrics():
+    """Prometheus-compatible metrics endpoint."""
+    try:
+        from prometheus_client import generate_latest, REGISTRY
+
+        return generate_latest(REGISTRY).decode("utf-8")
+    except Exception:
+        lines = [
+            "# HELP mt_requests_total Total requests processed",
+            "# TYPE mt_requests_total counter",
+            f"mt_requests_total {_metrics_store['requests_total']}",
+            "",
+            "# HELP mt_requests_errors Total request errors",
+            "# TYPE mt_requests_errors counter",
+            f"mt_requests_errors {_metrics_store['requests_errors']}",
+            "",
+            "# HELP mt_events_processed Total events processed",
+            "# TYPE mt_events_processed counter",
+            f"mt_events_processed {_metrics_store['events_processed']}",
+            "",
+            "# HELP mt_up Service up status",
+            "# TYPE mt_up gauge",
+            "mt_up 1",
+        ]
+        return "\n".join(lines)
+
+
+@app.get("/version", tags=["Health"])
+async def get_version():
+    """Returns version and build information."""
+    return {"version": "1.0.0", "name": "Memory Thread API", "api_version": "v1"}
 
 
 @app.post(
@@ -631,6 +714,150 @@ async def galaxy_conflicts(client: MemoryClient = Depends(get_client)):
         return {"conflicts": client.get_galaxy_conflicts()}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# Graph Endpoints
+# ==============================================================================
+
+GRAPH_TAG = "Graph"
+
+
+@app.get("/graph", tags=[GRAPH_TAG], dependencies=[Depends(verify_token)])
+async def get_graph(namespace: Optional[str] = None):
+    """Export the full cognitive graph with positions, communities, and centralities."""
+    try:
+        from memory_thread.services.graph_engine import graph_engine
+
+        return graph_engine.export_graph_json(namespace=namespace)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/graph/stats", tags=[GRAPH_TAG], dependencies=[Depends(verify_token)])
+async def get_graph_stats(namespace: Optional[str] = None):
+    """Graph-level statistics: node/edge counts, community count, density."""
+    try:
+        from memory_thread.services.graph_engine import graph_engine
+
+        export = graph_engine.export_graph_json(namespace=namespace)
+        nodes = export["nodes"]
+        edges = export["edges"]
+        n = len(nodes)
+        e = len(edges)
+        max_possible = n * (n - 1) / 2 if n > 1 else 1
+        return {
+            "node_count": n,
+            "edge_count": e,
+            "community_count": export["metadata"]["community_count"],
+            "density": round(e / max_possible, 6) if max_possible > 0 else 0.0,
+            "avg_centrality": round(sum(node["centrality"] for node in nodes) / n, 4)
+            if n > 0
+            else 0.0,
+            "avg_pagerank": round(sum(node["pagerank"] for node in nodes) / n, 6) if n > 0 else 0.0,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/graph/search", tags=[GRAPH_TAG], dependencies=[Depends(verify_token)])
+async def search_graph(request: GraphSearchRequest):
+    """Fuzzy search nodes by content."""
+    try:
+        from memory_thread.services.graph_engine import graph_engine
+
+        results = graph_engine.search_nodes(request.query, attr=request.attr)
+        if request.namespace:
+            results = [
+                n
+                for n in results
+                if graph_engine.graph.vs.find(name=n).attributes().get("namespace")
+                == request.namespace
+            ]
+        enriched = []
+        for node_id in results[:50]:
+            try:
+                v = graph_engine.graph.vs.find(name=node_id)
+                attrs = v.attributes()
+                enriched.append(
+                    {
+                        "id": node_id,
+                        "content": attrs.get("content", ""),
+                        "type": attrs.get("type", ""),
+                        "namespace": attrs.get("namespace", ""),
+                        "truth_confidence": attrs.get("truth_confidence", 0.5),
+                    }
+                )
+            except (ValueError, KeyError):
+                pass
+        return {"query": request.query, "total": len(results), "results": enriched}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/graph/paths", tags=[GRAPH_TAG], dependencies=[Depends(verify_token)])
+async def find_path(request: GraphPathsRequest):
+    """Shortest path between two entities in the cognitive graph."""
+    try:
+        from memory_thread.services.graph_engine import graph_engine
+
+        path = graph_engine.shortest_path(request.source, request.target)
+        if not path:
+            return {"found": False, "path": [], "length": 0}
+        return {
+            "found": True,
+            "path": path,
+            "length": len(path) - 1,
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/graph/activation", tags=[GRAPH_TAG], dependencies=[Depends(verify_token)])
+async def spreading_activation(request: GraphActivationRequest):
+    """Run spreading activation from seed nodes and return the activation map."""
+    try:
+        from memory_thread.services.graph_engine import graph_engine
+
+        result = graph_engine.activation(
+            seeds=request.seeds,
+            max_depth=request.max_depth,
+            decay_per_hop=request.decay_per_hop,
+            truth_threshold=request.truth_threshold,
+        )
+        sorted_results = sorted(result.items(), key=lambda x: -x[1])
+        return {
+            "seeds": request.seeds,
+            "activation_map": {k: v for k, v in sorted_results},
+            "total_activated": len(result),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==============================================================================
+# SSE Event Stream
+# ==============================================================================
+
+
+@app.get("/events", tags=["Events"])
+def event_stream():
+    """SSE endpoint — streams graph mutations, WAL commits, and health deltas to connected clients."""
+    from memory_thread.services.event_bus import event_bus
+    import queue
+
+    q = event_bus.subscribe()
+    try:
+        while True:
+            try:
+                msg = q.get(timeout=30)
+                yield f"data: {msg}\n\n"
+            except queue.Empty:
+                yield ": keepalive\n\n"
+    except GeneratorExit:
+        pass
+    finally:
+        event_bus.unsubscribe(q)
 
 
 # ==============================================================================
