@@ -592,7 +592,7 @@ class GraphEngine:
             "content": event.delta.get("content", ""),
             "delta_json": _json.dumps(event.delta),
         }
-        if event_id not in {v["name"] for v in self.graph.vs}:
+        if not self._vertex_exists(event_id):
             self.graph.add_vertex(event_id, **event_attrs)
 
         if not self.graph.are_adjacent(event_id, entity_id):
@@ -613,7 +613,7 @@ class GraphEngine:
 
         if event.thread_id:
             thread_id = str(event.thread_id)
-            if thread_id not in {v["name"] for v in self.graph.vs}:
+            if not self._vertex_exists(thread_id):
                 self.graph.add_vertex(
                     thread_id, type="thread", title="", created_by=event.actor.value
                 )
@@ -683,7 +683,7 @@ class GraphEngine:
         )
 
     def _ensure_node(self, name: str, **attrs) -> str:
-        if name not in {v["name"] for v in self.graph.vs}:
+        if not self._vertex_exists(name):
             self.graph.add_vertex(name, **attrs)
             if attrs.get("type") == "entity":
                 self.node_index[name] = name
