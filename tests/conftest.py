@@ -4,6 +4,14 @@ from pathlib import Path
 
 import pytest
 
+# Skip the blocking AsyncGraphWorker.flush() during lifespan so API tests
+# don't hang against a large live DB. Safe: the worker still starts its
+# background poll thread; only the initial full-replay is bypassed.
+os.environ.setdefault("MT_SKIP_GRAPH_FLUSH", "1")
+# Force server-side MemoryClient to use_db=False so API tests run fully
+# in-memory without needing a live Postgres connection per request.
+os.environ.setdefault("MT_USE_DB_FALSE", "1")
+
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
@@ -15,6 +23,32 @@ def pytest_configure(config):
     config.addinivalue_line("markers", "slow: long-running performance test")
     config.addinivalue_line("markers", "integration: uses optional services or subprocesses")
     config.addinivalue_line("markers", "benchmark: performance-oriented benchmark-style check")
+
+
+@pytest.fixture(scope="module")
+def pg_graph_worker():
+    """Start AsyncGraphWorker with an initial flush for PG integration tests.
+
+    Mirrors what server.py lifespan does: flush() drains any backlog from PG
+    synchronously so tests that read graph state immediately after writing see
+    a fully consistent graph. Worker is stopped after the test module exits.
+
+    Skipped silently if Postgres is not available (worker will raise on init).
+    """
+    try:
+        from memory_thread.db.postgres_client import PostgresClient
+        from memory_thread.nervous.graph_worker import AsyncGraphWorker
+
+        pg = PostgresClient()
+        worker = AsyncGraphWorker(pg)
+        worker.flush()
+        worker.start()
+        yield worker
+        worker.stop()
+    except Exception:
+        yield None  # PG unavailable — tests guarded by requires_postgres will skip
+
+
 
 
 @pytest.fixture

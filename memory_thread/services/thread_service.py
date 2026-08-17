@@ -56,19 +56,19 @@ class ThreadService:
         """Create a new thread node in the graph."""
         thread_id = str(uuid.uuid4())
 
-        if thread_id not in {v["name"] for v in graph_engine.graph.vs}:
-            graph_engine.graph.add_vertex(
-                thread_id,
-                type="thread",
-                title=title,
-                created_by=created_by,
-                started_at=datetime.utcnow().isoformat(),
-                status="active",
-            )
+        # Fix #1: use _ensure_node so the new vertex is registered in _vertex_names
+        graph_engine._ensure_node(
+            thread_id,
+            type="thread",
+            title=title,
+            created_by=created_by,
+            started_at=datetime.utcnow().isoformat(),
+            status="active",
+        )
 
         if parent_thread_id:
             parent = str(parent_thread_id)
-            if parent in {v["name"] for v in graph_engine.graph.vs}:
+            if parent in graph_engine._vertex_names:  # Fix #1: O(1) check
                 if not graph_engine.graph.are_adjacent(parent, thread_id):
                     graph_engine.graph.add_edge(parent, thread_id, type="contains")
             thread_result = Thread(

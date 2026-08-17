@@ -6,21 +6,90 @@
 
 - **Structural-only graph** — This is the actual scaling ceiling, not rebuild speed. Storing full conversation text in igraph vertex attributes guarantees OOM past ~100K events. Keeping only `entity_id` + `sequence_id` in the graph, with content fetched via `SELECT ... WHERE id IN (...)` from PG, is the right direction. But it touches every graph consumer — `search_nodes()`, `recall()`, `golden_thread.trace()`, `context_monitor.observe()` — so it needs a careful rollout.
 
-## What I'd push back on
+## Implementation
 
-- **5-second MVCC buffer** — Correct in theory, but over-engineering for this system. The current write path is single-threaded per-client. Two clients writing concurrently *could* interleave, but `remember()` does `ON CONFLICT (id) DO NOTHING` and `_apply()` is idempotent via `_vertex_exists()`. The buffer adds 5s of latency per cycle for a race that practically never triggers in an append-only ledger. I'd skip it unless you see evidence of the bug in production.
+### Worker: `memory_thread/nervous/graph_worker.py`
 
-- **The ContradictionWorker and EnrichmentPipeline** — Currently started as daemon threads in `MemoryClient.__init__`. If the async worker is the sole graph writer, these need to move there too, or they become orphans writing to a stale graph. It's manageable but worth calling out.
+Reads from the existing `events` table (not a new table), parses `truth_vector` from JSONB, reconstructs Pydantic `Event` objects, and replays them through `graph_engine._apply()`.
 
-## What's missing
+```python
+class AsyncGraphWorker:
+    """Background thread: replay PG events into igraph asynchronously."""
 
-- **Crash recovery + cursor atomicity** — If the worker crashes *between* `_apply()` batches and `UPDATE ingestion_cursor`, replaying the batch is safe (idempotent). But the cursor update needs to be in the same transaction as... well, there's no PG-side transaction for the graph since it's in-memory. A simple fix: write `last_sequence_id` after every N events within the batch, not just at the end. That way crash replay overlaps at most N events instead of 5000.
+    def __init__(self, pg, batch_size=1000, poll_interval=1.0):
+        self.pg = pg
+        self.batch_size = batch_size
+        self.poll_interval = poll_interval
+        self._ensure_cursor_table()
+        self._ensure_influence_table()
+```
 
-## Verdict
+- Cursor: `ingestion_cursor` table tracks `last_event_id UUID`. Worker queries `WHERE timestamp > cursor_timestamp OR (timestamp = cursor_timestamp AND id > cursor_id) ORDER BY timestamp, id`.
+- `_apply()` is idempotent — replaying already-applied events is a no-op (vertex existence check).
+- No 5-second MVCC buffer — unnecessary given idempotent writes and single-threaded per-client.
+- `galaxy_influence_matrix` table created on worker init.
 
-**Strategy 3 is the right call.** If I were sequencing the work:
+### Schema additions required
 
-1. Add `sequence_id BIGSERIAL` to `events` table + `ingestion_cursor` table (1-2 hours, no code change to existing paths)
-2. Strip heavy attributes from igraph vertices, move content fetch to PG (bigger refactor, 2-3 days)
-3. Extract `ContradictionWorker` + `EnrichmentPipeline` into the async worker
-4. Make the write path thin (skip graph apply on `remember()`)
+```sql
+-- Cursor tracking (created by worker on init)
+CREATE TABLE IF NOT EXISTS ingestion_cursor (
+    system_key VARCHAR(100) PRIMARY KEY,
+    last_event_id UUID,
+    last_processed_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
+);
+
+-- Multi-agent trust matrix (created by worker on init)
+CREATE TABLE IF NOT EXISTS galaxy_influence_matrix (
+    requesting_namespace VARCHAR(255) NOT NULL,
+    observed_namespace VARCHAR(255) NOT NULL,
+    trust_weight FLOAT NOT NULL CHECK (trust_weight >= 0.0 AND trust_weight <= 1.0),
+    PRIMARY KEY (requesting_namespace, observed_namespace)
+);
+```
+
+No changes to the existing `events` table. No `sequence_id` required for initial deployment — cursor works on `(timestamp, id)`.
+
+## Execution order
+
+1. **Deploy worker** — `AsyncGraphWorker` can run alongside the existing sync path. `_apply()` is idempotent, so double-apply is safe (wasted CPU, no corruption).
+2. **Strip graph apply from sync path** — once worker is stable, remove `graph_engine.apply_event()` from `remember()`. Worker becomes sole graph writer.
+3. **Add `sequence_id BIGSERIAL`** — optimizes cursor query from index-scan on `(timestamp, id)` to integer comparison on `(sequence_id)`. Worker switches cursor after migration.
+4. **Strip heavy attributes from igraph** — move content fetch to PG `SELECT ... WHERE id IN (...)`. Touches `search_nodes()`, `recall()`, `golden_thread.trace()`, `context_monitor.observe()`.
+5. **Move ContradictionWorker + EnrichmentPipeline** — extract into the async worker loop so they process events as they're replayed, not detached from the graph.
+
+## Remaining work
+
+### 1. Strip full rebuild from startup (highest impact)
+`client.py:274` calls `graph_engine.rebuild(self._pg)` — a `SELECT * FROM events ORDER BY timestamp` that replays every row. On accumulated PG data this takes minutes. Fix:
+- Keep `load_snapshot()` for fast boot
+- Remove `rebuild()` fallback — let `AsyncGraphWorker` catch up incrementally from cursor
+- The graph is still populated by sync `_apply()` in `remember()`, so no test breakage
+
+### 2. Remove `contradiction_audit.batch_id NOT NULL`
+Migration 12 (`runner.py:261`) creates `batch_id UUID NOT NULL` with no default. The `ContradictionWorker` inserts rows without providing `batch_id`, causing `column "batch_id" does not exist` errors on every contradiction check. Fix: add `DEFAULT gen_random_uuid()` or make nullable.
+
+### 3. Wire `AsyncGraphWorker` into server/bootstrap
+The worker class is fully implemented at `memory_thread/nervous/graph_worker.py` (cursor table, influence table, batch replay, daemon thread loop) but never started. Needs:
+- Start call in server bootstrap or app init
+- Stop call in shutdown
+- Worker reads from `events` table, uses `ingestion_cursor` for position tracking
+
+### 4. Strip sync `_apply()` from `remember()` (after worker is live in prod)
+Once the worker is proven stable, remove `graph_engine.apply_event(event)` from `_remember_direct()`. Breaks PG tests that expect immediate consistency — add `worker.flush()` or `time.sleep(0.1)` in test fixtures. Enables true async write path.
+
+### 5. Add `sequence_id BIGSERIAL` to `events` table
+Optimizes worker cursor from `ORDER BY (timestamp, id)` index-scan to integer comparison. One-column migration. Worker switches cursor query after migration is applied.
+
+### 6. Strip heavy content attributes from igraph vertices
+Conversation text stored in igraph vertex attributes guarantees OOM past ~100K events. Keep only `entity_id` (UUID) in graph, fetch content via `SELECT ... WHERE id IN (...)`. Touches `search_nodes()`, `recall()`, `golden_thread.trace()`, `context_monitor.observe()` — needs careful rollout.
+
+### 7. Move `ContradictionWorker` + `EnrichmentPipeline` into worker loop
+Currently these run detached from the graph replay. Processing them inside the worker's batch loop ensures they fire on each event as it's applied, not on a separate schedule.
+
+## Design decisions
+
+- **`truth_vector` is JSONB** — worker parses it back to `TruthVector` on read. No schema change needed.
+- **Cursor uses `(timestamp, id)`** — works without schema migration. `ORDER BY timestamp, id` is deterministic even for same-timestamp events.
+- **Double-apply is safe** — `_apply()` checks `_vertex_exists()` before creating any node. Redundant work but no data corruption.
+- **Sync `_apply()` kept in `remember()` for now** — avoids breaking PG tests. Worker re-applies same events (idempotent, wasted CPU). To be stripped after worker is proven in production.

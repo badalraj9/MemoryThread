@@ -34,3 +34,9 @@ qdrant.exe
 
 # Windows reserved names
 nul
+
+# Build artifacts
+*.egg-info/
+
+# Benchmark output
+reports/throughput_benchmark_*.json

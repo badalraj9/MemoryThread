@@ -93,7 +93,8 @@ class WorkflowInduction:
         """Store workflow as nodes + edges in the graph."""
         wf_id = str(uuid.uuid4())
 
-        graph_engine.graph.add_vertex(
+        # Fix #1: use _ensure_node so the vertex is registered in _vertex_names
+        graph_engine._ensure_node(
             wf_id,
             type="workflow",
             title=title,
@@ -106,7 +107,8 @@ class WorkflowInduction:
 
         for i, step_desc in enumerate(steps):
             step_id = str(uuid.uuid4())
-            graph_engine.graph.add_vertex(
+            # Fix #1: use _ensure_node so the vertex is registered in _vertex_names
+            graph_engine._ensure_node(
                 step_id,
                 type="step",
                 description=step_desc,

@@ -1127,8 +1127,12 @@
 
   <div id="app-container">
 
+    <!-- ==========================================
+         CENTERED MAIN CHAT COLUMN (820px Exact Width)
+         ========================================== -->
     <main id="main-pane">
       
+      <!-- Minimal Header -->
       <header class="top-header">
         <div class="brand-group">
           <span class="brand-logo-monogram">MT</span>
@@ -1152,8 +1156,10 @@
         </div>
       </header>
 
+      <!-- Chat Scroll Area -->
       <div class="chat-scroll-area" id="chat-messages">
         
+        <!-- Turn 1 -->
         <div class="message-row">
           <div class="user-turn-container">
             <div class="user-text">What do you remember about my preferences?</div>
@@ -1187,6 +1193,7 @@
           </div>
         </div>
 
+        <!-- Turn 2 -->
         <div class="message-row">
           <div class="user-turn-container">
             <div class="user-text">Remind me what we discussed about the memory decay model.</div>
@@ -1250,6 +1257,7 @@
 
       </div>
 
+      <!-- 60px Tall Clean Rectangular Input Dock -->
       <footer class="chat-input-dock">
         <form class="input-wrapper-card" id="chat-form" onsubmit="handleChatSubmit(event)">
           <textarea 
@@ -1277,8 +1285,12 @@
 
     </main>
 
+    <!-- ==========================================
+         TRUE FLOATING INSPECTOR (Floating Overlay, 24px Margin)
+         ========================================== -->
     <aside id="inspector-pane" class="hidden">
       
+      <!-- Inspector Header -->
       <div class="inspector-header">
         <h2 class="inspector-title">Memory Inspector</h2>
         <button class="close-inspector-btn" id="close-inspector-btn" title="Close Inspector">
@@ -1289,6 +1301,7 @@
         </button>
       </div>
 
+      <!-- Tab Navigation -->
       <nav class="inspector-tabs">
         <button class="tab-btn active" data-tab="recall" onclick="switchInspectorTab('recall')">
           Recall
@@ -1305,19 +1318,24 @@
         </button>
       </nav>
 
+      <!-- Scrollable Inspector Body -->
       <div class="inspector-body">
         
+        <!-- View 1: Recall Tab (Compact & Balanced) -->
         <div class="inspector-view-container" id="view-recall">
           <div style="display: flex; justify-content: space-between; align-items: baseline;">
             <span class="view-subhead">Recall Trace</span>
             <span style="font-size: 11.5px; color: var(--text-muted);" id="recall-summary-count">12 memories recalled</span>
           </div>
 
-          <div class="trace-clean-list" id="recall-trace-list"></div>
+          <div class="trace-clean-list" id="recall-trace-list">
+            <!-- Populated via JS -->
+          </div>
 
           <button class="show-more-traces-btn" onclick="showMoreTraces()">+ Show more traces</button>
         </div>
 
+        <!-- View 2: Memory Drilldown -->
         <div class="inspector-view-container" id="view-memory" style="display: none;">
           <a class="back-btn-link" onclick="switchInspectorTab('recall')">
             <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor"><polyline points="15 18 9 12 15 6"></polyline></svg>
@@ -1373,6 +1391,7 @@
           </div>
         </div>
 
+        <!-- View 3: Conflicts Tab -->
         <div class="inspector-view-container" id="view-conflicts" style="display: none;">
           <div class="view-subhead">Contradictions · <span id="conflicts-count-sub">2</span></div>
 
@@ -1389,6 +1408,7 @@
           </div>
         </div>
 
+        <!-- View 4: Health Tab -->
         <div class="inspector-view-container" id="view-health" style="display: none;">
           <div class="view-subhead">System Health</div>
 
@@ -1420,6 +1440,7 @@
 
       </div>
 
+      <!-- Inspector Bottom Bar -->
       <div class="inspector-bottom-bar">
         <div class="namespace-selector-group">
           <span class="namespace-label">Namespace</span>
@@ -1434,7 +1455,7 @@
         <button class="settings-btn" title="Configuration & API settings" onclick="openSettingsModal()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor">
             <circle cx="12" cy="12" r="3"></circle>
-            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path>
           </svg>
         </button>
       </div>
@@ -1443,6 +1464,7 @@
 
   </div>
 
+  <!-- Settings Modal -->
   <div class="modal-overlay" id="settings-modal" onclick="handleModalBackdropClick(event, 'settings-modal')">
     <div class="modal-card">
       <div class="modal-header">
@@ -1469,6 +1491,7 @@
     </div>
   </div>
 
+  <!-- Add Memory Modal -->
   <div class="modal-overlay" id="add-memory-modal" onclick="handleModalBackdropClick(event, 'add-memory-modal')">
     <div class="modal-card">
       <div class="modal-header">
@@ -1509,6 +1532,7 @@
 
   <div class="toast-container" id="toast-container"></div>
 
+  <!-- Javascript Logic -->
   <script>
     const state = {
       apiUrl: localStorage.getItem('mt_api_url') || 'http://127.0.0.1:8000',
