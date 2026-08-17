@@ -18,7 +18,7 @@ setup(
     python_requires=">=3.9",
     install_requires=[
         "pydantic>=2.0",
-        "networkx>=3.0",
+        "python-igraph>=1.0",
         "python-dotenv>=1.0",
     ],
     extras_require={

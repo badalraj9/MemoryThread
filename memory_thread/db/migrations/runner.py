@@ -60,10 +60,19 @@ MIGRATIONS = [
                 contradiction_count INTEGER DEFAULT 0,
                 last_updated TIMESTAMPTZ DEFAULT NOW()
             );
-            
+
             INSERT INTO tms_health (id, drift_count, contradiction_count)
             VALUES (1, 0, 0)
             ON CONFLICT (id) DO NOTHING;
+
+            -- schema_version must exist before any migration INSERTs into it,
+            -- otherwise run_migrations() fails on a brand-new (fresh) database.
+            -- Migration 7 also declares this table (CREATE TABLE IF NOT EXISTS,
+            -- idempotent) so this is harmless on upgrade paths.
+            CREATE TABLE IF NOT EXISTS schema_version (
+                version_id INTEGER PRIMARY KEY,
+                applied_at TIMESTAMPTZ DEFAULT NOW()
+            );
         """,
     },
     {

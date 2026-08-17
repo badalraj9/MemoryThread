@@ -138,11 +138,13 @@ async def lifespan(app: FastAPI):
     # Startup
     print()
 
-    # Check PostgreSQL
+    # Check PostgreSQL and bootstrap AsyncGraphWorker
     postgres_status = "unavailable"
     postgres_latency = None
+    _graph_worker = None
     try:
         from memory_thread.db.postgres_client import PostgresClient
+        from memory_thread.nervous.graph_worker import AsyncGraphWorker
 
         pg = PostgresClient()
         start = time.perf_counter()
@@ -150,7 +152,32 @@ async def lifespan(app: FastAPI):
             cur.execute("SELECT 1")
         postgres_latency = int((time.perf_counter() - start) * 1000)
         postgres_status = "healthy"
+
+        # Bootstrap graph worker. Replay mode is configurable (Fix #2):
+        #   sync      — block startup until all backlog is replayed (old behaviour)
+        #   background— start the worker and accept traffic immediately; the graph
+        #               fills in as replay runs (default; avoids cold-start stalls
+        #               on very large events tables)
+        #   skip      — no replay (test environments); also honours legacy
+        #               MT_SKIP_GRAPH_FLUSH=1.
+        _graph_worker = AsyncGraphWorker(pg)
+        replay_mode = os.environ.get("MT_GRAPH_REPLAY", "background").lower()
+        if replay_mode == "skip" or os.environ.get("MT_SKIP_GRAPH_FLUSH") == "1":
+            log.info("AsyncGraphWorker replay skipped (MT_GRAPH_REPLAY=skip)")
+        elif replay_mode == "sync":
+            flush_start = time.perf_counter()
+            _graph_worker.flush()
+            flush_ms = int((time.perf_counter() - flush_start) * 1000)
+            log.info("AsyncGraphWorker initial flush complete (%dms)", flush_ms)
+            _graph_worker.start()
+        else:
+            _graph_worker.start()
+            log.info("AsyncGraphWorker replaying in background (server ready immediately)")
+        global _graph_worker_ref
+        _graph_worker_ref = _graph_worker
+
     except Exception as e:
+        log.warning("AsyncGraphWorker could not start (Postgres unavailable?): %s", e)
         postgres_status = "unavailable"
 
     # Check API auth
@@ -180,6 +207,12 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     print("\n[yellow]Shutting down...[/yellow]")
+    # Stop the graph worker before closing clients
+    if _graph_worker is not None:
+        try:
+            _graph_worker.stop()
+        except Exception as e:
+            log.warning("Error stopping AsyncGraphWorker: %s", e)
     # Close all cached MemoryClient instances (shuts down enrichment pipelines + WAL)
     for namespace, client in list(_client_cache.items()):
         try:
@@ -421,6 +454,9 @@ class GraphActivationRequest(BaseModel):
 
 _client_cache: dict = {}
 
+# Reference to the running AsyncGraphWorker, exposed for readiness/metrics probes.
+_graph_worker_ref = None
+
 
 def get_client(
     x_namespace: str = Header("default", alias="X-Namespace"),
@@ -429,8 +465,9 @@ def get_client(
     namespace = namespace_override or x_namespace
 
     if namespace not in _client_cache:
+        use_db = os.environ.get("MT_USE_DB_FALSE") != "1"
         _client_cache[namespace] = MemoryClient(
-            namespace=namespace, use_db=True, default_authority=0.5
+            namespace=namespace, use_db=use_db, default_authority=0.5
         )
     return _client_cache[namespace]
 
@@ -473,6 +510,12 @@ async def readiness_check():
 
     if not pg_ok:
         raise HTTPException(status_code=503, detail="PostgreSQL not available")
+
+    # Optionally gate on initial graph replay completion (Fix #2). Off by default
+    # so startup is fast; enable with MT_WAIT_REPLAY_READY=1 for strict readiness.
+    if os.environ.get("MT_WAIT_REPLAY_READY") == "1" and _graph_worker_ref is not None:
+        if not _graph_worker_ref.is_initial_replay_done():
+            raise HTTPException(status_code=503, detail="Graph replay still in progress")
     return {"ready": True, "status": "healthy"}
 
 
@@ -488,28 +531,44 @@ _metrics_store = {"requests_total": 0, "requests_errors": 0, "events_processed":
 @app.get("/metrics", response_class=PlainTextResponse, tags=["Health"])
 async def prometheus_metrics():
     """Prometheus-compatible metrics endpoint."""
+    from memory_thread.services.metrics import get_metrics
+
+    lines = [
+        "# HELP mt_requests_total Total requests processed",
+        "# TYPE mt_requests_total counter",
+        f"mt_requests_total {_metrics_store['requests_total']}",
+        "",
+        "# HELP mt_requests_errors Total request errors",
+        "# TYPE mt_requests_errors counter",
+        f"mt_requests_errors {_metrics_store['requests_errors']}",
+        "",
+        "# HELP mt_events_processed Total events processed",
+        "# TYPE mt_events_processed counter",
+        f"mt_events_processed {_metrics_store['events_processed']}",
+        "",
+        "# HELP mt_up Service up status",
+        "# TYPE mt_up gauge",
+        "mt_up 1",
+    ]
+
+    # Append in-process operational metrics (replay + recall health).
+    for name, data in get_metrics().items():
+        if "avg" in data:
+            lines.append(f"# TYPE mt_{name} histogram")
+            lines.append(f"mt_{name}_count {data['count']}")
+            lines.append(f"mt_{name}_sum {round(data['sum'], 3)}")
+            lines.append(f"mt_{name}_max {round(data['max'], 3)}")
+        else:
+            lines.append(f"# TYPE mt_{name} counter")
+            lines.append(f"mt_{name} {data['count']}")
+        lines.append("")
+
     try:
         from prometheus_client import generate_latest, REGISTRY
 
-        return generate_latest(REGISTRY).decode("utf-8")
+        # If the prometheus client is available, prepend its registry too.
+        return generate_latest(REGISTRY).decode("utf-8") + "\n".join(lines)
     except Exception:
-        lines = [
-            "# HELP mt_requests_total Total requests processed",
-            "# TYPE mt_requests_total counter",
-            f"mt_requests_total {_metrics_store['requests_total']}",
-            "",
-            "# HELP mt_requests_errors Total request errors",
-            "# TYPE mt_requests_errors counter",
-            f"mt_requests_errors {_metrics_store['requests_errors']}",
-            "",
-            "# HELP mt_events_processed Total events processed",
-            "# TYPE mt_events_processed counter",
-            f"mt_events_processed {_metrics_store['events_processed']}",
-            "",
-            "# HELP mt_up Service up status",
-            "# TYPE mt_up gauge",
-            "mt_up 1",
-        ]
         return "\n".join(lines)
 
 

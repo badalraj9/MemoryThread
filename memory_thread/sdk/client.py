@@ -11,11 +11,14 @@ Usage:
 
 import uuid
 import json
+import re
+import math
 import threading
 import time
 import queue
+from collections import defaultdict
 from datetime import datetime
-from typing import Optional, List, Dict, Any, Tuple
+from typing import Optional, List, Dict, Any, Tuple, Set
 from urllib.parse import urlparse, parse_qs
 import os
 
@@ -27,6 +30,7 @@ from memory_thread.services.tms_service import (
 )
 from memory_thread.config.settings import settings
 from memory_thread.utils.logger import get_logger
+from memory_thread.services.metrics import incr, observe
 from memory_thread.sdk.models import Memory, RecallResult, WritePathMetric, ConnectionConfig
 from memory_thread.sdk.wal_manager import WalManager
 from memory_thread.sdk.persistence import PersistenceService
@@ -118,6 +122,11 @@ class MemoryClient:
 
         self._memories: Dict[uuid.UUID, EntityState] = {}
         self._global_memories: Dict[uuid.UUID, EntityState] = {}
+        # C: BM25-lite inverted index over memory content for O(matched) recall
+        # instead of an O(M) full _memories scan on the keyword fallback path.
+        self._keyword_index: Dict[str, Set[str]] = defaultdict(set)  # token -> {entity_id_str}
+        self._term_freq: Dict[str, Dict[str, int]] = defaultdict(lambda: defaultdict(int))
+        self._doc_len: Dict[str, int] = {}  # entity_id_str -> token count
         self._event_log: List[Event] = []
         self._write_path_metrics: Dict[str, WritePathMetric] = {}
         self._write_path_metric_buffers: List[Dict[str, WritePathMetric]] = [
@@ -270,8 +279,55 @@ class MemoryClient:
         if self._pg:
             from memory_thread.services.graph_engine import graph_engine
 
-            if not graph_engine.load_snapshot(settings.GRAPH_SNAPSHOT_PATH):
-                graph_engine.rebuild(self._pg)
+            # Skip bootstrap if a prior client in this process already built the engine.
+            if graph_engine._built:
+                log.debug(
+                    "GraphEngine already built (%d v, %d e) — attaching without rebuild",
+                    graph_engine.graph.vcount(),
+                    graph_engine.graph.ecount(),
+                )
+                return
+
+            # Load the snapshot for fast cold-boot (~50ms disk read vs full PG replay).
+            # Any events written after the snapshot watermark will be caught up
+            # incrementally by AsyncGraphWorker (started in server.py lifespan or
+            # explicitly via MemoryClient._start_graph_worker() for SDK-only usage).
+            with graph_engine._write_lock:
+                graph_engine.load_snapshot(settings.GRAPH_SNAPSHOT_PATH)
+                # Mark built so downstream callers see the engine as ready.
+                # Worker will apply remaining deltas asynchronously.
+                if not graph_engine._built:
+                    graph_engine._built = True
+
+    def _start_graph_worker(self) -> None:
+        """Start AsyncGraphWorker for SDK-only usage (no FastAPI server).
+
+        Call this after MemoryClient.__init__() when not running inside the
+        FastAPI server (standalone scripts, test fixtures, CLI tools).
+
+        Behaviour:
+            - flush() drains all backlog events from PG synchronously before
+              returning — graph is fully consistent when this method returns.
+            - start() then launches the background daemon for ongoing writes.
+            - The worker reference is stored on self._graph_worker for cleanup
+              in close().
+
+        Safe to call multiple times: no-op if worker already running.
+        """
+        if not self._pg:
+            return
+        if getattr(self, "_graph_worker", None) is not None:
+            return
+        try:
+            from memory_thread.nervous.graph_worker import AsyncGraphWorker
+
+            worker = AsyncGraphWorker(self._pg)
+            worker.flush()
+            worker.start()
+            self._graph_worker = worker
+            log.debug("AsyncGraphWorker started via MemoryClient._start_graph_worker()")
+        except Exception as e:
+            log.warning("Could not start AsyncGraphWorker: %s", e)
 
     def remember(
         self,
@@ -347,6 +403,10 @@ class MemoryClient:
         from memory_thread.services.graph_engine import graph_engine
 
         graph_engine.apply_event(event)
+
+        # Namespace-tiering (enterprise RAM bounding). No-op unless
+        # GRAPH_NAMESPACE_BUDGET > 0 is configured in settings.
+        self._namespace_tiering_enforce()
 
         if self.durability_mode == "batched" and not wal_prewritten:
             self._wal_manager.append_committed(
@@ -436,10 +496,15 @@ class MemoryClient:
         antecedents=None,
         action=None,
         event_id=None,
+        influence_weight: float = 1.0,
     ):
         started = time.perf_counter()
+        # Scale incoming authority by cross-agent influence weight.
+        # influence_weight = 1.0 preserves current behavior (same-agent).
+        # influence_weight < 1.0 reduces impact of less-trusted agents.
+        effective_authority = authority * influence_weight
         truth_vector = TruthVector.model_construct(
-            confidence=confidence, authority=authority, freshness=1.0, corroboration=0
+            confidence=confidence, authority=effective_authority, freshness=1.0, corroboration=0
         )
         actor = ActorEnum.USER if source == "user" else ActorEnum.AGENT
         event_id = event_id or uuid.uuid4()
@@ -513,12 +578,16 @@ class MemoryClient:
             ),
             authority=max(previous_vector.authority, truth_vector.authority),
             freshness=max(previous_vector.freshness, truth_vector.freshness),
-            corroboration=previous_vector.corroboration + truth_vector.corroboration + 1,
+            corroboration=previous_vector.corroboration
+            + truth_vector.corroboration
+            + int(1 * influence_weight),
         )
         state.version += 1
         state.last_event_id = event_id
         state.updated_at = datetime.utcnow()
         self._memories[entity_id] = state
+        # C: keep BM25 inverted index in sync (handles ADD and UPDATE).
+        self._index_memory(str(entity_id), content)
         self._record_write_path_metric("remember.derive_state", started)
         return event, state
 
@@ -553,6 +622,31 @@ class MemoryClient:
         ge.apply_event(event)
         return entity_id
 
+    # ── Namespace-tiering (enterprise RAM bounding) ──────────────────────
+    # When GRAPH_NAMESPACE_BUDGET > 0, only that many workspaces' subgraphs
+    # stay in RAM; inactive ones are evicted and re-materialized on demand.
+    # Disabled by default — existing behavior (whole graph in RAM) is unchanged.
+
+    def _namespace_budget(self) -> int:
+        return int(getattr(settings, "GRAPH_NAMESPACE_BUDGET", 0) or 0)
+
+    def _namespace_tiering_ensure(self) -> None:
+        if self._namespace_budget() <= 0:
+            return
+        from memory_thread.services.graph_engine import graph_engine
+
+        graph_engine.set_namespace_budget(self._namespace_budget())
+        if self._pg is not None:
+            graph_engine.ensure_namespace_loaded(self.namespace, self._pg)
+
+    def _namespace_tiering_enforce(self) -> None:
+        if self._namespace_budget() <= 0:
+            return
+        from memory_thread.services.graph_engine import graph_engine
+
+        graph_engine.set_namespace_budget(self._namespace_budget())
+        graph_engine.enforce_namespace_budget()
+
     def recall(
         self,
         query: str,
@@ -560,24 +654,37 @@ class MemoryClient:
         min_truth_score: float = 0.3,
         project: Optional[str] = None,
     ) -> RecallResult:
-        if project:
-            original_namespace = self.namespace
-            self.namespace = project
-            result = self._recall_impl(query, top_k, min_truth_score)
-            self.namespace = original_namespace
-            return result
+        started = time.perf_counter()
+        try:
+            # Namespace-tiering: lazily re-materialize the active workspace's
+            # subgraph from Postgres if it was evicted. No-op unless budget set.
+            self._namespace_tiering_ensure()
+            if project:
+                original_namespace = self.namespace
+                self.namespace = project
+                try:
+                    result = self._recall_impl(query, top_k, min_truth_score)
+                finally:
+                    self.namespace = original_namespace
+                return result
 
-        global_namespace = self._get_global_namespace()
-        project_result = self._recall_impl(query, top_k, min_truth_score)
+            global_namespace = self._get_global_namespace()
 
-        if global_namespace != self.namespace:
-            original_namespace = self.namespace
-            self.namespace = global_namespace
-            global_result = self._recall_impl(query, top_k, min_truth_score)
-            self.namespace = original_namespace
-            return self._merge_results(project_result, global_result, top_k)
+            # D: when global != project, do ONE activation pass over both namespaces
+            # instead of two full _recall_impl calls (halves per-recall cost in
+            # production, where global namespace differs by default).
+            if global_namespace != self.namespace:
+                return self._recall_dual_namespace(
+                    query, top_k, min_truth_score, self.namespace, global_namespace
+                )
 
-        return project_result
+            return self._recall_impl(query, top_k, min_truth_score)
+        finally:
+            observe(
+                "recall_latency_ms",
+                (time.perf_counter() - started) * 1000.0,
+                tags={"namespace": self.namespace},
+            )
 
     def create_thread(self, title: str, parent_thread_id: Optional[str] = None) -> str:
         from memory_thread.services.thread_service import thread_service
@@ -629,12 +736,20 @@ class MemoryClient:
 
         if graph_engine.graph.vcount() == 0:
             self._recall_graph_fallback_count += 1
+            incr(
+                "recall_keyword_fallback_total",
+                tags={"namespace": self.namespace, "reason": "empty_graph"},
+            )
             log.info("Graph recall fallback: graph empty")
             return self._recall_keyword(query, top_k, min_truth_score)
 
         seeds = self._resolve_seeds(query)
         if not seeds:
             self._recall_graph_fallback_count += 1
+            incr(
+                "recall_keyword_fallback_total",
+                tags={"namespace": self.namespace, "reason": "no_seeds"},
+            )
             log.info("Graph recall fallback: no seed nodes for '%s'", query)
             return self._recall_keyword(query, top_k, min_truth_score)
 
@@ -644,6 +759,7 @@ class MemoryClient:
             max_depth=max_depth,
             decay=decay,
             truth_threshold=min_truth_score,
+            namespace=self.namespace,
         )
 
         memories = []
@@ -676,33 +792,131 @@ class MemoryClient:
         memories.sort(key=lambda m: (m.truth_score, m.authority), reverse=True)
         return RecallResult(memories=memories[:top_k], query=query, total_found=len(memories))
 
+    def _recall_dual_namespace(
+        self,
+        query: str,
+        top_k: int,
+        min_truth_score: float,
+        project_ns: str,
+        global_ns: str,
+    ) -> RecallResult:
+        """D: single activation pass over project + global namespaces.
+
+        Replaces the two separate _recall_impl calls previously run when the
+        global namespace differs from the project namespace. Seeds are resolved
+        for both namespaces, activation runs once (namespace=None), and results
+        are filtered to the target namespaces, deduped by entity id (keeping the
+        best score), with the global-namespace memories weighted by
+        GLOBAL_AUTHORITY_WEIGHT — matching the prior merge semantics.
+        """
+        from memory_thread.services.graph_engine import graph_engine
+        from memory_thread.services.retrieval_service import retrieve_by_activation
+        from memory_thread.config.settings import settings
+
+        global_weight = getattr(settings, "GLOBAL_AUTHORITY_WEIGHT", 0.8)
+        target_ns = {project_ns, global_ns}
+
+        if graph_engine.graph.vcount() == 0:
+            return self._recall_keyword(query, top_k, min_truth_score)
+
+        seeds = list(
+            set(self._resolve_seeds(query, project_ns) + self._resolve_seeds(query, global_ns))
+        )
+        if not seeds:
+            return self._recall_keyword(query, top_k, min_truth_score)
+
+        activated = retrieve_by_activation(
+            seeds=seeds,
+            top_k=top_k,
+            max_depth=3,
+            decay=0.5,
+            truth_threshold=min_truth_score,
+            namespace=None,
+        )
+
+        best: Dict[str, Memory] = {}
+        for item in activated:
+            ns = item.get("namespace")
+            if ns not in target_ns:
+                continue
+            eid = item["id"]
+            try:
+                entity_id = uuid.UUID(eid) if isinstance(eid, str) else eid
+            except (ValueError, AttributeError):
+                continue
+            is_global = ns == global_ns
+            truth_score = item["score"]
+            confidence = item.get("truth_score", min_truth_score)
+            authority = item.get("truth_score", min_truth_score) * 0.9
+            if is_global:
+                truth_score *= global_weight
+                authority *= global_weight
+            mem = Memory(
+                content=item.get("content", eid),
+                entity_id=entity_id,
+                truth_score=truth_score,
+                confidence=confidence,
+                authority=authority,
+                freshness=1.0,
+                corroboration=0,
+                timestamp=datetime.utcnow(),
+                source="graph",
+                memory_type="fact",
+            )
+            existing = best.get(eid)
+            if existing is None or mem.truth_score > existing.truth_score:
+                best[eid] = mem
+
+        memories = list(best.values())
+
+        if len(memories) < top_k:
+            kr = self._recall_keyword(
+                query, top_k=top_k - len(memories), min_truth_score=min_truth_score
+            )
+            seen = {str(m.entity_id) for m in memories}
+            for mem in kr.memories:
+                if str(mem.entity_id) not in seen:
+                    memories.append(mem)
+                    seen.add(str(mem.entity_id))
+
+        memories.sort(key=lambda m: (m.truth_score, m.authority), reverse=True)
+        return RecallResult(memories=memories[:top_k], query=query, total_found=len(memories))
+
     def recall_graph(
         self, query, top_k=5, min_truth_score=0.3, max_depth=3, decay=0.5, project=None
     ):
-        if project:
-            original_namespace = self.namespace
-            self.namespace = project
-            result = self._recall_graph_primary(query, top_k, min_truth_score, max_depth, decay)
-            self.namespace = original_namespace
-            return result
+        started = time.perf_counter()
+        try:
+            if project:
+                original_namespace = self.namespace
+                self.namespace = project
+                try:
+                    return self._recall_graph_primary(
+                        query, top_k, min_truth_score, max_depth, decay
+                    )
+                finally:
+                    self.namespace = original_namespace
 
-        global_namespace = self._get_global_namespace()
-        project_result = self._recall_graph_primary(query, top_k, min_truth_score, max_depth, decay)
+            global_namespace = self._get_global_namespace()
+            # D: single activation pass over both namespaces (mirrors recall()),
+            # instead of two full _recall_graph_primary calls (halves cost).
+            if global_namespace != self.namespace:
+                return self._recall_dual_namespace(
+                    query, top_k, min_truth_score, self.namespace, global_namespace
+                )
 
-        if global_namespace != self.namespace:
-            original_namespace = self.namespace
-            self.namespace = global_namespace
-            global_result = self._recall_graph_primary(
-                query, top_k, min_truth_score, max_depth, decay
+            return self._recall_graph_primary(query, top_k, min_truth_score, max_depth, decay)
+        finally:
+            observe(
+                "recall_latency_ms",
+                (time.perf_counter() - started) * 1000.0,
+                tags={"namespace": self.namespace},
             )
-            self.namespace = original_namespace
-            return self._merge_results(project_result, global_result, top_k)
 
-        return project_result
-
-    def _resolve_seeds(self, query: str) -> List[str]:
+    def _resolve_seeds(self, query: str, namespace: Optional[str] = None) -> List[str]:
         from memory_thread.services.graph_engine import graph_engine
 
+        ns = namespace if namespace is not None else self.namespace
         seeds = []
 
         try:
@@ -730,13 +944,13 @@ class MemoryClient:
             except Exception:
                 pass
 
-        # Filter to current namespace — graph is shared, seeds must not leak across namespaces
+        # Filter to target namespace — graph is shared, seeds must not leak across namespaces
         filtered = []
         for name in seeds:
             try:
                 v = graph_engine.graph.vs.find(name=name)
                 v_ns = v.attributes().get("namespace")
-                if v_ns == self.namespace:
+                if v_ns == ns:
                     filtered.append(name)
             except (ValueError, KeyError):
                 filtered.append(name)
@@ -797,28 +1011,86 @@ class MemoryClient:
             memories.append(mem)
         return memories
 
+    # ── C: BM25-lite keyword index ────────────────────────────────────
+
+    @staticmethod
+    def _tokenize(text: str) -> List[str]:
+        # Whitespace-delimited tokens (lowercased), matching the prior
+        # keyword fallback so phrase tokens like "beta_only_token_7" stay
+        # atomic and cross-namespace isolation is preserved.
+        return [t for t in (text or "").lower().split() if t]
+
+    def _deindex_memory(self, eid_str: str) -> None:
+        tf = self._term_freq.pop(eid_str, None)
+        if tf:
+            for tok in tf:
+                postings = self._keyword_index.get(tok)
+                if postings:
+                    postings.discard(eid_str)
+                    if not postings:
+                        del self._keyword_index[tok]
+        self._doc_len.pop(eid_str, None)
+
+    def _index_memory(self, eid_str: str, content: str) -> None:
+        self._deindex_memory(eid_str)
+        toks = self._tokenize(content)
+        tf = self._term_freq[eid_str]
+        for tok in toks:
+            tf[tok] += 1
+            self._keyword_index[tok].add(eid_str)
+        self._doc_len[eid_str] = len(toks)
+
+    def _rebuild_keyword_index(self) -> None:
+        """C: build the index from currently-loaded memories (lazy one-time)."""
+        self._keyword_index = defaultdict(set)
+        self._term_freq = defaultdict(lambda: defaultdict(int))
+        self._doc_len = {}
+        for eid, state in self._memories.items():
+            self._index_memory(str(eid), state.current_value.get("content", ""))
+
     def _recall_keyword(self, query: str, top_k: int, min_truth_score: float) -> RecallResult:
-        query_words = set(query.lower().split())
-        scored_memories = []
+        if not self._keyword_index and self._memories:
+            self._rebuild_keyword_index()
 
-        for entity_id, state in self._memories.items():
-            content = state.current_value.get("content", "")
-            content_words = set(content.lower().split())
+        query_tokens = set(self._tokenize(query))
+        if not query_tokens:
+            return RecallResult(memories=[], query=query, total_found=0)
 
-            overlap = len(query_words & content_words)
-            if overlap == 0:
+        n_docs = len(self._doc_len)
+        if n_docs == 0:
+            return RecallResult(memories=[], query=query, total_found=0)
+        avgdl = sum(self._doc_len.values()) / n_docs
+
+        # BM25 scoring over postings only (O(postings), not O(corpus)).
+        raw_scores: Dict[str, float] = {}
+        for tok in query_tokens:
+            postings = self._keyword_index.get(tok)
+            if not postings:
                 continue
+            df = len(postings)
+            idf = math.log(1 + (n_docs - df + 0.5) / (df + 0.5))
+            for eid_str in postings:
+                tf = self._term_freq[eid_str].get(tok, 0)
+                dl = self._doc_len.get(eid_str, 0)
+                denom = tf + 1.5 * (0.25 + 0.75 * (dl / avgdl if avgdl else 0))
+                raw_scores[eid_str] = raw_scores.get(eid_str, 0.0) + idf * (tf * 2.5) / denom
 
-            relevance = overlap / max(len(query_words), 1)
+        scored_memories = []
+        for eid_str, raw in raw_scores.items():
+            state = self._memories.get(uuid.UUID(eid_str))
+            if state is None:
+                continue
+            # Saturate BM25 to [0,1) so we can reuse the existing composite:
+            # final = truth*0.6 + relevance*0.4. Preserves prior behavior shape.
+            relevance = raw / (raw + 1.0)
             truth_score = TruthVectorService.calculate_score(state.truth_vector)
             final_score = truth_score * 0.6 + relevance * 0.4
-
             if final_score >= min_truth_score:
                 scored_memories.append(
                     (
                         Memory(
-                            content=content,
-                            entity_id=entity_id,
+                            content=state.current_value.get("content", ""),
+                            entity_id=uuid.UUID(eid_str),
                             truth_score=final_score,
                             confidence=state.truth_vector.confidence,
                             authority=state.truth_vector.authority,
@@ -847,6 +1119,8 @@ class MemoryClient:
     def load_from_db(self) -> int:
         loaded = self._persistence.load_all(self.namespace)
         self._memories.update(loaded)
+        for eid, state in loaded.items():
+            self._index_memory(str(eid), state.current_value.get("content", ""))
         count = len(loaded)
         self._load_shared_memories()
         return count
@@ -924,6 +1198,15 @@ class MemoryClient:
         self._enrichment.shutdown()
         self._contradiction_worker.shutdown()
         self._wal_manager.close(compact=settings.WAL_COMPACT_ON_CLOSE)
+
+        # Stop client-owned graph worker (started via _start_graph_worker()).
+        # The server-managed worker in server.py lifespan is stopped there instead.
+        _worker = getattr(self, "_graph_worker", None)
+        if _worker is not None:
+            try:
+                _worker.stop()
+            except Exception as e:
+                log.warning("Error stopping client-owned AsyncGraphWorker: %s", e)
 
         from memory_thread.services.graph_engine import graph_engine
 
@@ -1148,6 +1431,7 @@ class MemoryClient:
 
             for eid in to_remove:
                 del self._memories[eid]
+                self._deindex_memory(str(eid))
                 pruned += 1
 
             log.info(f"Pruned {pruned} low-value memories")
