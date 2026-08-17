@@ -8,32 +8,35 @@ from typing import Optional
 
 
 def resolve_content(node_id: str) -> str:
-    """Get content for a node. Entity nodes resolve from the latest modifying event."""
+    """Get content for a node. Entity nodes resolve via cached_content (O(1)).
+
+    Falls back to the O(E) edge scan only for legacy graphs lacking the cache.
+    """
     from memory_thread.services.graph_engine import graph_engine
 
-    try:
-        v = graph_engine.graph.vs.find(name=node_id)
-    except (ValueError, KeyError):
+    idx = graph_engine._vidx(node_id)
+    if idx is None:
         return ""
+    v = graph_engine.graph.vs[idx]
     vattrs = v.attributes()
+    # B: O(1) cache written on every apply_event.
+    cached = vattrs.get("cached_content")
+    if cached:
+        return str(cached)
     content = vattrs.get("content") or ""
     if vattrs.get("type") == "entity" and not content:
-        try:
-            vidx = graph_engine.graph.vs.find(name=node_id).index
-            best, best_ts = "", ""
-            for e in graph_engine.graph.es:
-                eattrs = e.attributes()
-                if eattrs.get("type") == "modifies" and e.target == vidx:
-                    ev = graph_engine.graph.vs[e.source]
-                    ev_content = ev.attributes().get("content")
-                    if not ev_content:
-                        continue
-                    ets = str(ev.attributes().get("timestamp", ""))
-                    if ets >= best_ts:
-                        best = str(ev_content)
-                        best_ts = ets
-            if best:
-                return best
-        except (ValueError, KeyError):
-            pass
+        best, best_ts = "", ""
+        for e in graph_engine.graph.es:
+            eattrs = e.attributes()
+            if eattrs.get("type") == "modifies" and e.target == idx:
+                ev = graph_engine.graph.vs[e.source]
+                ev_content = ev.attributes().get("content")
+                if not ev_content:
+                    continue
+                ets = str(ev.attributes().get("timestamp", ""))
+                if ets >= best_ts:
+                    best = str(ev_content)
+                    best_ts = ets
+        if best:
+            return best
     return str(content) if content else ""

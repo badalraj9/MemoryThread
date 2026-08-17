@@ -37,7 +37,8 @@ def _get_dsn() -> str:
         f"user={settings.POSTGRES_USER} "
         f"password={settings.POSTGRES_PASSWORD} "
         f"host={settings.POSTGRES_SERVER} "
-        f"port={settings.POSTGRES_PORT}"
+        f"port={settings.POSTGRES_PORT} "
+        f"connect_timeout=5"
     )
 
 

@@ -210,5 +210,11 @@ class Settings(BaseSettings):
     # Relative to the working directory. Set to "" to disable snapshot behaviour.
     GRAPH_SNAPSHOT_PATH: str = ".mt/graph.pkl"
 
+    # Namespace-tiering (enterprise RAM bounding).
+    # Maximum number of workspaces' subgraphs held in RAM at once. 0 = unlimited
+    # (legacy behaviour: the entire graph lives in memory). When > 0, inactive
+    # namespaces are evicted and re-materialized from Postgres on demand.
+    GRAPH_NAMESPACE_BUDGET: int = 0
+
 
 settings = Settings()
